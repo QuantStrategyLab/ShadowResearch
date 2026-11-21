@@ -1,0 +1,11 @@
+{
+  "calendar_version": "csa22-v1-provisional",
+  "files": {
+    "SPEC.md": "91e41a9ac7b782c819053afb5a7efac8ae4f1dbebc029d1613dea25017c440e5",
+    "exceptions-2025.json": "df0d3c679c63fdda38004df86f1ba58d3f50e025016b3e3d0298d4394bb2da76",
+    "expected-2025.json": "f21857966483f1092a552a43c502817ac8681a0c798b5c4e2c9e8683324fb8de",
+    "generate_expected_2025.py": "c6dd6646038e79c81d0561da6f2b5e2b01e6f4c612bb5a010f4babed6be6f595"
+  },
+  "spec_digest": "9444245b899b285b0e8f7c9e8a0340ebc6b54683abf797f9884ed7cb11660f7e",
+  "status": "provisional"
+}
