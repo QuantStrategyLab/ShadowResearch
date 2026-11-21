@@ -4,6 +4,7 @@ __all__ = [
     "calendar_consumer",
     "evaluator",
     "feeder",
+    "feeder_live",
     "ledger",
     "replay",
     "sizing",
