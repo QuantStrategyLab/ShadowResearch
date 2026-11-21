@@ -89,6 +89,11 @@ class SizingStackTest(unittest.TestCase):
             )
             self.assertFalse(tqqq["kelly_applied"])
             self.assertEqual(t["orders_placed"], 0)
+            for inst in ("TQQQ", "SOXL"):
+                f = _fund(t, inst)
+                self.assertFalse(f["kelly_applied"])
+                self.assertIs(type(f["orders_placed"]), int)
+                self.assertEqual(f["orders_placed"], 0)
 
     def test_positive_control_balanced_cushion_table(self) -> None:
         cases = [

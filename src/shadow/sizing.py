@@ -398,6 +398,7 @@ def compute_session_sizing(
                         "kelly_would_have_bound": kelly_would_bind,
                         "kelly_counterfactual_x": canonical_decimal_str(kelly_cf_x),
                         "kelly_applied": False,
+                        "orders_placed": 0,
                         "v": canonical_decimal_str(v_i),
                         "x_pre": canonical_decimal_str(x_p),
                         "x_post_joint": canonical_decimal_str(x_post[inst]),

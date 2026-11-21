@@ -198,6 +198,9 @@ def _check_standing_assertions(records: list[dict], source_tag: str) -> int:
             assert tier["orders_placed"] == 0, f"{source_tag}: tier orders_placed"
             for fund in tier["funds"]:
                 assert fund["kelly_applied"] is False, f"{source_tag}: fund kelly_applied"
+                assert type(fund["orders_placed"]) is int and fund["orders_placed"] == 0, (
+                    f"{source_tag}: fund orders_placed"
+                )
                 row_count += 1
     return row_count
 

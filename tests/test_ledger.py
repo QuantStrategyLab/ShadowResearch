@@ -26,6 +26,7 @@ from shadow.ledger import (
     is_canonical_decimal_str,
     is_utc_ms_timestamp,
     parse_json_no_duplicates,
+    validate_record_body,
 )
 
 
@@ -157,6 +158,45 @@ class LedgerTest(unittest.TestCase):
             )
             self.assertFalse(eligible)
             self.assertTrue(len(reasons) > 0)
+
+    def test_fund_orders_placed_validated_on_persisted_rows(self) -> None:
+        spec = load_spec()
+        ev = StubEvaluator()
+        code_sha = compute_code_manifest_hash()
+        cal = resolve_session("XNYS", "2025-11-21", spec=spec)
+        built = build_record_body(
+            chain_id="drill-fund-orders-check",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2025-11-21",
+            decision_timestamp_utc=cal["close_utc"],
+            session_inputs=_sample_inputs(),
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state={},
+        )
+        base_body = built["record_body"]
+        for tier in base_body["tiers"]:
+            for fund in tier["funds"]:
+                self.assertIs(type(fund["orders_placed"]), int)
+                self.assertEqual(fund["orders_placed"], 0)
+
+        missing_body = copy.deepcopy(base_body)
+        del missing_body["tiers"][0]["funds"][0]["orders_placed"]
+        with self.assertRaises(CanonicalizationError):
+            validate_record_body(missing_body)
+
+        bool_body = copy.deepcopy(base_body)
+        bool_body["tiers"][0]["funds"][0]["orders_placed"] = False
+        with self.assertRaises(CanonicalizationError):
+            validate_record_body(bool_body)
+
+        nonzero_body = copy.deepcopy(base_body)
+        nonzero_body["tiers"][0]["funds"][0]["orders_placed"] = 1
+        with self.assertRaises(CanonicalizationError):
+            validate_record_body(nonzero_body)
 
 
 if __name__ == "__main__":

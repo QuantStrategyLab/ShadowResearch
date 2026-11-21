@@ -236,6 +236,9 @@ def validate_record_body(body: dict) -> None:
                     )
             if fund.get("kelly_applied") is not False:
                 raise CanonicalizationError("kelly_applied must be false")
+            fund_orders = fund.get("orders_placed")
+            if isinstance(fund_orders, bool) or not isinstance(fund_orders, int) or fund_orders != 0:
+                raise CanonicalizationError("fund orders_placed must be integer 0 in Stage N")
 
     ev = body["evaluator"]
     if not isinstance(ev, dict):
