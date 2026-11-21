@@ -332,8 +332,10 @@ def compute_session_sizing(
                 x_p = x_pre[inst]
                 denom = beta_soxl if inst == "SOXL" else Decimal("1")
 
-                kelly_would_bind = x_k_c < x_p
+                # Per demo/DEMO-CASES-CORRECTION-1.md (Astra interpretation-4 ruling):
+                # compare counterfactual against x_pre at full precision before Step 7.
                 kelly_cf_x = (s_i * min(x_cap, x_ml, x_k_c) * v_i) / denom
+                kelly_would_bind = kelly_cf_x < x_p
 
                 w_tgt = w_target[inst]
                 if active_control_state == "DE-RISK":

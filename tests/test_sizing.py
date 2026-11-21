@@ -171,6 +171,49 @@ class SizingStackTest(unittest.TestCase):
             compute_session_sizing(bad)
         self.assertEqual(ctx.exception.field, "SOXL_close")
 
+    def test_kelly_would_have_bound_follows_counterfactual_vs_x_pre(self) -> None:
+        # S4 high-vol case: x_K_cond < min(x_cap, x_ML) across all 6 rows, so
+        # kelly_counterfactual_x < x_pre holds even when x_K_cond >= x_pre.
+        s4_res = compute_session_sizing(_make_inputs(sig_tqqq="0.72", sig_soxl="0.80"))
+        for tid in ("conservative", "balanced", "aggressive"):
+            t = _tier(s4_res, tid)
+            for inst in ("TQQQ", "SOXL"):
+                f = _fund(t, inst)
+                self.assertTrue(f["kelly_would_have_bound"], f"{tid}.{inst}")
+                self.assertLess(Decimal(f["kelly_counterfactual_x"]), Decimal(f["x_pre"]))
+                self.assertFalse(f["kelly_applied"])
+
+        # S1 low-vol case: x_K_cond > x_ML so cf == x_pre -> equality yields False.
+        s1_res = compute_session_sizing(_make_inputs())
+        for tid in ("conservative", "balanced", "aggressive"):
+            t = _tier(s1_res, tid)
+            for inst in ("TQQQ", "SOXL"):
+                f = _fund(t, inst)
+                self.assertFalse(f["kelly_would_have_bound"], f"{tid}.{inst}")
+                self.assertEqual(Decimal(f["kelly_counterfactual_x"]), Decimal(f["x_pre"]))
+
+        # Zero signal (g == 0) and exhausted cushion (A == 0) yield False even at high vol.
+        zero_sig = compute_session_sizing(
+            _make_inputs(s_tqqq="0", s_soxl="0", sig_tqqq="0.72", sig_soxl="0.80")
+        )
+        for tid in ("conservative", "balanced", "aggressive"):
+            t = _tier(zero_sig, tid)
+            for inst in ("TQQQ", "SOXL"):
+                f = _fund(t, inst)
+                self.assertEqual(f["x_pre"], "0")
+                self.assertEqual(f["kelly_counterfactual_x"], "0")
+                self.assertFalse(f["kelly_would_have_bound"])
+
+        exhausted = compute_session_sizing(
+            _make_inputs(E="42500", L="7500", sig_tqqq="0.72", sig_soxl="0.80")
+        )
+        cons_ex = _tier(exhausted, "conservative")
+        for inst in ("TQQQ", "SOXL"):
+            f = _fund(cons_ex, inst)
+            self.assertEqual(f["x_pre"], "0")
+            self.assertEqual(f["kelly_counterfactual_x"], "0")
+            self.assertFalse(f["kelly_would_have_bound"])
+
 
 if __name__ == "__main__":
     unittest.main()

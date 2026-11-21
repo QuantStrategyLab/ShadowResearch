@@ -31,7 +31,8 @@ from shadow.sizing import compute_session_sizing, quantize_6dp
 D1_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "d1_synthetic_6sessions.json"
 Y2_OVERLAP_DIR = REPO_ROOT / "tests" / "fixtures" / "y2overlap"
 
-# Independent 6dp expectations frozen in demo/DEMO-CASES.md
+# Independent 6dp expectations from demo/DEMO-CASES.md, with S4 bind flags
+# corrected per demo/DEMO-CASES-CORRECTION-1.md (Astra ruling).
 D1_EXPECTED_6DP: dict[str, dict[str, dict[str, object]]] = {
     "S1": {
         "conservative": {
@@ -87,13 +88,13 @@ D1_EXPECTED_6DP: dict[str, dict[str, dict[str, object]]] = {
     "S4": {
         "conservative": {
             "c": "0.150000", "x_ML": "0.091717", "sub": "c", "x_Ks": "0.113932",
-            "TQQQ": {"v": "0.069444", "x_Kc": "0.012659", "x_pre": "0.006369", "bind": False, "cf": "0.000879", "x_post": "0.006369", "w": "0.002123", "qi": 2, "dq": 2, "sup": False},
-            "SOXL": {"v": "0.062500", "x_Kc": "0.010254", "x_pre": "0.003822", "bind": False, "cf": "0.000427", "x_post": "0.003822", "w": "0.001274", "qi": 1, "dq": 1, "sup": False},
+            "TQQQ": {"v": "0.069444", "x_Kc": "0.012659", "x_pre": "0.006369", "bind": True, "cf": "0.000879", "x_post": "0.006369", "w": "0.002123", "qi": 2, "dq": 2, "sup": False},
+            "SOXL": {"v": "0.062500", "x_Kc": "0.010254", "x_pre": "0.003822", "bind": True, "cf": "0.000427", "x_post": "0.003822", "w": "0.001274", "qi": 1, "dq": 1, "sup": False},
         },
         "balanced": {
             "c": "0.300000", "x_ML": "0.201289", "sub": "c", "x_Ks": "0.227865",
             "TQQQ": {"v": "0.138889", "x_Kc": "0.025318", "x_pre": "0.027957", "bind": True, "cf": "0.003516", "x_post": "0.027957", "w": "0.009319", "qi": 9, "dq": 9, "sup": False},
-            "SOXL": {"v": "0.125000", "x_Kc": "0.020508", "x_pre": "0.016774", "bind": False, "cf": "0.001709", "x_post": "0.016774", "w": "0.005591", "qi": 6, "dq": 6, "sup": False},
+            "SOXL": {"v": "0.125000", "x_Kc": "0.020508", "x_pre": "0.016774", "bind": True, "cf": "0.001709", "x_post": "0.016774", "w": "0.005591", "qi": 6, "dq": 6, "sup": False},
         },
         "aggressive": {
             "c": "0.500000", "x_ML": "0.391176", "sub": "c", "x_Ks": "0.455729",
