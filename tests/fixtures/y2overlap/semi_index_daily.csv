@@ -1,0 +1,16 @@
+# NOTE: Pre-2009-12-22 total return (1994-05-04 through 2009-12-21) is MODELLED via Path C (definitions-contract.md Section 7.1).
+# Pre-TR dividend model: Nasdaq GIW Implied Index Dividend Series (2009-12-22..2012-12-21 annualized y=0.01460417).
+# Corrupt pre-1994-05-04 api.nasdaq.com placeholder rows (close=479.49, O=H=L=0) were detected and stripped.
+# From 2009-12-22 onward, native GIW XSOX Gross TR is used; from 2021-08-25 onward, XSOX substitutes for commercial ICESEMIT.
+# Retrieved: 2026-11-16. Early api.nasdaq.com 1996 stale zero-OHL / missing Mondays are explicitly flagged in quality_flag.
+date,cal_days,dt_yr,pr_close,pr_return,native_tr_close,div_return,idx_total_return,idx_tr_index,tr_regime,is_modelled,source,quality_flag
+2025-11-14,1,0.00273973,6811.19880788,-0.0011053632,8694.54022470,0.0000000000,-0.0011053632,91.6649450353,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-17,3,0.00821918,6705.73711617,-0.0154835727,8560.54327096,0.0000730838,-0.0154116204,90.2522396958,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-18,1,0.00273973,6551.03416551,-0.0230702379,8363.65537367,0.0000724464,-0.0229994629,88.1764866580,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-19,1,0.00273973,6670.03042030,0.0181644992,8515.57698492,-0.0000000000,0.0181644992,89.7781683784,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-20,1,0.00273973,6352.06674527,-0.0476704985,8110.45685412,0.0001013201,-0.0475740084,85.5070610440,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-21,1,0.00273973,6406.43202631,0.0085586760,8179.87162634,0.0000000000,0.0085586760,86.2388882731,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-24,3,0.00821918,6703.19894930,0.0463232766,8560.31183637,0.0001778001,0.0465093130,90.2497997233,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-25,1,0.00273973,6714.17897962,0.0016380284,8574.33387036,0.0000000000,0.0016380284,90.3976314593,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-26,1,0.00273973,6899.46111556,0.0275956504,8810.94819038,-0.0000000000,0.0275956504,92.8922128953,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean
+2025-11-28,2,0.00547945,7025.15030639,0.0182172475,8971.45941438,-0.0000000000,0.0182172475,94.5844533295,native_xsox_sub_for_icesemit,false,giw_xsox_sub_for_icesemit,clean

@@ -1,0 +1,14 @@
+# SOXL Real Leveraged ETF Daily Split- and Distribution-Adjusted Market Close Series (2010-03-11..2026-11-13)
+# Sources: api.nasdaq.com unrounded chart close (60:1 split-adj) + Direxion official distribution schedule, retrieved 2026-11-16
+# Basis note: Direxion publishes no public daily NAV CSV; market-close total returns are audited against Direxion NAV/Market checkpoints.
+date,cal_days,dt_yr,mkt_close_split_adj,div_declared,div_split_adj,mkt_total_return,tr_mkt_index,source,quality_flag
+2025-11-14,1,0.00273973,38.8600000000,0.000000,0.0000000000,-0.0091789903,64.5624954236,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-17,3,0.00821918,36.8400000000,0.000000,0.0000000000,-0.0519814720,61.2064418787,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-18,1,0.00273973,34.3500000000,0.000000,0.0000000000,-0.0675895765,57.0695243902,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-19,1,0.00273973,35.9600000000,0.000000,0.0000000000,0.0468704512,59.7443987502,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-20,1,0.00273973,30.8100000000,0.000000,0.0000000000,-0.1432146830,51.1881236233,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-21,1,0.00273973,31.7300000000,0.000000,0.0000000000,0.0298604349,52.7166232577,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-24,3,0.00821918,35.8600000000,0.000000,0.0000000000,0.1301607312,59.5782574856,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-25,1,0.00273973,36.1700000000,0.000000,0.0000000000,0.0086447295,60.0932954059,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-26,1,0.00273973,39.1900000000,0.000000,0.0000000000,0.0834946088,65.1107615968,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
+2025-11-28,2,0.00547945,41.2600000000,0.000000,0.0000000000,0.0528195968,68.5498857741,nasdaq_chart_plus_direxion_dist,market_close_basis_no_public_daily_nav
