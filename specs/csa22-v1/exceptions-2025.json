@@ -1,6 +1,6 @@
 {
-  "calendar_version": "csa22-v1-provisional",
-  "status": "provisional",
+  "calendar_version": "csa22-v1",
+  "status": "published",
   "exchange": "XNYS",
   "timezone": "America/New_York",
   "coverage_start_date": "2025-01-01",

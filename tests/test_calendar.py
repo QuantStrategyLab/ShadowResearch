@@ -1,4 +1,4 @@
-"""Unit tests for C-SA-22 provisional calendar spec and consumer."""
+"""Unit tests for C-SA-22 published calendar spec and consumer."""
 
 from __future__ import annotations
 
