@@ -1,0 +1,30 @@
+name: Documentation check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    uses: QuantStrategyLab/.github/.github/workflows/docs-acceptance.yml@b4966bdd8780cad3ae5154ae50d8b98259a16dc6
+    with:
+      policy-revision: b4966bdd8780cad3ae5154ae50d8b98259a16dc6
+      mode: advisory
+
+  docs:
+    name: Documentation check
+    needs: policy
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require documentation policy acceptance
+        run: test "${{ needs.policy.result }}" = "success"
