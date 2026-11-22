@@ -1,0 +1,14 @@
+# USD Overnight Risk-Free Funding Rate (r_f) and 3-Month Treasury Constant Maturity Collateral Rate
+# Sources: Federal Reserve Board H.15 (RIFSPFF_N.B & RIFLGFCM03_N.B) + NY Fed Markets API SOFR, retrieved 2026-11-16
+# Stitch rule: EFFR for 1985-01-31..2018-04-01; NY Fed SOFR from 2018-04-02 onward; bond holidays carried forward.
+date,cal_days,dt_yr,rf_rate,effr_rate,sofr_rate,tbill_3m_rate,rf_regime,quality_flag
+2025-11-14,1,0.00273973,0.039500,0.038800,0.039500,0.039500,nyfed_sofr,clean
+2025-11-17,3,0.00821918,0.040000,0.038800,0.040000,0.039700,nyfed_sofr,clean
+2025-11-18,1,0.00273973,0.039400,0.038800,0.039400,0.039400,nyfed_sofr,clean
+2025-11-19,1,0.00273973,0.039100,0.038800,0.039100,0.039500,nyfed_sofr,clean
+2025-11-20,1,0.00273973,0.039100,0.038800,0.039100,0.039400,nyfed_sofr,clean
+2025-11-21,1,0.00273973,0.039300,0.038800,0.039300,0.039000,nyfed_sofr,clean
+2025-11-24,3,0.00821918,0.039600,0.038800,0.039600,0.039100,nyfed_sofr,clean
+2025-11-25,1,0.00273973,0.040100,0.038800,0.040100,0.039000,nyfed_sofr,clean
+2025-11-26,1,0.00273973,0.040500,0.038800,0.040500,0.039200,nyfed_sofr,clean
+2025-11-28,2,0.00547945,0.041200,0.038900,0.041200,0.038800,nyfed_sofr,clean

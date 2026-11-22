@@ -1,0 +1,11 @@
+{
+  "chart": {
+    "result": [
+      {
+        "meta": {"symbol": "XSOX", "currency": "USD"},
+        "timestamp": [1763758800],
+        "indicators": {"quote": [{"close": [8179.87]}]}
+      }
+    ]
+  }
+}

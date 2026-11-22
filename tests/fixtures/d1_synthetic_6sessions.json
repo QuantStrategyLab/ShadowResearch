@@ -1,0 +1,113 @@
+{
+  "fixture_id": "d1_synthetic_6sessions",
+  "chain_id": "drill-sh1-demo-d1",
+  "mode": "drill",
+  "sessions": [
+    {
+      "session_id": "S1",
+      "scenario": "full_cushion_s_1",
+      "session_date": "2025-11-21",
+      "decision_timestamp_utc": "2025-11-21T21:00:00.000Z",
+      "inputs": {
+        "E": "50000",
+        "E_star": "50000",
+        "H": "0",
+        "L": "0",
+        "funds": {
+          "TQQQ": {"s": "1", "close_price": "50", "q_pre": 0, "sigma_forecast": "0.05"},
+          "SOXL": {"s": "1", "close_price": "40", "q_pre": 0, "sigma_forecast": "0.05"}
+        }
+      }
+    },
+    {
+      "session_id": "S2",
+      "scenario": "drawdown_10pct",
+      "session_date": "2025-11-24",
+      "decision_timestamp_utc": "2025-11-24T21:00:00.000Z",
+      "inputs": {
+        "E": "45000",
+        "E_star": "50000",
+        "H": "0",
+        "L": "5000",
+        "funds": {
+          "TQQQ": {"s": "1", "close_price": "50", "q_pre": 0, "sigma_forecast": "0.10"},
+          "SOXL": {"s": "1", "close_price": "40", "q_pre": 0, "sigma_forecast": "0.10"}
+        }
+      }
+    },
+    {
+      "session_id": "S3",
+      "scenario": "s_lt_1_joint_cap_binding",
+      "session_date": "2025-11-25",
+      "decision_timestamp_utc": "2025-11-25T21:00:00.000Z",
+      "inputs": {
+        "E": "50000",
+        "E_star": "50000",
+        "H": "0",
+        "L": "0",
+        "funds": {
+          "TQQQ": {"s": "0.85", "close_price": "50", "q_pre": 0, "sigma_forecast": "0.05"},
+          "SOXL": {"s": "0.90", "close_price": "40", "q_pre": 0, "sigma_forecast": "0.05"}
+        }
+      }
+    },
+    {
+      "session_id": "S4",
+      "scenario": "high_forecast_vol_kelly_would_bind",
+      "session_date": "2025-11-26",
+      "decision_timestamp_utc": "2025-11-26T21:00:00.000Z",
+      "inputs": {
+        "E": "50000",
+        "E_star": "50000",
+        "H": "0",
+        "L": "0",
+        "funds": {
+          "TQQQ": {"s": "1", "close_price": "50", "q_pre": 0, "sigma_forecast": "0.72"},
+          "SOXL": {"s": "1", "close_price": "40", "q_pre": 0, "sigma_forecast": "0.80"}
+        }
+      }
+    },
+    {
+      "session_id": "S5",
+      "scenario": "half_day_13_00_est",
+      "session_date": "2025-11-28",
+      "decision_timestamp_utc": "2025-11-28T18:00:00.000Z",
+      "inputs": {
+        "E": "50000",
+        "E_star": "50000",
+        "H": "0",
+        "L": "0",
+        "funds": {
+          "TQQQ": {"s": "1", "close_price": "50", "q_pre": 0, "sigma_forecast": "0.05"},
+          "SOXL": {"s": "1", "close_price": "40", "q_pre": 0, "sigma_forecast": "0.05"}
+        }
+      }
+    },
+    {
+      "session_id": "S6",
+      "scenario": "post_2_1_tqqq_split",
+      "session_date": "2025-12-01",
+      "decision_timestamp_utc": "2025-12-01T21:00:00.000Z",
+      "inputs": {
+        "E": "50000",
+        "E_star": "50000",
+        "H": "0",
+        "L": "0",
+        "funds": {
+          "TQQQ": {
+            "s": "1",
+            "close_price": "25",
+            "q_pre": {"conservative": 44, "balanced": 100, "aggressive": 194},
+            "sigma_forecast": "0.05"
+          },
+          "SOXL": {
+            "s": "1",
+            "close_price": "40",
+            "q_pre": {"conservative": 6, "balanced": 13, "aggressive": 27},
+            "sigma_forecast": "0.05"
+          }
+        }
+      }
+    }
+  ]
+}

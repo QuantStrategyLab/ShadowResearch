@@ -1,0 +1,15 @@
+# NOTE: Pre-1999-03-04 total return (1985-01-31 through 1999-03-03) is MODELLED via Path C (definitions-contract.md Section 7.1).
+# Pre-TR dividend model: Nasdaq GIW Implied Index Dividend Series (1999-03-04..2002-03-04 annualized y=0.00055003).
+# From 1999-03-04 onward, idx_total_return uses native Nasdaq GIW XNDX Gross Total Return strictly (is_modelled=false).
+# Retrieved: 2026-11-16. NDX reflects retroactive 1994-01-04 2:1 base adjustment (1985-01-31 close=125.0).
+date,cal_days,dt_yr,pr_close,pr_return,native_tr_close,div_return,idx_total_return,idx_tr_index,tr_regime,is_modelled,source,quality_flag
+2025-11-14,1,0.00273973,25008.24161073,0.0005913155,30387.33095130,0.0001216163,0.0007130037,244.9898763763,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-17,3,0.00821918,24799.91783393,-0.0083302049,30134.79660379,0.0000198560,-0.0083105143,242.9538845125,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-18,1,0.00273973,24503.09634736,-0.0119686480,29774.79891387,0.0000226735,-0.0119462459,240.0514976694,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-19,1,0.00273973,24640.51539608,0.0056082320,29941.99810938,0.0000071878,0.0056154601,241.3994972783,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-20,1,0.00273973,24054.37959487,-0.0237874814,29235.20712502,0.0001865817,-0.0236053380,235.7011805634,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-21,1,0.00273973,24239.57343846,0.0076989657,29462.35006497,0.0000699953,0.0077694999,237.5324608712,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-24,3,0.00821918,24873.85398347,0.0261671496,30233.69100179,0.0000130722,0.0261805638,243.7511946277,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-25,1,0.00273973,25018.36017745,0.0058095619,30409.46839424,0.0000043702,0.0058139574,245.1683536968,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-26,1,0.00273973,25236.93914057,0.0087367422,30676.99567717,0.0000602311,0.0087974995,247.3252221654,native_xndx_gross_tr,false,giw_xndx_native,clean
+2025-11-28,2,0.00547945,25434.88915826,0.0078436619,30918.76780651,0.0000372651,0.0078812193,249.2744464712,native_xndx_gross_tr,false,giw_xndx_native,clean
