@@ -22,13 +22,24 @@ B0 = USD 50,000 (a record, not real money); H = 0.
 
 ## Layout
 
-- `docs/` — batch briefs and probe reports.
+- `config/` — pinned drill-chain scheduler and OpenTimestamps anchor configuration.
+- `deploy/scheduler/` — user-level systemd, watchdog, and `launchd` drill templates.
+- `docs/` — batch briefs, probe reports, acceptance pack, and scheduler runbook.
 - `specs/` — pinned specification packages consumed by digest
   (C-SA-22 calendar spec package is published here by the coordinator).
-- `src/` — feeder, sizing stack, ledger, replay, scheduler.
+- `src/` — feeder, sizing stack, ledger, OpenTimestamps client/verifier, replay, scheduler, acceptance pack.
 - `tests/` — unit and fixture suites.
 - Ledger data (records, receipts, raw market bytes) is committed to a
   dedicated append-only data branch, never to `main`.
+
+## Local verification
+
+```sh
+python3 -m unittest discover -s tests
+python3 demo/run_demo.py
+PYTHONPATH=src python3 -m shadow.scheduler dry-run
+PYTHONPATH=src python3 -m shadow.acceptance
+```
 
 ## Operating constraints
 

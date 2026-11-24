@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
+from pathlib import Path
+
+from shadow.manifest import (
+    compute_code_manifest_hash,
+    load_calendar_manifest_identity,
+    load_effective_runtime_config,
+)
 
 TIER_ORDER: tuple[str, ...] = ("aggressive", "balanced", "conservative")
 INSTRUMENT_ORDER: tuple[str, ...] = ("SOXL", "TQQQ")
+STAGE_N_NOTIONAL_B0 = Decimal("50000")
+STAGE_N_DEFAULT_H = Decimal("0")
 
 TIER_CONFIGS: dict[str, dict[str, str]] = {
     "conservative": {
@@ -39,6 +49,24 @@ TIER_CONFIGS: dict[str, dict[str, str]] = {
     },
 }
 
+CLOCK_START_DEFINITION: dict[str, object] = {
+    "clk_id": "CLK-01",
+    "requires_sh2_acceptance": True,
+    "requires_fuse1_engine_hash": True,
+    "requires_policy_digest": True,
+    "requires_calendar_digest": True,
+    "requires_detached_receipt": True,
+    "requires_within_commitment_deadline": True,
+    "drills_and_y2_credit_eligible": False,
+    "reset_triggers": [
+        "session_gap",
+        "backfill",
+        "missed_run_non_detection",
+        "replay_mismatch",
+        "unversioned_parameter_edit",
+    ],
+}
+
 PINNED_POLICY_PARAMS: dict[str, object] = {
     "policy_id": "policy_v0_pre",
     "B0": "50000",
@@ -56,6 +84,16 @@ PINNED_POLICY_PARAMS: dict[str, object] = {
     "kelly_applied": False,
     "stop_loss_return_rule": "OFF",
     "loss_controls_armed": False,
+    "unavailable_broker_inputs": "explicitly_unverified",
+    "raw_vs_adjusted_separation": "7A_raw_vs_adjusted_separated",
+    "monthly_diagnostic_rule": "diagnostic_only_unread_by_sizing",
+    "cost_assumptions": {
+        "stage": "stage_n_notional",
+        "commission_model": "notional_zero_order_path",
+        "spread_slippage_model": "unresolved_oi_cost_3_4_unverified",
+        "accrual_day_count": "days/365",
+    },
+    "clock_start_definition": CLOCK_START_DEFINITION,
     "tiers": TIER_CONFIGS,
 }
 
@@ -89,10 +127,43 @@ def quantize_6dp(value: Decimal | str) -> Decimal:
     return d.quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN)
 
 
-def policy_config_hash() -> str:
-    """Return deterministic SHA-256 hex digest of pinned policy_v0_pre parameters."""
+def policy_config_hash(
+    *,
+    runtime_config: dict[str, object] | None = None,
+    calendar_spec: dict[str, object] | None = None,
+    code_manifest_hash: str | None = None,
+    repo_root: str | Path | None = None,
+) -> str:
+    """Return deterministic SHA-256 of complete policy, runtime config, calendar, and code manifest."""
+    eff_cfg = (
+        runtime_config
+        if runtime_config is not None
+        else load_effective_runtime_config(repo_root)
+    )
+    cal_ver = str(eff_cfg.get("calendar_version", "csa22-v1"))
+    if calendar_spec is not None:
+        rules = calendar_spec.get("rules") if isinstance(calendar_spec.get("rules"), dict) else {}
+        cal_ident = {
+            "calendar_version": str(
+                calendar_spec.get("calendar_version") or rules.get("calendar_version") or cal_ver
+            ),
+            "spec_digest": str(calendar_spec.get("spec_digest", "")),
+        }
+    else:
+        cal_ident = load_calendar_manifest_identity(repo_root, calendar_version=cal_ver)
+    exec_sha = (
+        code_manifest_hash
+        if code_manifest_hash is not None
+        else compute_code_manifest_hash(repo_root, calendar_version=cal_ident["calendar_version"])
+    )
+    identity_payload = {
+        "policy_params": PINNED_POLICY_PARAMS,
+        "effective_runtime_config": eff_cfg,
+        "calendar_identity": cal_ident,
+        "executable_manifest_sha256": exec_sha,
+    }
     blob = json.dumps(
-        PINNED_POLICY_PARAMS,
+        identity_payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -164,6 +235,138 @@ def _binding_constraint(
     if s_i < Decimal("1"):
         suffixes.append("s")
     return base if not suffixes else f"{base}+{'+'.join(suffixes)}"
+
+
+def compute_monthly_diagnostics(
+    monthly_returns: Sequence[Decimal | int | str] | None,
+) -> dict[str, object]:
+    """Compute monthly win-rate, Bayesian CI, and payoff diagnostic (unread by sizing)."""
+    if monthly_returns is None:
+        return {
+            "status": "unavailable",
+            "reason": "insufficient_monthly_observations",
+            "sample_months": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "flat_count": 0,
+            "win_rate": None,
+            "win_rate_bayes_ci": None,
+            "payoff_ratio": None,
+            "payoff_reason": "insufficient_monthly_observations",
+            "unread_by_sizing": True,
+        }
+    if isinstance(monthly_returns, (str, bytes, dict)):
+        raise SizingInputError("monthly_returns", "monthly_returns must be a sequence")
+
+    with localcontext() as ctx:
+        ctx.prec = 28
+        ctx.rounding = ROUND_HALF_EVEN
+        parsed = [_to_decimal(item, "monthly_returns") for item in monthly_returns]
+        if not parsed:
+            return {
+                "status": "unavailable",
+                "reason": "insufficient_monthly_observations",
+                "sample_months": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "flat_count": 0,
+                "win_rate": None,
+                "win_rate_bayes_ci": None,
+                "payoff_ratio": None,
+                "payoff_reason": "insufficient_monthly_observations",
+                "unread_by_sizing": True,
+            }
+
+        wins = [r for r in parsed if r > 0]
+        losses = [r for r in parsed if r < 0]
+        flats = [r for r in parsed if r == 0]
+        n = len(parsed)
+        win_count = len(wins)
+        loss_count = len(losses)
+        win_rate = Decimal(win_count) / Decimal(n)
+
+        # Uniform Beta(1, 1) posterior mean and 95% normal-approximation credible interval
+        alpha = Decimal(1 + win_count)
+        beta = Decimal(1 + (n - win_count))
+        total = alpha + beta
+        post_mean = alpha / total
+        post_var = (alpha * beta) / ((total ** 2) * (total + Decimal("1")))
+        half_width = Decimal("1.959963984540054") * post_var.sqrt()
+        ci_low = max(Decimal("0"), post_mean - half_width)
+        ci_high = min(Decimal("1"), post_mean + half_width)
+
+        if wins and losses:
+            avg_win = sum(wins) / Decimal(win_count)
+            avg_loss_abs = abs(sum(losses) / Decimal(loss_count))
+            payoff_ratio: str | None = canonical_decimal_str(avg_win / avg_loss_abs)
+            payoff_reason: str | None = None
+        elif not losses:
+            payoff_ratio = None
+            payoff_reason = "no_losses_in_window"
+        else:
+            payoff_ratio = None
+            payoff_reason = "no_wins_in_window"
+
+        return {
+            "status": "computed",
+            "reason": None,
+            "sample_months": n,
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "flat_count": len(flats),
+            "win_rate": canonical_decimal_str(win_rate),
+            "win_rate_bayes_ci": {
+                "prior": "Beta(1,1)",
+                "level": "0.95",
+                "mean": canonical_decimal_str(post_mean),
+                "lower": canonical_decimal_str(ci_low),
+                "upper": canonical_decimal_str(ci_high),
+            },
+            "payoff_ratio": payoff_ratio,
+            "payoff_reason": payoff_reason,
+            "unread_by_sizing": True,
+        }
+
+
+def compute_raw_vs_adjusted_separation(
+    e_val: Decimal,
+    prior_e: Decimal | None,
+    external_flow: Decimal = Decimal("0"),
+) -> dict[str, object]:
+    """Compute 7A separation between raw asset change and cash-flow-adjusted P&L/return."""
+    labels = {
+        "raw": "Asset change (includes cash flows)",
+        "adjusted": "Cash-flow-adjusted P&L/return",
+    }
+    if prior_e is None:
+        return {
+            "status": "unavailable",
+            "unavailable_reason": "prior_equity_unavailable",
+            "external_flow_usd": canonical_decimal_str(external_flow),
+            "raw_asset_change_usd": None,
+            "raw_asset_change_pct": None,
+            "adjusted_pnl_usd": None,
+            "adjusted_return_pct": None,
+            "labels": labels,
+        }
+    if prior_e <= 0:
+        raise SizingInputError("prior_E", f"prior_E must be > 0, got {prior_e}")
+
+    raw_change = e_val - prior_e
+    raw_pct = raw_change / prior_e
+    adj_pnl = e_val - prior_e - external_flow
+    denom = prior_e + external_flow
+    adj_pct = canonical_decimal_str(adj_pnl / denom) if denom > 0 else None
+    return {
+        "status": "computed",
+        "unavailable_reason": None,
+        "external_flow_usd": canonical_decimal_str(external_flow),
+        "raw_asset_change_usd": canonical_decimal_str(raw_change),
+        "raw_asset_change_pct": canonical_decimal_str(raw_pct),
+        "adjusted_pnl_usd": canonical_decimal_str(adj_pnl),
+        "adjusted_return_pct": adj_pct,
+        "labels": labels,
+    }
 
 
 def compute_session_sizing(
@@ -433,9 +636,17 @@ def compute_session_sizing(
                 }
             )
 
+        prior_e_raw = inputs.get("prior_E")
+        prior_e = _to_decimal(prior_e_raw, "prior_E") if prior_e_raw is not None else None
+        ext_flow_raw = inputs.get("external_flow", "0")
+        ext_flow = _to_decimal(ext_flow_raw, "external_flow")
+        raw_vs_adjusted = compute_raw_vs_adjusted_separation(e_val, prior_e, ext_flow)
+        monthly_diagnostic = compute_monthly_diagnostics(inputs.get("monthly_returns"))
+
         return {
             "policy_id": "policy_v0_pre",
             "policy_config_hash": policy_config_hash(),
+            "unavailable_broker_inputs": "explicitly_unverified",
             "bankroll": {
                 "E": canonical_decimal_str(e_val),
                 "E_star": canonical_decimal_str(e_star),
@@ -445,5 +656,7 @@ def compute_session_sizing(
                 "W_ref": canonical_decimal_str(w_ref),
                 "L": canonical_decimal_str(l_val),
             },
+            "raw_vs_adjusted": raw_vs_adjusted,
+            "monthly_diagnostic": monthly_diagnostic,
             "tiers": tiers_out,
         }

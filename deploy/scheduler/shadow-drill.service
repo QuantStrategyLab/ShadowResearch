@@ -1,0 +1,19 @@
+[Unit]
+Description=SHADOW-N SH-1 Daily Drill Cycle (OA-SH1-6 gated; drill chain only, CLK-01 inactive)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=15
+CPUQuota=25%
+MemoryMax=512M
+TasksMax=32
+OOMScoreAdjust=500
+WorkingDirectory=%h/shadow-research
+Environment=PYTHONPATH=%h/shadow-research/src
+ExecStart=/usr/bin/env bash -lc 'set -euo pipefail; source "%h/dev-env-mini/env.sh"; exec python3 -m shadow.scheduler run-drill --session auto --data-dir "%h/shadow-research/data/drill" --config "%h/shadow-research/config/drill-scheduler.json"'
+StandardOutput=append:%h/shadow-research/data/drill/logs/shadow-drill.log
+StandardError=append:%h/shadow-research/data/drill/logs/shadow-drill.log
+
+[Install]
+WantedBy=default.target

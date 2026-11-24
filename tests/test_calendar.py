@@ -1,4 +1,4 @@
-"""Unit tests for C-SA-22 provisional calendar spec and consumer."""
+"""Unit tests for C-SA-22 published calendar spec and consumer."""
 
 from __future__ import annotations
 
@@ -13,7 +13,12 @@ _SRC = str(Path(__file__).resolve().parents[1] / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from shadow.calendar_consumer import CalendarDigestError, load_spec, resolve_session
+from shadow.calendar_consumer import (
+    CalendarDigestError,
+    load_spec,
+    resolve_prior_close_session,
+    resolve_session,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPEC_DIR = REPO_ROOT / "specs" / "csa22-v1"
@@ -111,6 +116,24 @@ class CalendarConsumerTest(unittest.TestCase):
             exc_file.write_text(exc_file.read_text(encoding="utf-8") + " ", encoding="utf-8")
             with self.assertRaises(CalendarDigestError):
                 load_spec(copy_dir)
+
+    def test_resolve_prior_close_session_and_dynamic_exceptions_filename(self) -> None:
+        spec = load_spec(SPEC_DIR)
+        # Before Friday regular close -> resolves Thursday 2025-11-20
+        before_fri = resolve_prior_close_session("2025-11-21T20:55:00.000Z", spec=spec)
+        self.assertEqual(before_fri["trade_date"], "2025-11-20")
+        # At/after Friday regular close -> resolves Friday 2025-11-21
+        at_fri = resolve_prior_close_session("2025-11-21T21:00:00.000Z", spec=spec)
+        self.assertEqual(at_fri["trade_date"], "2025-11-21")
+        # Saturday morning UTC/ET -> resolves Friday 2025-11-21
+        sat = resolve_prior_close_session("2025-11-22T05:55:00.000Z", spec=spec)
+        self.assertEqual(sat["trade_date"], "2025-11-21")
+        # Thanksgiving afternoon -> resolves Wednesday 2025-11-26
+        thx = resolve_prior_close_session("2025-11-27T22:00:00.000Z", spec=spec)
+        self.assertEqual(thx["trade_date"], "2025-11-26")
+        # Half-day 2025-11-28 after 13:00 EST (18:00Z) -> resolves 2025-11-28
+        half_after = resolve_prior_close_session("2025-11-28T18:05:00.000Z", spec=spec)
+        self.assertEqual(half_after["trade_date"], "2025-11-28")
 
 
 if __name__ == "__main__":

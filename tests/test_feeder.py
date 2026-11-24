@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -18,9 +19,14 @@ from shadow.feeder import (
     VINTAGE_Y2,
     _parse_y2_csv_bytes,
     emit_market_records_from_fixtures,
+    emit_market_records_from_payloads,
     emit_y2_reconstruction_records,
+    expected_prior_sofr_business_day,
     read_verified_archived_bytes,
     run_reconstruction_window,
+    select_nyfed_sofr_entry,
+    select_tiingo_row,
+    select_yahoo_close,
 )
 from shadow.ledger import check_forward_clock_credit
 
@@ -38,7 +44,7 @@ class FeederTest(unittest.TestCase):
             recs_v0 = emit_market_records_from_fixtures(
                 fixture_dir=FEEDER_FIXTURES,
                 session_date="2025-11-21",
-                retrieval_time_utc="2025-11-21T20:55:00.000Z",
+                retrieval_time_utc="2025-11-21T21:30:00.000Z",
                 archive_dir=archive_dir,
             )
             self.assertEqual(len(recs_v0), 6)
@@ -61,7 +67,7 @@ class FeederTest(unittest.TestCase):
             recs_v1 = emit_market_records_from_fixtures(
                 fixture_dir=FEEDER_FIXTURES,
                 session_date="2025-11-21",
-                retrieval_time_utc="2025-11-21T20:58:00.000Z",
+                retrieval_time_utc="2025-11-21T21:35:00.000Z",
                 archive_dir=archive_dir,
                 revision_seq=1,
                 sofr_filename="nyfed_sofr_2025-11-21_rev.json",
@@ -135,6 +141,174 @@ class FeederTest(unittest.TestCase):
             self.assertTrue(first_day["SEMI"]["is_modelled"])
             second_day = {r["instrument"]: r for r in recs["2025-11-17"]}
             self.assertFalse(second_day["XNDX"]["is_modelled"])
+
+    def test_normalization_honesty_t_minus_1_sofr_ca_fields_and_yahoo_timestamps(self) -> None:
+        # Item #10 & #2: SOFR requires effectiveDate < session_date (strict T-1)
+        same_day_only = json.dumps(
+            {"refRates": [{"effectiveDate": "2025-11-24", "type": "SOFR", "percentRate": 3.95}]}
+        ).encode("utf-8")
+        with self.assertRaises(ValueError):
+            select_nyfed_sofr_entry(same_day_only, "2025-11-24")
+
+        with_prior = json.dumps(
+            {
+                "refRates": [
+                    {"effectiveDate": "2025-11-21", "type": "SOFR", "percentRate": 3.92},
+                    {"effectiveDate": "2025-11-24", "type": "SOFR", "percentRate": 3.95},
+                ]
+            }
+        ).encode("utf-8")
+        picked = select_nyfed_sofr_entry(with_prior, "2025-11-24")
+        self.assertEqual(picked["effectiveDate"], "2025-11-21")
+
+        # Item #10: Tiingo refuses synthesizing missing divCash or splitFactor
+        missing_ca_bytes = json.dumps([{"date": "2025-11-21T00:00:00.000Z", "close": 50.0}]).encode("utf-8")
+        with self.assertRaises(ValueError) as ctx_ca:
+            select_tiingo_row(missing_ca_bytes, "2025-11-21")
+        self.assertEqual(str(ctx_ca.exception), "tiingo_missing_corporate_action_fields")
+
+        # Daily Tiingo row without publication timestamp leaves source_publication_time_utc=None
+        valid_tiingo = json.dumps(
+            [{"date": "2025-11-21T00:00:00.000Z", "close": 50.0, "divCash": 0.0, "splitFactor": 1.0}]
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recs = emit_market_records_from_payloads(
+                [("TQQQ", "TQQQ", "etf_tiingo"), ("SOXL", "SOXL", "etf_tiingo")],
+                {"TQQQ": valid_tiingo, "SOXL": missing_ca_bytes},
+                session_date="2025-11-21",
+                retrieval_time_utc="2025-11-21T21:30:00.000Z",
+                archive_dir=Path(tmpdir) / "arch",
+                vintage="recorded_fixture",
+                observation_class="synthetic",
+                provider_for={"TQQQ": "tiingo_fixture", "SOXL": "tiingo_fixture"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )
+            self.assertIsNone(recs[0]["source_publication_time_utc"])
+            self.assertFalse(recs[1]["eligibility"]["eligible"])
+            self.assertEqual(recs[1]["eligibility"]["reason"], "tiingo_missing_corporate_action_fields")
+
+            # Pre-close call MUST fail session_close_utc lower bound even when session_close_utc param is omitted
+            pre_close_recs = emit_market_records_from_payloads(
+                [("TQQQ", "TQQQ", "etf_tiingo")],
+                {"TQQQ": valid_tiingo},
+                session_date="2025-11-21",
+                retrieval_time_utc="2025-11-21T20:55:00.000Z",
+                archive_dir=Path(tmpdir) / "arch_pre",
+                vintage="recorded_fixture",
+                observation_class="synthetic",
+                provider_for={"TQQQ": "tiingo_fixture"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )
+            self.assertFalse(pre_close_recs[0]["eligibility"]["eligible"])
+            self.assertEqual(pre_close_recs[0]["eligibility"]["reason"], "session_not_yet_closed")
+
+        # Item #2/#12: Yahoo without bar timestamps is rejected even with 1 close value
+        no_ts_yahoo = json.dumps(
+            {"chart": {"result": [{"timestamp": [], "indicators": {"quote": [{"close": [29500.0]}]}}]}}
+        ).encode("utf-8")
+        with self.assertRaises(ValueError):
+            select_yahoo_close(no_ts_yahoo, "2025-11-21")
+
+        # R3 #7 regression: SOFR T-1 business day checks & stale SOFR rejection
+        self.assertEqual(expected_prior_sofr_business_day("2025-11-24"), "2025-11-21")
+        # US federal bond-only holidays: Veterans Day (2025-11-11 Tue) & Columbus Day (2025-10-13 Mon)
+        self.assertEqual(expected_prior_sofr_business_day("2025-11-12"), "2025-11-10")
+        self.assertEqual(expected_prior_sofr_business_day("2025-10-14"), "2025-10-10")
+
+        sofr_series = [("SOFR", "SOFR", "rate_sofr")]
+        stale_sofr_payload = json.dumps(
+            {"refRates": [{"effectiveDate": "2025-11-17", "type": "SOFR", "percentRate": 3.91, "revisionIndicator": ""}]}
+        ).encode("utf-8")
+        fresh_sofr_payload = json.dumps(
+            {"refRates": [{"effectiveDate": "2025-11-21", "type": "SOFR", "percentRate": 3.92, "revisionIndicator": ""}]}
+        ).encode("utf-8")
+        bond_gap_payload = json.dumps(
+            {"refRates": [{"effectiveDate": "2025-11-10", "type": "SOFR", "percentRate": 3.95, "revisionIndicator": ""}]}
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stale_rec = emit_market_records_from_payloads(
+                sofr_series,
+                {"SOFR": stale_sofr_payload},
+                session_date="2025-11-24",
+                retrieval_time_utc="2025-11-24T21:30:00.000Z",
+                archive_dir=Path(tmpdir) / "sofr_stale",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"SOFR": "nyfed_sofr"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertFalse(stale_rec["eligibility"]["eligible"])
+            self.assertEqual(stale_rec["eligibility"]["reason"], "sofr_stale_effective_date")
+            self.assertEqual(stale_rec["disclosures"]["vintage_lag"], "stale")
+            self.assertEqual(stale_rec["disclosures"]["actual_effective_date"], "2025-11-17")
+            self.assertEqual(stale_rec["disclosures"]["expected_effective_date"], "2025-11-21")
+
+            fresh_rec = emit_market_records_from_payloads(
+                sofr_series,
+                {"SOFR": fresh_sofr_payload},
+                session_date="2025-11-24",
+                retrieval_time_utc="2025-11-24T21:30:00.000Z",
+                archive_dir=Path(tmpdir) / "sofr_fresh",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"SOFR": "nyfed_sofr"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertTrue(fresh_rec["eligibility"]["eligible"])
+            self.assertEqual(fresh_rec["disclosures"]["vintage_lag"], "T-1")
+
+            bond_gap_rec = emit_market_records_from_payloads(
+                sofr_series,
+                {"SOFR": bond_gap_payload},
+                session_date="2025-11-12",
+                retrieval_time_utc="2025-11-12T21:30:00.000Z",
+                archive_dir=Path(tmpdir) / "sofr_bond",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"SOFR": "nyfed_sofr"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertTrue(bond_gap_rec["eligibility"]["eligible"])
+            self.assertEqual(bond_gap_rec["disclosures"]["vintage_lag"], "T-1")
+            self.assertEqual(bond_gap_rec["disclosures"]["expected_effective_date"], "2025-11-10")
+
+            # R4 #7 regression: XNYS unscheduled closure (2025-01-09 Carter Mourning) STILL publishes NY Fed SOFR
+            self.assertEqual(expected_prior_sofr_business_day("2025-01-10"), "2025-01-09")
+            jan09_sofr_payload = json.dumps(
+                {"refRates": [{"effectiveDate": "2025-01-09", "type": "SOFR", "percentRate": 4.29, "revisionIndicator": ""}]}
+            ).encode("utf-8")
+            jan08_stale_payload = json.dumps(
+                {"refRates": [{"effectiveDate": "2025-01-08", "type": "SOFR", "percentRate": 4.30, "revisionIndicator": ""}]}
+            ).encode("utf-8")
+            jan09_rec = emit_market_records_from_payloads(
+                sofr_series,
+                {"SOFR": jan09_sofr_payload},
+                session_date="2025-01-10",
+                retrieval_time_utc="2025-01-10T21:30:00.000Z",
+                archive_dir=Path(tmpdir) / "sofr_jan09",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"SOFR": "nyfed_sofr"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertTrue(jan09_rec["eligibility"]["eligible"])
+            self.assertEqual(jan09_rec["disclosures"]["vintage_lag"], "T-1")
+            self.assertEqual(jan09_rec["disclosures"]["expected_effective_date"], "2025-01-09")
+
+            jan08_rec = emit_market_records_from_payloads(
+                sofr_series,
+                {"SOFR": jan08_stale_payload},
+                session_date="2025-01-10",
+                retrieval_time_utc="2025-01-10T21:30:00.000Z",
+                archive_dir=Path(tmpdir) / "sofr_jan08_stale",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"SOFR": "nyfed_sofr"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertFalse(jan08_rec["eligibility"]["eligible"])
+            self.assertEqual(jan08_rec["eligibility"]["reason"], "sofr_stale_effective_date")
+            self.assertEqual(jan08_rec["disclosures"]["expected_effective_date"], "2025-01-09")
 
 
 if __name__ == "__main__":

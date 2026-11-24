@@ -1,0 +1,38 @@
+{
+  "schema_version": "sh1-drill-scheduler-v1",
+  "chain_id": "drill-sh1-v1",
+  "mode": "drill",
+  "clk01_active": false,
+  "production_mode_forbidden": true,
+  "venue": "XNYS",
+  "calendar_version": "csa22-v1",
+  "decision_instant_et": "17:30",
+  "half_day_run_time_et": "14:30",
+  "decision_instant_status": "provisional_pending_weekday_finalization_probe",
+  "decision_cutoff_et": "18:00",
+  "decision_cutoff_half_day_et": "15:00",
+  "commitment_deadline_et": "23:30",
+  "treasury_endpoint": "https://home.treasury.gov/sites/default/files/interest-rates/yield{year}.csv",
+  "yahoo_symbol_map": {
+    "XNDX": "^XNDX",
+    "XSOX": "XSOX"
+  },
+  "ots_calendars": [
+    "https://a.pool.opentimestamps.org",
+    "https://b.pool.opentimestamps.org",
+    "https://alice.btc.calendar.opentimestamps.org",
+    "https://bob.btc.calendar.opentimestamps.org"
+  ],
+  "ots_timeout_seconds": 10.0,
+  "max_footprint_bytes": 2147483648,
+  "log_retention_days": 30,
+  "log_max_bytes": 52428800,
+  "resource_caps": {
+    "nice": 15,
+    "cpu_quota": "25%",
+    "memory_max": "512M",
+    "tasks_max": 32,
+    "oom_score_adjust": 500
+  },
+  "notes": "OA-SH1-6 gated drill-chain configuration. Never runs production mode or CLK-01."
+}

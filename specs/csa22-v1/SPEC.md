@@ -1,14 +1,17 @@
-# C-SA-22 Provisional Specification — XNYS Sessions Calendar (`csa22-v1`)
+# C-SA-22 Specification — XNYS Sessions Calendar (`csa22-v1`)
 
-> **PROVISIONAL FIXTURE:** This specification package is a provisional local
-> fixture for the SH-1 §7 design demonstration. Formal C-SA-22 publication and
-> registry entry (R-3) are owned by the coordinator.
+> **PUBLISHED:** This specification package was formally published on
+> 2026-11-21 by Pigbibi (coordinator, QuantStrategyLab) under registration R-3
+> of `docs/BRIEF-SH-1.md`. It supersedes the provisional fixture whose
+> `spec_digest` was
+> `9444245b899b285b0e8f7c9e8a0340ebc6b54683abf797f9884ed7cb11660f7e`;
+> consumers bind to the `spec_digest` recorded in `manifest.json`.
 
 ## Metadata
 
 - **Contract:** C-SA-22 (`BRIEF-SH-1.md` §5.3)
-- **Calendar Version:** `csa22-v1-provisional`
-- **Status:** `provisional`
+- **Calendar Version:** `csa22-v1`
+- **Status:** `published`
 - **Exchange:** `XNYS`
 - **Timezone:** `America/New_York`
 - **Coverage Window:** `2025-01-01` through `2025-12-31` (inclusive)
