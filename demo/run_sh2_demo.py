@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -65,6 +65,7 @@ def _sample_inputs(
     *,
     e_val: str = "50000",
     sigma_tqqq: str = "0.24",
+    include_sources: bool = True,
     extra: dict | None = None,
 ) -> dict:
     payload: dict = {
@@ -77,67 +78,164 @@ def _sample_inputs(
             "SOXL": {"s": "1", "close_price": "40", "q_pre": 100, "sigma_forecast": "0.22"},
         },
     }
+    if include_sources:
+        payload.update(
+            {
+                "prior_closes": {
+                    "TQQQ": "49",
+                    "SOXL": "39.5",
+                    "XNDX": "29350",
+                    "SEMI": "8150",
+                },
+                "current_index_closes": {"XNDX": "29500", "SEMI": "8200"},
+                "positions_source_record": {"as_of": "2026-01-05T22:30:00.000Z", "age_sessions": 0},
+                "broker_reconciliation_source_record": {
+                    "as_of": "2026-01-05T22:30:00.000Z",
+                    "age_sessions": 0,
+                },
+            }
+        )
     if extra:
         payload.update(extra)
     return payload
 
 
-def _build_session_fixture_files(fixture_dir: Path, session_date: str) -> None:
-    fixture_dir.mkdir(parents=True, exist_ok=True)
-    for sym, px in (("tqqq", 50.0), ("soxl", 40.0), ("qqq", 495.0)):
-        (fixture_dir / f"tiingo_{sym}_{session_date}.json").write_text(
-            json.dumps(
-                [
-                    {
-                        "date": f"{session_date}T00:00:00.000Z",
-                        "close": px,
-                        "divCash": 0.0,
-                        "splitFactor": 1.0,
-                    }
-                ]
-            ),
-            encoding="utf-8",
-        )
-    ts_close = int(
-        datetime.strptime(f"{session_date} 16:00", "%Y-%m-%d %H:%M")
-        .replace(tzinfo=_NY_TZ)
-        .timestamp()
-    )
-    for sym, px in (("xndx", 29500.0), ("xsox", 8200.0)):
-        (fixture_dir / f"yahoo_{sym}_{session_date}.json").write_text(
-            json.dumps(
-                {
-                    "chart": {
-                        "result": [
-                            {
-                                "timestamp": [ts_close],
-                                "indicators": {"quote": [{"close": [px]}]},
-                            }
-                        ]
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-    # Use a guaranteed prior weekday (< session_date) matching expected_prior_sofr_business_day
+def _prior_weekday_str(session_date: str) -> str:
+    d = date.fromisoformat(session_date) - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
+def _build_two_day_payloads(
+    session_date: str,
+    *,
+    tqqq_split: float = 1.0,
+    xndx_ret_override: float | None = None,
+) -> dict[str, bytes]:
     from shadow.feeder import expected_prior_sofr_business_day
 
     spec = load_spec(REPO_ROOT / "specs" / "csa22-v2")
+    prev_ds = _prior_weekday_str(session_date)
     sofr_eff = expected_prior_sofr_business_day(session_date, calendar_spec=spec)
-    (fixture_dir / f"nyfed_sofr_{session_date}.json").write_text(
-        json.dumps(
+    out: dict[str, bytes] = {}
+    for sym, prev_px, cur_px in (("TQQQ", 49.0, 50.0), ("SOXL", 39.5, 40.0), ("QQQ", 492.0, 495.0)):
+        cur_split = tqqq_split if sym == "TQQQ" else 1.0
+        out[sym] = json.dumps(
+            [
+                {
+                    "date": f"{prev_ds}T00:00:00.000Z",
+                    "close": prev_px,
+                    "divCash": 0.0,
+                    "splitFactor": 1.0,
+                },
+                {
+                    "date": f"{session_date}T00:00:00.000Z",
+                    "close": cur_px,
+                    "divCash": 0.0,
+                    "splitFactor": cur_split,
+                },
+            ]
+        ).encode("utf-8")
+
+    ts_prev = int(
+        datetime.strptime(f"{prev_ds} 16:00", "%Y-%m-%d %H:%M").replace(tzinfo=_NY_TZ).timestamp()
+    )
+    ts_cur = int(
+        datetime.strptime(f"{session_date} 16:00", "%Y-%m-%d %H:%M").replace(tzinfo=_NY_TZ).timestamp()
+    )
+    xndx_cur = (
+        round(29350.0 * (1.0 + xndx_ret_override), 4)
+        if xndx_ret_override is not None
+        else 29500.0
+    )
+    for sym, meta_sym, prev_px, cur_px in (
+        ("XNDX", "^XNDX", 29350.0, xndx_cur),
+        ("SEMI", "XSOX", 8150.0, 8200.0),
+    ):
+        out[sym] = json.dumps(
             {
-                "refRates": [
-                    {"effectiveDate": sofr_eff, "type": "SOFR", "percentRate": 4.35}
-                ]
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {
+                                "symbol": meta_sym,
+                                "instrumentType": "INDEX",
+                                "dataGranularity": "1d",
+                            },
+                            "timestamp": [ts_prev, ts_cur],
+                            "indicators": {"quote": [{"close": [prev_px, cur_px]}]},
+                        }
+                    ]
+                }
             }
-        ),
-        encoding="utf-8",
+        ).encode("utf-8")
+
+    out["SOFR"] = json.dumps(
+        {"refRates": [{"effectiveDate": sofr_eff, "type": "SOFR", "percentRate": 4.35}]}
+    ).encode("utf-8")
+    out["TBILL_3M"] = (
+        f"Date,1 Mo,3 Mo\n{prev_ds},4.38,4.42\n{session_date},4.40,4.45\n".encode("utf-8")
     )
-    (fixture_dir / f"treasury_tbill_{session_date}.csv").write_text(
-        f"Date,1 Mo,3 Mo\n{session_date},4.40,4.45\n",
-        encoding="utf-8",
+    return out
+
+
+def build_live_mock_transport(
+    session_date: str,
+    *,
+    tqqq_split: float = 1.0,
+    xndx_ret_override: float | None = None,
+):
+    payloads = _build_two_day_payloads(
+        session_date,
+        tqqq_split=tqqq_split,
+        xndx_ret_override=xndx_ret_override,
     )
+
+    def _transport(url: str, headers: dict) -> tuple[int, bytes]:
+        _ = headers
+        low_url = url.lower()
+        if "api.tiingo.com" in low_url:
+            if "/tqqq/" in low_url:
+                return 200, payloads["TQQQ"]
+            if "/soxl/" in low_url:
+                return 200, payloads["SOXL"]
+            if "/qqq/" in low_url:
+                return 200, payloads["QQQ"]
+        if "finance.yahoo.com" in low_url:
+            if "xndx" in low_url:
+                return 200, payloads["XNDX"]
+            if "xsox" in low_url:
+                return 200, payloads["SEMI"]
+        if "markets.newyorkfed.org" in low_url:
+            return 200, payloads["SOFR"]
+        if "treasury.gov" in low_url:
+            return 200, payloads["TBILL_3M"]
+        return 404, b"not_found"
+
+    return _transport
+
+
+def _build_session_fixture_files(
+    fixture_dir: Path,
+    session_date: str,
+    *,
+    tqqq_split: float = 1.0,
+    xndx_ret_override: float | None = None,
+) -> None:
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    payloads = _build_two_day_payloads(
+        session_date,
+        tqqq_split=tqqq_split,
+        xndx_ret_override=xndx_ret_override,
+    )
+    (fixture_dir / f"tiingo_tqqq_{session_date}.json").write_bytes(payloads["TQQQ"])
+    (fixture_dir / f"tiingo_soxl_{session_date}.json").write_bytes(payloads["SOXL"])
+    (fixture_dir / f"tiingo_qqq_{session_date}.json").write_bytes(payloads["QQQ"])
+    (fixture_dir / f"yahoo_xndx_{session_date}.json").write_bytes(payloads["XNDX"])
+    (fixture_dir / f"yahoo_xsox_{session_date}.json").write_bytes(payloads["SEMI"])
+    (fixture_dir / f"nyfed_sofr_{session_date}.json").write_bytes(payloads["SOFR"])
+    (fixture_dir / f"treasury_tbill_{session_date}.csv").write_bytes(payloads["TBILL_3M"])
 
 
 def _mock_ots_client(body: dict) -> tuple[bytes, dict]:
@@ -349,6 +447,10 @@ def run_all_demos() -> dict[str, dict]:
             "cal = resolve_session('XNYS', '2026-01-05', spec=spec)\n"
             "ev = VendoredFuseEvaluator()\n"
             "sin = {'E': '50000', 'E_star': '50000', 'H': '0', 'L': '0', "
+            "'prior_closes': {'TQQQ': '49', 'SOXL': '39.5', 'XNDX': '29350', 'SEMI': '8150'}, "
+            "'current_index_closes': {'XNDX': '29500', 'SEMI': '8200'}, "
+            "'positions_source_record': {'as_of': '2026-01-05T22:30:00.000Z', 'age_sessions': 0}, "
+            "'broker_reconciliation_source_record': {'as_of': '2026-01-05T22:30:00.000Z', 'age_sessions': 0}, "
             "'funds': {'TQQQ': {'s': '1', 'close_price': '50', 'q_pre': 100, 'sigma_forecast': '0.50'}, "
             "'SOXL': {'s': '1', 'close_price': '40', 'q_pre': 100, 'sigma_forecast': '0.22'}}}\n"
             "vin = build_fuse_validated_inputs(sin, cal, policy_hash='p', session_date='2026-01-05', as_of='2026-01-05T22:30:00.000Z')\n"
@@ -365,6 +467,10 @@ def run_all_demos() -> dict[str, dict]:
             "ev = VendoredFuseEvaluator()\n"
             f"prior, _ = load_row_state_snapshot({str(snap_dir)!r}, expected_chain_id='d4', expected_engine_hash=ev.engine_hash, expected_spec_version=ev.spec_version, expected_sequence=0)\n"
             "sin = {'E': '50000', 'E_star': '50000', 'H': '0', 'L': '0', "
+            "'prior_closes': {'TQQQ': '50', 'SOXL': '40', 'XNDX': '29500', 'SEMI': '8200'}, "
+            "'current_index_closes': {'XNDX': '29600', 'SEMI': '8240'}, "
+            "'positions_source_record': {'as_of': '2026-01-06T22:30:00.000Z', 'age_sessions': 0}, "
+            "'broker_reconciliation_source_record': {'as_of': '2026-01-06T22:30:00.000Z', 'age_sessions': 0}, "
             "'funds': {'TQQQ': {'s': '1', 'close_price': '50', 'q_pre': 100, 'sigma_forecast': '0.24'}, "
             "'SOXL': {'s': '1', 'close_price': '40', 'q_pre': 100, 'sigma_forecast': '0.22'}}}\n"
             "vin = build_fuse_validated_inputs(sin, cal, policy_hash='p', session_date='2026-01-06', as_of='2026-01-06T22:30:00.000Z')\n"
@@ -392,7 +498,7 @@ def run_all_demos() -> dict[str, dict]:
         assert not (Path(tmpdir) / "locked" / "ledger").exists()
     results["D5"] = {"status": "PASS", "production_chain_locked": True, "zero_appends": True}
 
-    # D6: Zero conformance shims (U-01 unresolved + missing source O1 trip)
+    # D6: Zero conformance shims (U-01 unresolved + missing source/prior_closes O1 fail-closed)
     v_unresolved = build_fuse_validated_inputs(
         _sample_inputs(), cal, policy_hash="p", session_date="2026-01-05", as_of="2026-01-05T22:30:00.000Z"
     )
@@ -400,6 +506,21 @@ def run_all_demos() -> dict[str, dict]:
         ev.spec_version, ev.engine_hash, "p", "2026-01-05", "2026-01-05T22:30:00.000Z", "shadow", v_unresolved, {}, None
     )
     assert all(rows_u[rid]["reason"] == "unresolved_fail_closed" and rows_u[rid]["would_have_tripped"] for rid in ("V5", "V7", "O5"))
+    missing_sources_res = build_record_body(
+        chain_id="d6-no-fab",
+        sequence=0,
+        prev_record_sha256=GENESIS_PREV_HASH,
+        mode="production",
+        session_date="2026-01-05",
+        decision_timestamp_utc="2026-01-05T22:30:00.000Z",
+        session_inputs=_sample_inputs(include_sources=False),
+        calendar_session=cal,
+        code_version_sha=code_sha,
+        evaluator=ev,
+        runtime_config=json.loads((REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")),
+        calendar_spec=spec_v2,
+    )
+    assert missing_sources_res["fail_closed"] is True and missing_sources_res["o1_output"]["state"] == "NO-NEW-RISK"
     missing_res = build_record_body(
         chain_id="d6-missing",
         sequence=0,
@@ -415,7 +536,7 @@ def run_all_demos() -> dict[str, dict]:
         calendar_spec=spec_v2,
     )
     assert missing_res["fail_closed"] is True and missing_res["appended"] is False
-    results["D6"] = {"status": "PASS", "unresolved_rows_fail_closed": ["O5", "V5", "V7"]}
+    results["D6"] = {"status": "PASS", "unresolved_rows_fail_closed": ["O5", "V5", "V7"], "no_fabricated_sources": True}
 
     # D7: Bit-for-bit deterministic replay on FUSE-1 vendored chain + csa22-v2
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -514,6 +635,15 @@ def run_all_demos() -> dict[str, dict]:
         )
         recs = ledger.load_records()
         rcps = ledger.load_receipts()
+        ok_default_locked, reasons_default_locked = check_forward_clock_credit(
+            recs,
+            rcps,
+            ledger_dir=ldir,
+            bitcoin_merkle_roots=hdrs,
+            commitment_deadline_et="23:30",
+            calendar_spec=spec_v2,
+        )
+        assert not ok_default_locked and "production_chain_locked" in reasons_default_locked
         ok_locked, reasons_locked = check_forward_clock_credit(
             recs,
             rcps,
@@ -538,7 +668,7 @@ def run_all_demos() -> dict[str, dict]:
             production_chain_locked=False,
         )
         assert ok_unlocked and reasons_unlocked == []
-    results["D10"] = {"status": "PASS", "locked_rejected": True, "unlocked_creditable": True}
+    results["D10"] = {"status": "PASS", "locked_rejected": True, "default_locked_rejected": True, "unlocked_creditable": True}
 
     return {"demo_suite": "SH2-D1-D10", "passed": len(results), "total": 10, "cases": results}
 

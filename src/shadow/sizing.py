@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
 from pathlib import Path
 
@@ -369,9 +369,28 @@ def compute_raw_vs_adjusted_separation(
     }
 
 
+_CONTROL_STATE_RANK = {
+    "NORMAL": 0,
+    "NO-NEW-RISK": 1,
+    "DE-RISK": 2,
+    "ORDER-UNKNOWN": 3,
+    "HALT": 4,
+    "J1_TRIM": 1,
+}
+
+
+def _most_restrictive_sizing_state(base_state: str, fund_state: str | None) -> str:
+    if fund_state is None or fund_state == base_state:
+        return base_state
+    if _CONTROL_STATE_RANK.get(fund_state, 0) > _CONTROL_STATE_RANK.get(base_state, 0):
+        return fund_state
+    return base_state
+
+
 def compute_session_sizing(
     inputs: dict,
     active_control_state: str = "NORMAL",
+    fund_control_states: Mapping[str, str] | None = None,
 ) -> dict:
     """Compute the 10-step policy_v0_pre notional sizing stack across all 3 tiers."""
     with localcontext() as ctx:
@@ -540,14 +559,22 @@ def compute_session_sizing(
                 kelly_cf_x = (s_i * min(x_cap, x_ml, x_k_c) * v_i) / denom
                 kelly_would_bind = kelly_cf_x < x_p
 
+                eff_state = _most_restrictive_sizing_state(
+                    active_control_state,
+                    (fund_control_states or {}).get(inst),
+                )
                 w_tgt = w_target[inst]
-                if active_control_state == "DE-RISK":
+                if eff_state == "DE-RISK":
                     w_tgt_eff = Decimal("0")
                 else:
                     w_tgt_eff = w_tgt
 
                 q_ideal = int((w_tgt_eff * e_val / p_ref).to_integral_value(rounding=ROUND_FLOOR))
                 q_pre_i = q_pre_map[inst]
+                no_new_risk_clamped = False
+                if eff_state == "NO-NEW-RISK" and q_ideal > q_pre_i:
+                    q_ideal = q_pre_i
+                    no_new_risk_clamped = True
                 w_cur_i = w_cur_map[inst]
 
                 cap_exceeded = (
@@ -556,15 +583,15 @@ def compute_session_sizing(
                     or joint_cur_exceeded
                     or (w_cur_sum > w_ceil)
                 )
-                breaker_forced_reduce = active_control_state in ("DE-RISK", "J1_TRIM")
+                breaker_forced_reduce = eff_state == "DE-RISK" or active_control_state == "J1_TRIM"
                 mandatory_bypass = (q_ideal < q_pre_i) and (cap_exceeded or breaker_forced_reduce)
                 in_band = abs(w_cur_i - w_tgt_eff) <= (b_band * w_tgt_eff)
 
-                if active_control_state == "HALT":
+                if eff_state in ("HALT", "ORDER-UNKNOWN"):
                     delta_q_exec = 0
                     band_suppressed = False
                     emerg_bypass = False
-                elif q_ideal == q_pre_i:
+                elif q_ideal == q_pre_i or no_new_risk_clamped:
                     delta_q_exec = 0
                     band_suppressed = False
                     emerg_bypass = False

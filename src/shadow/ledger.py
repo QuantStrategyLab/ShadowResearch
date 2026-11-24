@@ -10,16 +10,20 @@ import re
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import date, datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
 from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator, StubProductionForbiddenError
 from shadow.fuse_adapter import (
     EngineIdentityError,
+    PINNED_FUSE_ENGINE_HASH,
+    PINNED_FUSE_SPEC_VERSION,
     build_fuse_validated_inputs,
     is_stub_evaluator,
+    resolve_account_and_fund_control_states,
     resolve_aggregate_control_state,
     serialize_breakers_for_ledger,
 )
@@ -84,6 +88,10 @@ class CanonicalizationError(ValueError):
 
 class LedgerAppendError(ValueError):
     """Raised when an append violates chain rules (duplicate, fork, gap, invalid body)."""
+
+
+class ChainConcurrencyConflictError(RuntimeError):
+    """Raised when another writer holds an active cross-instance chain lease."""
 
 
 def is_canonical_decimal_str(value: object) -> bool:
@@ -679,17 +687,20 @@ def build_record_body(
     if canonical_decimal_str(session_inputs.get("H", "0")) != "0":
         raise CanonicalizationError("Stage N ledger boundary requires H == '0'")
 
-    active_state = resolve_aggregate_control_state(eff_scope)
+    account_state, fund_states, overall_state = resolve_account_and_fund_control_states(
+        eff_scope, INSTRUMENT_ORDER
+    )
 
     sizing_res = compute_session_sizing(
         session_inputs,
-        active_control_state=active_state,
+        active_control_state=account_state,
+        fund_control_states=fund_states,
     )
 
     inputs_digest = compute_inputs_digest(
         session_inputs,
         w_ref=sizing_res["bankroll"]["W_ref"],
-        active_control_state=active_state,
+        active_control_state=overall_state,
         market_records_digest=market_records_digest,
         session_date=session_date,
     )
@@ -797,15 +808,76 @@ def check_forward_clock_credit(
     spec_dir: str | Path | None = None,
     expected_engine_hash: str | None = None,
     expected_spec_version: str | None = None,
-    production_chain_locked: bool = False,
+    production_chain_locked: bool | None = None,
 ) -> tuple[bool, list[str]]:
     """Determine whether a ledger record sequence is eligible for CLK-01..04 forward credit."""
     reasons: list[str] = []
-    if production_chain_locked:
-        reasons.append("production_chain_locked")
     if not records:
+        if production_chain_locked is True:
+            reasons.append("production_chain_locked")
         reasons.append("empty_chain")
         return False, reasons
+
+    eff_expected_engine_hash = expected_engine_hash
+    eff_expected_spec_version = expected_spec_version
+    eff_locked = production_chain_locked
+
+    if config_path is not None:
+        cfg_file = Path(config_path)
+        if cfg_file.is_file():
+            try:
+                raw_cfg = parse_json_no_duplicates(cfg_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                reasons.append(f"invalid_production_config:{exc}")
+                raw_cfg = None
+            if isinstance(raw_cfg, dict) and raw_cfg.get("mode") == "production":
+                if eff_locked is None:
+                    eff_locked = not (
+                        raw_cfg.get("production_chain_locked") is False
+                        and raw_cfg.get("clk01_active") is True
+                    )
+                if eff_expected_engine_hash is None:
+                    eh = raw_cfg.get("fuse_engine_hash")
+                    eff_expected_engine_hash = eh if isinstance(eh, str) and eh else "__MISSING__"
+                if eff_expected_spec_version is None:
+                    sv = raw_cfg.get("fuse_spec_version")
+                    eff_expected_spec_version = sv if isinstance(sv, str) and sv else "__MISSING__"
+    else:
+        first_body = (
+            records[0].get("record_body", records[0])
+            if isinstance(records[0], dict)
+            else {}
+        )
+        is_sh2_prod_chain = isinstance(first_body, dict) and (
+            first_body.get("calendar_version") == "csa22-v2"
+            or first_body.get("chain_id") == "prod-sh2-v1"
+            or first_body.get("ledger_mode") == "stage_n_production"
+        )
+        if is_sh2_prod_chain:
+            if eff_locked is None:
+                base_root = Path(repo_root) if repo_root is not None else _SPECS_ROOT.parent
+                default_prod_cfg = base_root / "config" / "production-scheduler.json"
+                if not default_prod_cfg.is_file():
+                    eff_locked = True
+                else:
+                    try:
+                        raw_prod = parse_json_no_duplicates(default_prod_cfg.read_text(encoding="utf-8"))
+                    except Exception:
+                        raw_prod = None
+                    if not isinstance(raw_prod, dict):
+                        eff_locked = True
+                    else:
+                        eff_locked = not (
+                            raw_prod.get("production_chain_locked") is False
+                            and raw_prod.get("clk01_active") is True
+                        )
+            if eff_expected_engine_hash is None:
+                eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+            if eff_expected_spec_version is None:
+                eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+
+    if eff_locked is True:
+        reasons.append("production_chain_locked")
 
     if receipts is None or len(receipts) == 0:
         reasons.append("missing_receipts")
@@ -934,9 +1006,9 @@ def check_forward_clock_credit(
                     reasons.append(f"seq_{seq}:evaluator_engine_hash_mismatch")
             if not isinstance(ev_spec, str) or not ev_spec:
                 reasons.append(f"seq_{seq}:missing_evaluator_spec_version")
-            if expected_engine_hash is not None and top_engine_hash != expected_engine_hash:
+            if eff_expected_engine_hash is not None and top_engine_hash != eff_expected_engine_hash:
                 reasons.append(f"seq_{seq}:unexpected_engine_hash")
-            if expected_spec_version is not None and ev_spec != expected_spec_version:
+            if eff_expected_spec_version is not None and ev_spec != eff_expected_spec_version:
                 reasons.append(f"seq_{seq}:unexpected_spec_version")
 
         identity_checks = (
@@ -1097,9 +1169,98 @@ class ShadowLedger:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _parse_iso_utc(raw: object) -> datetime | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            return datetime.fromisoformat(iso).astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    def _acquire_cross_instance_lease(
+        self,
+        lease_path: Path,
+        *,
+        lease_ttl_seconds: float,
+    ) -> str:
+        lease_id = uuid4().hex
+        now_utc = datetime.now(timezone.utc)
+        expires_utc = now_utc + timedelta(seconds=max(1.0, lease_ttl_seconds))
+        lease_payload = {
+            "schema_version": "c-sh-chain-lease-v1",
+            "lease_id": lease_id,
+            "pid": os.getpid(),
+            "execution_id": os.environ.get("CLOUD_RUN_EXECUTION", ""),
+            "acquired_at_utc": now_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_utc.microsecond // 1000:03d}Z",
+            "expires_at_utc": expires_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{expires_utc.microsecond // 1000:03d}Z",
+        }
+        lease_bytes = (
+            json.dumps(lease_payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+
+        for attempt in range(2):
+            try:
+                lfd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    os.write(lfd, lease_bytes)
+                    os.fsync(lfd)
+                finally:
+                    os.close(lfd)
+                return lease_id
+            except FileExistsError:
+                existing: dict = {}
+                try:
+                    existing_raw = lease_path.read_text(encoding="utf-8")
+                    parsed = parse_json_no_duplicates(existing_raw) if existing_raw.strip() else {}
+                    if isinstance(parsed, dict):
+                        existing = parsed
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    existing = {}
+
+                exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
+                now_chk = datetime.now(timezone.utc)
+                if exp_dt is not None and now_chk < exp_dt:
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease held by active writer: "
+                        f"lease_id={existing.get('lease_id')!r}, "
+                        f"pid={existing.get('pid')!r}, "
+                        f"execution_id={existing.get('execution_id')!r}"
+                    )
+                if attempt == 0:
+                    stale_tmp = lease_path.with_name(f".chain.lease.stale.{uuid4().hex}")
+                    try:
+                        os.replace(str(lease_path), str(stale_tmp))
+                        if stale_tmp.exists():
+                            stale_tmp.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                raise ChainConcurrencyConflictError(
+                    "Chain lease creation conflicted after stale reclamation retry"
+                )
+        raise ChainConcurrencyConflictError("Failed to acquire cross-instance chain lease")
+
+    @staticmethod
+    def _release_cross_instance_lease(lease_path: Path, expected_lease_id: str) -> None:
+        if not lease_path.is_file():
+            return
+        try:
+            parsed = parse_json_no_duplicates(lease_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
+            try:
+                lease_path.unlink()
+            except FileNotFoundError:
+                pass
+
     @contextmanager
-    def chain_lock(self) -> Iterator[None]:
-        """Acquire an exclusive per-chain file lock, safely re-entrant within the same thread."""
+    def chain_lock(self, *, lease_ttl_seconds: float = 300.0) -> Iterator[None]:
+        """Acquire exclusive flock + atomic .chain.lease.json cross-instance fencing lock."""
         self.root_dir.mkdir(parents=True, exist_ok=True)
         key = str(self.root_dir.resolve())
         locks = getattr(_CHAIN_LOCK_TLS, "locks", None)
@@ -1116,14 +1277,19 @@ class ShadowLedger:
             return
 
         lock_path = self.root_dir / ".chain.lock"
+        lease_path = self.root_dir / ".chain.lease.json"
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            locks[key] = {"fd": fd, "depth": 1}
+            lease_id = self._acquire_cross_instance_lease(
+                lease_path, lease_ttl_seconds=lease_ttl_seconds
+            )
+            locks[key] = {"fd": fd, "depth": 1, "lease_id": lease_id}
             try:
                 yield
             finally:
                 locks.pop(key, None)
+                self._release_cross_instance_lease(lease_path, lease_id)
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -1626,5 +1792,107 @@ def load_row_state_snapshot(
     ).hexdigest()
     if payload.get("state_sha256") != recomputed_sha:
         raise EngineIdentityError("State snapshot checksum mismatch")
+
+    return state_obj, payload
+
+
+def save_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    chain_id: str,
+    base_sequence: int,
+    base_record_sha256: str,
+    rejected_session_date: str,
+    engine_hash: str,
+    spec_version: str,
+    next_row_state: dict,
+) -> Path:
+    """Persist next_row_state after an O1/O2-rejected session so latches carry to subsequent sessions."""
+    if not isinstance(next_row_state, dict):
+        raise EngineIdentityError("pending rejected next_row_state must be a dict")
+    s_dir = Path(snapshots_dir)
+    s_dir.mkdir(parents=True, exist_ok=True)
+    state_canonical = json.dumps(
+        next_row_state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    payload = {
+        "schema_version": "c-sh-pending-rejected-state-v1",
+        "chain_id": chain_id,
+        "base_sequence": base_sequence,
+        "base_record_sha256": base_record_sha256,
+        "rejected_session_date": rejected_session_date,
+        "engine_hash": engine_hash,
+        "spec_version": spec_version,
+        "state_sha256": hashlib.sha256(state_canonical).hexdigest(),
+        "next_row_state": next_row_state,
+    }
+    raw_bytes = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    target = s_dir / "pending_rejected_state.json"
+    _atomic_write_bytes(target, raw_bytes)
+    return target
+
+
+def load_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    expected_chain_id: str,
+    expected_base_sequence: int,
+    expected_base_record_sha256: str,
+    current_session_date: str,
+    expected_engine_hash: str,
+    expected_spec_version: str,
+) -> tuple[dict, dict] | None:
+    """Load and verify pending O1/O2 rejected-day row state if present (fail closed on tamper/drift)."""
+    s_dir = Path(snapshots_dir)
+    target = s_dir / "pending_rejected_state.json"
+    if not target.is_file():
+        return None
+    try:
+        payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt pending rejected state snapshot {target}: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-pending-rejected-state-v1":
+        raise EngineIdentityError(f"Invalid pending rejected state snapshot schema in {target}")
+    if payload.get("chain_id") != expected_chain_id:
+        raise EngineIdentityError(
+            f"Pending state chain_id mismatch: expected {expected_chain_id!r}, got {payload.get('chain_id')!r}"
+        )
+    if payload.get("base_sequence") != expected_base_sequence:
+        raise EngineIdentityError(
+            f"Pending state base_sequence mismatch: expected {expected_base_sequence}, got {payload.get('base_sequence')!r}"
+        )
+    if payload.get("base_record_sha256") != expected_base_record_sha256:
+        raise EngineIdentityError("Pending state base_record_sha256 mismatch")
+    if payload.get("engine_hash") != expected_engine_hash:
+        raise EngineIdentityError("Pending state engine_hash mismatch")
+    if payload.get("spec_version") != expected_spec_version:
+        raise EngineIdentityError("Pending state spec_version mismatch")
+    rej_ds = payload.get("rejected_session_date")
+    if not isinstance(rej_ds, str) or rej_ds >= current_session_date:
+        raise EngineIdentityError(
+            f"Pending state rejected_session_date invalid or not before {current_session_date}: {rej_ds!r}"
+        )
+
+    state_obj = payload.get("next_row_state")
+    if not isinstance(state_obj, dict):
+        raise EngineIdentityError("Pending state next_row_state must be a dict")
+    recomputed_sha = hashlib.sha256(
+        json.dumps(
+            state_obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload.get("state_sha256") != recomputed_sha:
+        raise EngineIdentityError("Pending state checksum mismatch")
 
     return state_obj, payload

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -21,6 +22,9 @@ from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, StubProducti
 from shadow.feeder import (
     SOXL_PROXY_LABEL,
     emit_market_records_from_fixtures,
+    extract_prior_close_from_tiingo_bytes,
+    extract_prior_close_from_yahoo_bytes,
+    read_verified_archived_bytes,
     verify_market_record_raw_integrity,
 )
 from shadow.feeder_live import (
@@ -53,8 +57,10 @@ from shadow.ledger import (
     has_committed_detached_evidence,
     is_receipt_timely,
     is_utc_ms_timestamp,
+    load_pending_rejected_state_snapshot,
     load_row_state_snapshot,
     parse_json_no_duplicates,
+    save_pending_rejected_state_snapshot,
     save_row_state_snapshot,
     sha256_canonical,
     verify_receipt,
@@ -204,14 +210,35 @@ def load_scheduler_config(config_path: str | Path | None = None) -> DrillSchedul
     )
 
 
+def _require_strict_bool(
+    raw: Mapping[str, object],
+    key: str,
+    *,
+    default: bool | None = None,
+) -> bool:
+    if key not in raw:
+        if default is None:
+            raise ValueError(f"missing_required_boolean:{key}")
+        return default
+    val = raw[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"invalid_boolean_for_{key}:{val!r}")
+    return val
+
+
 def load_production_scheduler_config(config_path: str | Path | None = None) -> DrillSchedulerConfig:
-    """Load and validate production scheduler config with fail-closed OA-SH2-2 lock state."""
+    """Load and validate production scheduler config with strict boolean and OA-SH2-2 lock checks."""
     path = Path(config_path) if config_path is not None else DEFAULT_PRODUCTION_CONFIG_PATH
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("Production scheduler configuration JSON must be an object")
     if raw.get("mode") != "production":
         raise DrillOnlyViolationError("Production scheduler config MUST specify mode='production'")
+    clk01_active = _require_strict_bool(raw, "clk01_active")
+    production_chain_locked = _require_strict_bool(raw, "production_chain_locked")
+    production_mode_forbidden = _require_strict_bool(raw, "production_mode_forbidden", default=False)
+    if production_mode_forbidden is True:
+        raise DrillOnlyViolationError("production_mode_forbidden=true cannot run production mode")
     if raw.get("fuse_spec_version") != PINNED_FUSE_SPEC_VERSION:
         raise ValueError(
             f"Production config must pin fuse_spec_version={PINNED_FUSE_SPEC_VERSION!r}, got {raw.get('fuse_spec_version')!r}"
@@ -238,7 +265,7 @@ def load_production_scheduler_config(config_path: str | Path | None = None) -> D
     return DrillSchedulerConfig(
         chain_id=str(raw["chain_id"]),
         mode="production",
-        clk01_active=bool(raw.get("clk01_active", False)),
+        clk01_active=clk01_active,
         venue=str(raw["venue"]),
         calendar_version=str(raw["calendar_version"]),
         decision_instant_et=validated_times["decision_instant_et"],
@@ -255,8 +282,8 @@ def load_production_scheduler_config(config_path: str | Path | None = None) -> D
         log_max_bytes=int(raw.get("log_max_bytes", 50 * 1024 * 1024)),
         resource_caps=dict(raw.get("resource_caps", {})),
         schema_version=str(raw.get("schema_version", "sh2-production-scheduler-v1")),
-        production_mode_forbidden=bool(raw.get("production_mode_forbidden", False)),
-        production_chain_locked=bool(raw.get("production_chain_locked", True)),
+        production_mode_forbidden=production_mode_forbidden,
+        production_chain_locked=production_chain_locked,
         deployment_target=str(raw.get("deployment_target", "cloudrun-job")),
         cloudrun_region=str(raw.get("cloudrun_region", "us-east1")),
         calendar_spec_digest=str(raw["calendar_spec_digest"]),
@@ -1451,14 +1478,30 @@ def _commit_drill_session_atomically(
     engine_hash: str | None = None,
     spec_version: str | None = None,
 ) -> dict:
-    """Serialize via chain_lock, stage replay_bundle, commit seq_NNNNNN.record.json, then write detached .ots/.receipt."""
+    """Serialize via chain_lock, stage replay_bundle + state snapshot before seq_NNNNNN.record.json commit."""
     with ledger.chain_lock():
         bundle_path = bundle_dir / "replay_bundle.json"
         prior_bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
         bundle_modified = False
 
+        should_stage_snap = (
+            snapshots_dir is not None
+            and next_row_state is not None
+            and engine_hash is not None
+            and spec_version is not None
+        )
+        seq_snap_path = snapshots_dir / f"seq_{seq:06d}.state.json" if should_stage_snap and snapshots_dir is not None else None
+        latest_snap_path = snapshots_dir / "latest.state.json" if should_stage_snap and snapshots_dir is not None else None
+        pending_snap_path = snapshots_dir / "pending_rejected_state.json" if snapshots_dir is not None else None
+        prior_latest_bytes = (
+            latest_snap_path.read_bytes()
+            if latest_snap_path is not None and latest_snap_path.is_file()
+            else None
+        )
+        snap_staged = False
+
         def _stage_bundle_before_marker() -> None:
-            nonlocal bundle_modified
+            nonlocal bundle_modified, snap_staged
             _update_replay_bundle(
                 bundle_dir,
                 cfg=cfg,
@@ -1472,6 +1515,18 @@ def _commit_drill_session_atomically(
                 spec_version=spec_version,
             )
             bundle_modified = True
+            if should_stage_snap and snapshots_dir is not None:
+                save_row_state_snapshot(
+                    snapshots_dir,
+                    chain_id=cfg.chain_id,
+                    sequence=seq,
+                    session_date=str(body["session_date"]),
+                    record_sha256=sha256_canonical(body),
+                    engine_hash=engine_hash,  # type: ignore[arg-type]
+                    spec_version=spec_version,  # type: ignore[arg-type]
+                    next_row_state=next_row_state,  # type: ignore[arg-type]
+                )
+                snap_staged = True
             if post_ledger_hook is not None:
                 post_ledger_hook()
 
@@ -1498,23 +1553,17 @@ def _commit_drill_session_atomically(
                     _atomic_write_bytes(bundle_path, prior_bundle_bytes)
                 elif bundle_path.exists():
                     bundle_path.unlink()
+            if snap_staged:
+                if seq_snap_path is not None and seq_snap_path.exists():
+                    seq_snap_path.unlink()
+                if latest_snap_path is not None:
+                    if prior_latest_bytes is not None:
+                        _atomic_write_bytes(latest_snap_path, prior_latest_bytes)
+                    elif latest_snap_path.exists():
+                        latest_snap_path.unlink()
             raise
-        if (
-            snapshots_dir is not None
-            and next_row_state is not None
-            and engine_hash is not None
-            and spec_version is not None
-        ):
-            save_row_state_snapshot(
-                snapshots_dir,
-                chain_id=cfg.chain_id,
-                sequence=seq,
-                session_date=str(body["session_date"]),
-                record_sha256=env["record_sha256"],
-                engine_hash=engine_hash,
-                spec_version=spec_version,
-                next_row_state=next_row_state,
-            )
+        if pending_snap_path is not None and pending_snap_path.is_file():
+            pending_snap_path.unlink()
         return env
 
 
@@ -1848,6 +1897,8 @@ def run_production_cycle(
         raise ProductionChainLockedError(
             "Production chain is locked pending OA-SH2-2 sign-off; 0 production appends permitted"
         )
+    if fixtures_dir is not None:
+        raise ValueError("production_mode_forbids_offline_fixtures")
     if allow_unanchored_on_ots_failure:
         raise ValueError("Production chain structurally forbids unanchored appends")
     ev = evaluator if evaluator is not None else VendoredFuseEvaluator()
@@ -1928,6 +1979,10 @@ def _execute_cycle_with_config(
         raise CalendarCoverageError(
             f"calendar_coverage_insufficient: configured {cfg.calendar_version} != loaded {spec['rules']['calendar_version']}"
         )
+    if cfg.calendar_spec_digest is not None and spec.get("spec_digest") != cfg.calendar_spec_digest:
+        raise CalendarCoverageError(
+            f"calendar_coverage_insufficient: configured spec_digest {cfg.calendar_spec_digest} != loaded {spec.get('spec_digest')}"
+        )
     if cfg.venue != spec["rules"]["exchange"]:
         raise CalendarCoverageError(
             f"calendar_coverage_insufficient: unsupported_venue:{cfg.venue} != {spec['rules']['exchange']}"
@@ -1983,6 +2038,196 @@ def _execute_cycle_with_config(
             _post_record_commit_hook=_post_record_commit_hook,
             _post_report_json_hook=_post_report_json_hook,
         )
+
+
+def _extract_prior_session_closes(
+    *,
+    archive_dir: Path,
+    mkt_recs: list[dict],
+    session_date: str,
+    bundle_obj: dict | None,
+    cal: Mapping[str, object],
+) -> dict[str, str]:
+    """Derive prior trading day close prices from prior committed bundle session or multi-day archives."""
+    closes: dict[str, str] = {}
+    if isinstance(bundle_obj, dict):
+        sessions = bundle_obj.get("sessions")
+        if isinstance(sessions, list) and sessions:
+            prior_sess = None
+            for cand in reversed(sessions):
+                if isinstance(cand, dict) and str(cand.get("session_date", "")) < session_date:
+                    prior_sess = cand
+                    break
+            if prior_sess is not None and isinstance(prior_sess.get("market_records"), list):
+                for rec in prior_sess["market_records"]:
+                    if (
+                        isinstance(rec, dict)
+                        and rec.get("instrument") in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI")
+                        and rec.get("normalized_value") is not None
+                    ):
+                        closes[str(rec["instrument"])] = str(rec["normalized_value"])
+
+    for rec in mkt_recs:
+        inst = str(rec.get("instrument", ""))
+        if inst not in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI") or inst in closes:
+            continue
+        ref = rec.get("raw_bytes_ref") or ""
+        digest = rec.get("raw_bytes_sha256") or ""
+        if not ref or not digest:
+            continue
+        try:
+            raw_bytes = read_verified_archived_bytes(archive_dir, ref, digest)
+        except Exception:
+            continue
+        provider = str(rec.get("provider", ""))
+        if inst in ("TQQQ", "SOXL", "QQQ") or "tiingo" in provider:
+            val = extract_prior_close_from_tiingo_bytes(
+                raw_bytes, session_date, calendar_session=cal
+            )
+        else:
+            val = extract_prior_close_from_yahoo_bytes(
+                raw_bytes, session_date, calendar_session=cal
+            )
+        if val is not None:
+            closes[inst] = val
+    return closes
+
+
+def _reconcile_committed_state_snapshot_if_missing(
+    *,
+    snapshots_dir: Path,
+    ledger: ShadowLedger,
+    bundle_obj: dict | None,
+    prior_records: list[dict],
+    ex_seq: int,
+    existing_env: dict,
+    cfg: DrillSchedulerConfig,
+    spec: dict,
+    cal: dict,
+) -> None:
+    """Verify or deterministically rebuild seq_{ex_seq}.state.json after mid-commit interruption."""
+    ex_body = existing_env["record_body"]
+    ex_hash = ex_body.get("engine_hash")
+    ex_spec = (ex_body.get("evaluator") or {}).get("spec_version")
+    if ex_hash != PINNED_FUSE_ENGINE_HASH or ex_spec != PINNED_FUSE_SPEC_VERSION:
+        return
+    try:
+        seq_state, _ = load_row_state_snapshot(
+            snapshots_dir,
+            expected_chain_id=cfg.chain_id,
+            expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+            expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+            expected_sequence=ex_seq,
+            expected_record_sha256=existing_env["record_sha256"],
+            allow_missing_at_genesis=False,
+        )
+        if ex_seq == len(prior_records) - 1:
+            load_row_state_snapshot(
+                snapshots_dir,
+                expected_chain_id=cfg.chain_id,
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_sequence=ex_seq,
+                expected_record_sha256=existing_env["record_sha256"],
+                allow_missing_at_genesis=False,
+            )
+            latest_path = snapshots_dir / "latest.state.json"
+            if latest_path.is_file():
+                latest_obj = parse_json_no_duplicates(latest_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(latest_obj, dict)
+                    and latest_obj.get("sequence") == ex_seq
+                    and latest_obj.get("record_sha256") == existing_env["record_sha256"]
+                ):
+                    return
+            save_row_state_snapshot(
+                snapshots_dir,
+                chain_id=cfg.chain_id,
+                sequence=ex_seq,
+                session_date=str(ex_body["session_date"]),
+                record_sha256=existing_env["record_sha256"],
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=seq_state,
+            )
+        return
+    except Exception:
+        pass
+
+    if not isinstance(bundle_obj, dict):
+        raise ValueError("missing_replay_bundle_for_snapshot_recovery")
+    sessions = bundle_obj.get("sessions")
+    if not isinstance(sessions, list) or ex_seq >= len(sessions):
+        raise ValueError(f"missing_bundle_session_for_snapshot_recovery:seq={ex_seq}")
+    sess_entry = sessions[ex_seq]
+    fctx = sess_entry.get("fuse_context") if isinstance(sess_entry.get("fuse_context"), Mapping) else {}
+    if isinstance(fctx, Mapping) and fctx.get("prior_row_state_used") is not None:
+        prior_state = copy.deepcopy(fctx["prior_row_state_used"])
+    elif ex_seq == 0:
+        prior_state = {}
+    else:
+        prev_env = prior_records[ex_seq - 1]
+        prior_state, _ = load_row_state_snapshot(
+            snapshots_dir,
+            expected_chain_id=cfg.chain_id,
+            expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+            expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+            expected_sequence=ex_seq - 1,
+            expected_record_sha256=prev_env["record_sha256"],
+            allow_missing_at_genesis=False,
+        )
+
+    rec_inputs = dict(sess_entry["inputs"])
+    rec_inputs["market_records"] = sess_entry["market_records"]
+    rec_inputs["required_series"] = REQUIRED_MARKET_SERIES
+    if isinstance(fctx, Mapping):
+        for ctx_key in (
+            "prior_closes",
+            "positions_source_record",
+            "broker_reconciliation_source_record",
+            "index_one_session_returns",
+        ):
+            if ctx_key in fctx and fctx[ctx_key] is not None:
+                rec_inputs[ctx_key] = fctx[ctx_key]
+
+    ev = VendoredFuseEvaluator()
+    rebuilt = build_record_body(
+        chain_id=cfg.chain_id,
+        sequence=ex_seq,
+        prev_record_sha256=str(ex_body["prev_record_sha256"]),
+        mode=str(ex_body["mode"]),
+        session_date=str(ex_body["session_date"]),
+        decision_timestamp_utc=str(ex_body["decision_timestamp_utc"]),
+        session_inputs=rec_inputs,
+        calendar_session=cal,
+        code_version_sha=str(ex_body["code_version_sha"]),
+        evaluator=ev,
+        prior_row_state=prior_state,
+        discipline_labels=sess_entry.get("discipline_labels"),
+        market_records_digest=sess_entry.get("market_records_digest"),
+        runtime_config=bundle_obj.get("runtime_config"),
+        calendar_spec=spec,
+    )
+    if not rebuilt.get("appended") or sha256_canonical(rebuilt["record_body"]) != existing_env["record_sha256"]:
+        raise ValueError(f"snapshot_recovery_record_hash_mismatch:seq={ex_seq}")
+    save_row_state_snapshot(
+        snapshots_dir,
+        chain_id=cfg.chain_id,
+        sequence=ex_seq,
+        session_date=str(ex_body["session_date"]),
+        record_sha256=existing_env["record_sha256"],
+        engine_hash=PINNED_FUSE_ENGINE_HASH,
+        spec_version=PINNED_FUSE_SPEC_VERSION,
+        next_row_state=rebuilt["next_row_state"],
+    )
+    pending_rej = snapshots_dir / "pending_rejected_state.json"
+    if pending_rej.is_file():
+        try:
+            pobj = parse_json_no_duplicates(pending_rej.read_text(encoding="utf-8"))
+            if isinstance(pobj, dict) and str(pobj.get("rejected_session_date", "")) < str(ex_body["session_date"]):
+                pending_rej.unlink()
+        except Exception:
+            pass
 
 
 def _run_daily_drill_cycle_locked(
@@ -2247,6 +2492,18 @@ def _run_daily_drill_cycle_locked(
             current_appended=True,
         )
 
+        _reconcile_committed_state_snapshot_if_missing(
+            snapshots_dir=root / "state_snapshots",
+            ledger=ledger,
+            bundle_obj=bundle_obj_validated,
+            prior_records=prior_records,
+            ex_seq=ex_seq,
+            existing_env=existing_env,
+            cfg=cfg,
+            spec=spec,
+            cal=cal,
+        )
+
         if _is_committed_session_report_valid(
             reports_dir,
             session_date,
@@ -2492,6 +2749,8 @@ def _run_daily_drill_cycle_locked(
 
     # Step 1 & 2: Fetch canonical 7-series (with per-provider timestamps) inside [session_close_utc, decision_cutoff_utc]
     required_for_eval = REQUIRED_MARKET_SERIES
+    if cfg.mode == "production" and fixtures_dir is not None:
+        raise ValueError("production_mode_forbids_offline_fixtures")
     if fixtures_dir is not None:
         fixture_ret_utc = _format_utc_ms(clock_fn())
         mkt_recs = emit_market_records_from_fixtures(
@@ -2592,8 +2851,21 @@ def _run_daily_drill_cycle_locked(
     seq = len(prior_records)
     snapshots_dir = root / "state_snapshots"
     prior_state: dict = {}
+    prior_row_state_used: dict | None = None
     if not is_stub_evaluator(ev):
-        if head_env is not None:
+        pending_rej = load_pending_rejected_state_snapshot(
+            snapshots_dir,
+            expected_chain_id=cfg.chain_id,
+            expected_base_sequence=seq - 1,
+            expected_base_record_sha256=head_hash,
+            current_session_date=session_date,
+            expected_engine_hash=ev.engine_hash,
+            expected_spec_version=ev.spec_version,
+        )
+        if pending_rej is not None:
+            prior_state = pending_rej[0]
+            prior_row_state_used = copy.deepcopy(prior_state)
+        elif head_env is not None:
             prior_state, _ = load_row_state_snapshot(
                 snapshots_dir,
                 expected_chain_id=cfg.chain_id,
@@ -2611,6 +2883,25 @@ def _run_daily_drill_cycle_locked(
         }
 
     decision_utc = _format_utc_ms(clock_fn())
+    prior_closes: dict[str, str] = {}
+    pos_src: dict[str, object] | None = None
+    brk_src: dict[str, object] | None = None
+    if not is_stub_evaluator(ev):
+        prior_closes = _extract_prior_session_closes(
+            archive_dir=archive_dir,
+            mkt_recs=mkt_recs,
+            session_date=session_date,
+            bundle_obj=bundle_obj_validated,
+            cal=cal,
+        )
+        if prior_closes:
+            eval_inputs["prior_closes"] = prior_closes
+        # Explicit Stage-N notional source records when operating without live broker execution (H='0', orders_placed=0)
+        pos_src = {"as_of": decision_utc, "age_sessions": 0}
+        brk_src = {"as_of": decision_utc, "age_sessions": 0}
+        eval_inputs["positions_source_record"] = pos_src
+        eval_inputs["broker_reconciliation_source_record"] = brk_src
+
     if raw_integrity_failures:
         built = {
             "appended": False,
@@ -2674,6 +2965,9 @@ def _run_daily_drill_cycle_locked(
                     **session_inputs,
                     "market_records": mkt_recs,
                     "required_series": required_for_eval,
+                    "positions_source_record": pos_src,
+                    "broker_reconciliation_source_record": brk_src,
+                    **({"prior_closes": prior_closes} if prior_closes else {}),
                 }
             )
             cycle_labels = (
@@ -2708,6 +3002,17 @@ def _run_daily_drill_cycle_locked(
             )
 
     if not built["appended"]:
+        if not is_stub_evaluator(ev) and isinstance(built.get("next_row_state"), dict):
+            save_pending_rejected_state_snapshot(
+                snapshots_dir,
+                chain_id=cfg.chain_id,
+                base_sequence=seq - 1,
+                base_record_sha256=head_hash,
+                rejected_session_date=session_date,
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=built["next_row_state"],
+            )
         fail_reason = built["o1_output"].get("reason") or built.get("o2_output", {}).get("reason")
         return _build_fail_closed_result(
             t_start=t_start,
@@ -2725,7 +3030,7 @@ def _run_daily_drill_cycle_locked(
             fail_reason=str(fail_reason),
             required_series=series_summary,
             receipt_status="not_applicable_fail_closed",
-            receipt_reasons=["fail_closed_no_append", "drill_mode"],
+            receipt_reasons=["fail_closed_no_append", f"{cfg.mode}_mode"],
         )
 
     # Step 4: Obtain detached OTS receipt, check real post-stamp wall-clock, commit atomically
@@ -2773,7 +3078,7 @@ def _run_daily_drill_cycle_locked(
     if ots_bytes is None and not allow_unanchored_on_ots_failure:
         raise RuntimeError(f"OTS receipt acquisition failed: {ots_error}")
 
-    session_entry = {
+    session_entry: dict[str, object] = {
         "session_date": session_date,
         "decision_timestamp_utc": decision_utc,
         "inputs": session_inputs,
@@ -2781,6 +3086,15 @@ def _run_daily_drill_cycle_locked(
         "market_records_digest": sha256_canonical(mkt_recs),
         "market_records": mkt_recs,
     }
+    if not is_stub_evaluator(ev):
+        fctx: dict[str, object] = {
+            "prior_closes": prior_closes,
+            "positions_source_record": pos_src,
+            "broker_reconciliation_source_record": brk_src,
+        }
+        if prior_row_state_used is not None:
+            fctx["prior_row_state_used"] = prior_row_state_used
+        session_entry["fuse_context"] = fctx
     env = _commit_drill_session_atomically(
         ledger=ledger,
         seq=seq,
@@ -2894,6 +3208,10 @@ def detect_missed_runs(
     if spec["rules"]["calendar_version"] != cfg.calendar_version:
         raise CalendarCoverageError(
             f"calendar_coverage_insufficient: configured {cfg.calendar_version} != loaded {spec['rules']['calendar_version']}"
+        )
+    if cfg.calendar_spec_digest is not None and spec.get("spec_digest") != cfg.calendar_spec_digest:
+        raise CalendarCoverageError(
+            f"calendar_coverage_insufficient: configured spec_digest {cfg.calendar_spec_digest} != loaded {spec.get('spec_digest')}"
         )
     if cfg.venue != spec["rules"]["exchange"]:
         raise CalendarCoverageError(
@@ -3486,6 +3804,17 @@ def _resolve_auto_run_target(
                         ledger=ledger,
                         expected_consecutive_count=expected_consecutive,
                     ):
+                        _reconcile_committed_state_snapshot_if_missing(
+                            snapshots_dir=Path(data_dir) / "state_snapshots",
+                            ledger=ledger,
+                            bundle_obj=bundle_obj,
+                            prior_records=prior_records,
+                            ex_seq=ex_seq,
+                            existing_env=committed_env,
+                            cfg=cfg,
+                            spec=spec,
+                            cal=today_cal,
+                        )
                         return None, {
                             "status": "already_committed_no_op",
                             "ny_date": ny_today,

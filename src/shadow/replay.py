@@ -425,9 +425,23 @@ def replay_window(
                                 )
 
         replay_inputs = dict(sess["inputs"])
-        if not is_stub_evaluator(ev) and "market_records" in sess and "market_records" not in replay_inputs:
-            replay_inputs["market_records"] = sess["market_records"]
-            replay_inputs.setdefault("required_series", expected_required_series)
+        eff_prior_state = prior_state
+        if not is_stub_evaluator(ev):
+            if "market_records" in sess and "market_records" not in replay_inputs:
+                replay_inputs["market_records"] = sess["market_records"]
+                replay_inputs.setdefault("required_series", expected_required_series)
+            fctx = sess.get("fuse_context")
+            if isinstance(fctx, Mapping):
+                for ctx_key in (
+                    "prior_closes",
+                    "positions_source_record",
+                    "broker_reconciliation_source_record",
+                    "index_one_session_returns",
+                ):
+                    if ctx_key in fctx and fctx[ctx_key] is not None and ctx_key not in replay_inputs:
+                        replay_inputs[ctx_key] = fctx[ctx_key]
+                if fctx.get("prior_row_state_used") is not None:
+                    eff_prior_state = fctx["prior_row_state_used"]
 
         res = build_record_body(
             chain_id=bundle["chain_id"],
@@ -440,7 +454,7 @@ def replay_window(
             calendar_session=cal,
             code_version_sha=bundle["code_version_sha"],
             evaluator=ev,
-            prior_row_state=prior_state,
+            prior_row_state=eff_prior_state,
             discipline_labels=sess.get("discipline_labels"),
             market_records_digest=computed_mkt_digest,
             runtime_config=bundle.get("runtime_config"),

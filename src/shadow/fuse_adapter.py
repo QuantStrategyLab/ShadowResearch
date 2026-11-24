@@ -115,6 +115,33 @@ def resolve_aggregate_control_state(effective_state_by_scope: Mapping[str, str])
     return best_state
 
 
+def resolve_account_and_fund_control_states(
+    effective_state_by_scope: Mapping[str, str],
+    fund_symbols: tuple[str, ...] | list[str] = ("SOXL", "TQQQ"),
+) -> tuple[str, dict[str, str] | None, str]:
+    """Return (account_state, per_fund_states_or_None, overall_aggregate_state)."""
+    overall = resolve_aggregate_control_state(effective_state_by_scope)
+    if not isinstance(effective_state_by_scope, Mapping) or "aggregate" in effective_state_by_scope:
+        return overall, None, overall
+    account_scopes = {
+        k: v for k, v in effective_state_by_scope.items() if k in ("account", "joint")
+    }
+    account_state = (
+        resolve_aggregate_control_state(account_scopes) if account_scopes else overall
+    )
+    fund_states: dict[str, str] = {}
+    for sym in fund_symbols:
+        sym_scopes = {
+            k: v
+            for k, v in effective_state_by_scope.items()
+            if k in (f"fund:{sym}", f"symbol:{sym}")
+        }
+        fund_states[sym] = (
+            resolve_aggregate_control_state(sym_scopes) if sym_scopes else "NORMAL"
+        )
+    return account_state, fund_states, overall
+
+
 def _sanitize_for_canonical_ledger(val: object) -> object:
     """Recursively convert finite floats in FUSE-1 breaker diagnostics into canonical decimal strings."""
     if val is None or isinstance(val, (bool, str, int)):
@@ -574,6 +601,58 @@ def _map_calendar_statuses(calendar_session: Mapping[str, Any] | None) -> tuple[
     return cal_status, exch_status
 
 
+_FUND_BENCHMARK_INDEX = {
+    "TQQQ": "XNDX",
+    "SOXL": "SEMI",
+}
+
+_INDEX_RETURN_LABELS = (
+    ("XNDX", "NDX"),
+    ("SEMI", "SEMI"),
+    ("QQQ", "QQQ"),
+    ("SPX", "SPX"),
+)
+
+
+def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
+    cur_f = _finite_number(cur_raw)
+    prev_f = _finite_number(prev_raw)
+    if cur_f is None or prev_f is None or prev_f <= 0.0:
+        return None
+    cur_d = Decimal(str(cur_raw))
+    prev_d = Decimal(str(prev_raw))
+    return float((cur_d - prev_d) / prev_d)
+
+
+def _map_market_corporate_action(mca: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(mca, Mapping):
+        return None
+    try:
+        split_dec = Decimal(str(mca.get("split_ratio", "1")))
+        cash_dec = Decimal(str(mca.get("cash_per_share_usd", "0")))
+    except Exception:
+        return None
+    if not split_dec.is_finite() or not cash_dec.is_finite():
+        return None
+    if split_dec != Decimal("1"):
+        return {
+            "type": "split" if split_dec > Decimal("1") else "reverse_split",
+            "ratio": float(split_dec),
+            "ex_date": mca.get("ex_date"),
+            "adjustment_complete": False,
+            "exact_reconciliation": False,
+        }
+    if cash_dec > Decimal("0"):
+        return {
+            "type": "distribution",
+            "cash_per_share_usd": float(cash_dec),
+            "ex_date": mca.get("ex_date"),
+            "adjustment_complete": False,
+            "exact_reconciliation": False,
+        }
+    return None
+
+
 def build_fuse_validated_inputs(
     session_inputs: Mapping[str, Any],
     calendar_session: Mapping[str, Any] | None,
@@ -628,6 +707,12 @@ def build_fuse_validated_inputs(
     raw_funds = session_inputs.get("funds") if isinstance(session_inputs.get("funds"), Mapping) else {}
     mkt_recs = session_inputs.get("market_records")
     req_series = tuple(session_inputs.get("required_series", REQUIRED_MARKET_SERIES))
+    prior_closes = (
+        session_inputs.get("prior_closes")
+        if isinstance(session_inputs.get("prior_closes"), Mapping)
+        else {}
+    )
+    by_inst: dict[str, Mapping[str, Any]] = {}
 
     mkt_ok = True
     idx_ok = True
@@ -640,7 +725,7 @@ def build_fuse_validated_inputs(
             idx_ok = False
         else:
             by_inst = {
-                r.get("instrument"): r
+                str(r.get("instrument")): r
                 for r in mkt_recs
                 if isinstance(r, Mapping) and r.get("instrument")
             }
@@ -658,6 +743,17 @@ def build_fuse_validated_inputs(
                     if inst in ("XNDX", "SEMI", "QQQ"):
                         idx_ok = False
                     mkt_ok = False
+
+    # Derive current closes across instruments for return computation
+    cur_closes: dict[str, object] = {}
+    for inst_name, mrec in by_inst.items():
+        if mrec.get("normalized_value") is not None:
+            cur_closes[inst_name] = mrec["normalized_value"]
+    cur_idx_override = session_inputs.get("current_index_closes")
+    if isinstance(cur_idx_override, Mapping):
+        for k, v in cur_idx_override.items():
+            if v is not None:
+                cur_closes[str(k)] = v
 
     fuse_funds: dict[str, dict[str, Any]] = {}
     joint_exposure = 0.0
@@ -677,11 +773,35 @@ def build_fuse_validated_inputs(
         long_run_vol = _finite_number(fdata.get("long_run_volatility"))
         if long_run_vol is None:
             long_run_vol = 0.24
+
+        # Derive 1-session fund and benchmark index returns from real closes when not explicitly given
+        if fdata.get("fund_return") is not None:
+            fund_ret_val = _finite_number(fdata.get("fund_return"))
+        elif symbol in prior_closes and fdata.get("close_price") is not None:
+            fund_ret_val = _compute_return_ratio(fdata.get("close_price"), prior_closes.get(symbol))
+        else:
+            fund_ret_val = None
+
+        bench_inst = _FUND_BENCHMARK_INDEX.get(symbol, "XNDX")
+        if fdata.get("index_return") is not None:
+            idx_ret_val = _finite_number(fdata.get("index_return"))
+        elif bench_inst in prior_closes and bench_inst in cur_closes:
+            idx_ret_val = _compute_return_ratio(cur_closes.get(bench_inst), prior_closes.get(bench_inst))
+        else:
+            idx_ret_val = None
+
+        # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
+        ca_obj = copy.deepcopy(fdata.get("corporate_action"))
+        if ca_obj is None and symbol in by_inst:
+            ca_obj = _map_market_corporate_action(
+                by_inst[symbol].get("corporate_action")  # type: ignore[arg-type]
+            )
+
         fund_entry: dict[str, Any] = {
             "symbol": symbol,
             "exposure": _finite_number(fdata.get("exposure")) if fdata.get("exposure") is not None else pos_val,
-            "fund_return": _finite_number(fdata.get("fund_return")) if fdata.get("fund_return") is not None else 0.0,
-            "index_return": _finite_number(fdata.get("index_return")) if fdata.get("index_return") is not None else 0.0,
+            "fund_return": fund_ret_val,
+            "index_return": idx_ret_val,
             "modelled_fee": _finite_number(fdata.get("modelled_fee")) if fdata.get("modelled_fee") is not None else 0.0,
             "modelled_financing": _finite_number(fdata.get("modelled_financing")) if fdata.get("modelled_financing") is not None else 0.0,
             "forecast_volatility": sigma_val,
@@ -698,7 +818,7 @@ def build_fuse_validated_inputs(
             "ledger_value": _finite_number(fdata.get("ledger_value")) if fdata.get("ledger_value") is not None else pos_val,
             "broker_position": int(_finite_number(fdata.get("broker_position"))) if fdata.get("broker_position") is not None else (int(q_pre_val) if q_pre_val is not None else 0),
             "broker_value": _finite_number(fdata.get("broker_value")) if fdata.get("broker_value") is not None else pos_val,
-            "corporate_action": copy.deepcopy(fdata.get("corporate_action")),
+            "corporate_action": ca_obj,
             "fund_event": copy.deepcopy(fdata.get("fund_event")),
         }
         if "v5_tolerance" in fdata:
@@ -707,19 +827,54 @@ def build_fuse_validated_inputs(
             fund_entry["v7_spread_width"] = fdata["v7_spread_width"]
         fuse_funds[symbol] = fund_entry
 
+    idx_returns: dict[str, float] | None
+    if "index_one_session_returns" in session_inputs:
+        raw_idx_rets = session_inputs.get("index_one_session_returns")
+        idx_returns = copy.deepcopy(raw_idx_rets) if isinstance(raw_idx_rets, dict) else raw_idx_rets  # type: ignore[assignment]
+    elif idx_ok and prior_closes:
+        derived_idx: dict[str, float] = {}
+        for inst_key, ret_label in _INDEX_RETURN_LABELS:
+            if inst_key in prior_closes and inst_key in cur_closes:
+                r_val = _compute_return_ratio(cur_closes.get(inst_key), prior_closes.get(inst_key))
+                if r_val is not None:
+                    derived_idx[ret_label] = r_val
+        idx_returns = derived_idx if len(derived_idx) >= 2 else None
+    else:
+        idx_returns = None
+
+    # Only populate positions / broker_reconciliation when caller supplies explicit records (fail closed otherwise)
+    caller_sources = (
+        session_inputs.get("source_records")
+        if isinstance(session_inputs.get("source_records"), Mapping)
+        else {}
+    )
+    pos_rec = (
+        session_inputs.get("positions_source_record")
+        if "positions_source_record" in session_inputs
+        else caller_sources.get("positions")
+    )
+    brk_rec = (
+        session_inputs.get("broker_reconciliation_source_record")
+        if "broker_reconciliation_source_record" in session_inputs
+        else caller_sources.get("broker_reconciliation")
+    )
     raw_source_records: dict[str, dict[str, Any] | None] = {
-        "market_data": {"as_of": as_of, "age_sessions": 0} if mkt_ok else None,
-        "index_returns": {"as_of": as_of, "age_sessions": 0} if idx_ok else None,
-        "volatility": {"as_of": as_of, "age_sessions": 0} if vol_ok else None,
-        "positions": {"as_of": as_of, "age_sessions": 0},
-        "broker_reconciliation": {"as_of": as_of, "age_sessions": 0},
-        "session_calendar": {"as_of": as_of, "age_sessions": 0} if cal_ok else None,
+        "market_data": caller_sources.get("market_data")
+        if "market_data" in caller_sources
+        else ({"as_of": as_of, "age_sessions": 0} if mkt_ok else None),
+        "index_returns": caller_sources.get("index_returns")
+        if "index_returns" in caller_sources
+        else ({"as_of": as_of, "age_sessions": 0} if (idx_ok and idx_returns is not None) else None),
+        "volatility": caller_sources.get("volatility")
+        if "volatility" in caller_sources
+        else ({"as_of": as_of, "age_sessions": 0} if vol_ok else None),
+        "positions": copy.deepcopy(pos_rec) if isinstance(pos_rec, Mapping) else None,
+        "broker_reconciliation": copy.deepcopy(brk_rec) if isinstance(brk_rec, Mapping) else None,
+        "session_calendar": caller_sources.get("session_calendar")
+        if "session_calendar" in caller_sources
+        else ({"as_of": as_of, "age_sessions": 0} if cal_ok else None),
     }
     source_records = {k: v for k, v in raw_source_records.items() if v is not None}
-
-    idx_returns = session_inputs.get("index_one_session_returns")
-    if idx_returns is None and idx_ok:
-        idx_returns = {"NDX": 0.0, "SPX": 0.0}
 
     out: dict[str, Any] = {
         "tier": tier,

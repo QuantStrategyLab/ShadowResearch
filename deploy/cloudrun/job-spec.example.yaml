@@ -1,6 +1,9 @@
 # Secret-free Cloud Run Job specification example for SHADOW-N SH-2 (us-east1)
 # Replace <project-id>, <repo>, <tag>, <service-account>, and <bucket-name> before deploy.
 # Keep config/production-scheduler.json production_chain_locked=true until OA-SH2-2 sign-off.
+# Single-writer concurrency discipline: maxRetries: 0 with parallelism: 1 and taskCount: 1
+# prevents concurrent overlapping Cloud Run tasks; cross-instance writes are additionally fenced by
+# ledger/.chain.lease.json (GCS exclusive create ifGenerationMatch=0 semantics).
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
@@ -19,7 +22,7 @@ spec:
       taskCount: 1
       template:
         spec:
-          maxRetries: 3
+          maxRetries: 0
           timeoutSeconds: 300
           serviceAccountName: "<service-account>@<project-id>.iam.gserviceaccount.com"
           containers:

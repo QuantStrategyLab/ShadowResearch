@@ -101,7 +101,7 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
         {
             "id": "SH2-A04",
             "status": "PASS_OFFLINE",
-            "detail": "Zero conformance shims verified; U-01 unresolved rows fail closed verbatim; 1-byte tamper rejected before evaluate()",
+            "detail": "Zero conformance shims or fabricated sources/returns; U-01 unresolved fail-closed verbatim; 1-byte tamper rejected before evaluate()",
         },
         {
             "id": "SH2-A05",
@@ -126,7 +126,7 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
         {
             "id": "SH2-A09",
             "status": "PASS_OFFLINE",
-            "detail": "Cloud Run Jobs us-east1 stateless sequential & concurrent retry returns already_committed_no_op with <=1 append (Item 18)",
+            "detail": "Cloud Run Jobs us-east1 stateless retry returns already_committed_no_op with <=1 append and .chain.lease.json cross-instance fencing (Item 18)",
         },
         {
             "id": "SH2-A10",
@@ -141,7 +141,7 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
         {
             "id": "SH2-A12",
             "status": "PASS_OFFLINE",
-            "detail": "Forward-clock creditability verifies OTS BTC proof + engine_hash/spec_version pins when unlocked and rejects when locked",
+            "detail": "Forward-clock creditability verifies OTS BTC proof + engine_hash/spec_version pins when unlocked and fails closed by default when locked",
         },
         {
             "id": "SH2-A13",

@@ -20,7 +20,7 @@
   "treasury_endpoint": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_bill_rates&field_tdr_date_value={year}&page&_format=csv",
   "yahoo_symbol_map": {
     "XNDX": "^XNDX",
-    "SEMI": "XSOX"
+    "XSOX": "XSOX"
   },
   "ots_calendars": [
     "https://a.pool.opentimestamps.org",

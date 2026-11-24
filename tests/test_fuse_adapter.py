@@ -32,6 +32,7 @@ from shadow.fuse_adapter import (
 )
 from shadow.ledger import GENESIS_PREV_HASH, build_record_body
 from shadow.manifest import compute_code_manifest_hash
+from shadow.sizing import compute_session_sizing
 
 
 def _valid_inputs() -> dict:
@@ -40,9 +41,32 @@ def _valid_inputs() -> dict:
         "E_star": "50000",
         "H": "0",
         "L": "0",
+        "positions_source_record": {
+            "as_of": "2026-01-05T22:00:00.000Z",
+            "age_sessions": 0,
+        },
+        "broker_reconciliation_source_record": {
+            "as_of": "2026-01-05T22:00:00.000Z",
+            "age_sessions": 0,
+        },
+        "index_one_session_returns": {"NDX": 0.0, "SEMI": 0.0},
         "funds": {
-            "TQQQ": {"s": "1", "close_price": "50", "q_pre": 100, "sigma_forecast": "0.24"},
-            "SOXL": {"s": "1", "close_price": "40", "q_pre": 100, "sigma_forecast": "0.22"},
+            "TQQQ": {
+                "s": "1",
+                "close_price": "50",
+                "q_pre": 100,
+                "sigma_forecast": "0.24",
+                "fund_return": 0.0,
+                "index_return": 0.0,
+            },
+            "SOXL": {
+                "s": "1",
+                "close_price": "40",
+                "q_pre": 100,
+                "sigma_forecast": "0.22",
+                "fund_return": 0.0,
+                "index_return": 0.0,
+            },
         },
     }
 
@@ -270,6 +294,323 @@ class FuseAdapterTest(unittest.TestCase):
                 evaluator=StubEvaluator(),
                 calendar_spec=spec,
             )
+
+    def test_no_silent_synthesis_of_sources_or_zero_returns(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        bare_inputs = {
+            "E": "50000",
+            "E_star": "50000",
+            "H": "0",
+            "L": "0",
+            "funds": {
+                "TQQQ": {"s": "1", "close_price": "50", "q_pre": 100, "sigma_forecast": "0.24"},
+                "SOXL": {"s": "1", "close_price": "40", "q_pre": 100, "sigma_forecast": "0.22"},
+            },
+        }
+        vin = build_fuse_validated_inputs(
+            bare_inputs,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertNotIn("positions", vin["source_records"])
+        self.assertNotIn("broker_reconciliation", vin["source_records"])
+        self.assertNotIn("index_returns", vin["source_records"])
+        self.assertIsNone(vin["index_one_session_returns"])
+        self.assertIsNone(vin["funds"]["TQQQ"]["fund_return"])
+        self.assertIsNone(vin["funds"]["TQQQ"]["index_return"])
+
+        rows, eff, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NO-NEW-RISK")
+        self.assertEqual(rows["O1"]["reason"], "stale_or_missing_input")
+        self.assertEqual(resolve_aggregate_control_state(eff), "NO-NEW-RISK")
+
+        # Real 1-session return (-11% on XNDX) computed from prior_closes + market_records trips L6
+        crash_inputs = {
+            "E": "50000",
+            "E_star": "50000",
+            "H": "0",
+            "L": "0",
+            "positions_source_record": {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0},
+            "broker_reconciliation_source_record": {
+                "as_of": "2026-01-05T22:00:00.000Z",
+                "age_sessions": 0,
+            },
+            "prior_closes": {
+                "TQQQ": "50",
+                "SOXL": "40",
+                "QQQ": "500",
+                "XNDX": "100",
+                "SEMI": "100",
+            },
+            "market_records": [
+                {
+                    "instrument": "TQQQ",
+                    "normalized_value": "33.5",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "SOXL",
+                    "normalized_value": "40",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "QQQ",
+                    "normalized_value": "445",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "XNDX",
+                    "normalized_value": "89",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "SEMI",
+                    "normalized_value": "100",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "SOFR",
+                    "normalized_value": "0.045",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "TBILL_3M",
+                    "normalized_value": "0.044",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+            ],
+            "funds": {
+                "TQQQ": {"s": "1", "close_price": "33.5", "q_pre": 100, "sigma_forecast": "0.24"},
+                "SOXL": {"s": "1", "close_price": "40", "q_pre": 100, "sigma_forecast": "0.22"},
+            },
+        }
+        vin_crash = build_fuse_validated_inputs(
+            crash_inputs,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertAlmostEqual(vin_crash["index_one_session_returns"]["NDX"], -0.11, places=6)
+        rows_crash, eff_crash, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_crash,
+            {},
+            None,
+        )
+        self.assertEqual(rows_crash["L6"]["state"], "HALT")
+        self.assertEqual(resolve_aggregate_control_state(eff_crash), "HALT")
+
+    def test_market_record_corporate_action_wired_into_v2(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+
+        def _with_ca(split_ratio: str, cash: str) -> dict:
+            inp = json.loads(json.dumps(_valid_inputs()))
+            inp["market_records"] = [
+                {
+                    "instrument": "TQQQ",
+                    "normalized_value": "50",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                    "corporate_action": {
+                        "split_ratio": split_ratio,
+                        "cash_per_share_usd": cash,
+                        "ex_date": "2026-01-05",
+                    },
+                },
+                {
+                    "instrument": "SOXL",
+                    "normalized_value": "40",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                    "corporate_action": {"split_ratio": "1", "cash_per_share_usd": "0", "ex_date": "2026-01-05"},
+                },
+                {
+                    "instrument": "QQQ",
+                    "normalized_value": "500",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "XNDX",
+                    "normalized_value": "20000",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "SEMI",
+                    "normalized_value": "5000",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "SOFR",
+                    "normalized_value": "0.045",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+                {
+                    "instrument": "TBILL_3M",
+                    "normalized_value": "0.044",
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal["spec_digest"],
+                },
+            ]
+            return inp
+
+        # Neutral split=1, cash=0 leaves V2 clean (None)
+        vin_clean = build_fuse_validated_inputs(
+            _with_ca("1", "0"),
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNone(vin_clean["funds"]["TQQQ"]["corporate_action"])
+        rows_clean, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_clean,
+            {},
+            None,
+        )
+        self.assertEqual(rows_clean["V2"]["state"], "NORMAL")
+
+        # Split factor 2 trips V2 HALT
+        vin_split = build_fuse_validated_inputs(
+            _with_ca("2", "0"),
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_split["funds"]["TQQQ"]["corporate_action"]["type"], "split")
+        self.assertEqual(vin_split["funds"]["TQQQ"]["corporate_action"]["ratio"], 2.0)
+        rows_split, eff_split, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_split,
+            {},
+            None,
+        )
+        self.assertEqual(rows_split["V2"]["state"], "HALT")
+        self.assertEqual(rows_split["V2"]["reason"], "pending_corporate_action_TQQQ")
+        self.assertEqual(resolve_aggregate_control_state(eff_split), "HALT")
+
+        # Cash distribution > 0 also trips V2 HALT
+        vin_div = build_fuse_validated_inputs(
+            _with_ca("1", "0.25"),
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_div["funds"]["TQQQ"]["corporate_action"]["type"], "distribution")
+        rows_div, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_div,
+            {},
+            None,
+        )
+        self.assertEqual(rows_div["V2"]["state"], "HALT")
+
+    def test_no_new_risk_clamp_and_per_fund_isolation_in_sizing(self) -> None:
+        # q_pre=0 under NO-NEW-RISK clamps increase to q_ideal=0, delta_q_exec=0
+        s_inp_zero = json.loads(json.dumps(_valid_inputs()))
+        s_inp_zero["funds"]["TQQQ"]["q_pre"] = 0
+        s_inp_zero["funds"]["SOXL"]["q_pre"] = 0
+        out_nnr = compute_session_sizing(s_inp_zero, active_control_state="NO-NEW-RISK")
+        balanced_zero = next(t for t in out_nnr["tiers"] if t["tier_id"] == "balanced")
+        for fdec in balanced_zero["funds"]:
+            self.assertEqual(fdec["q_ideal"], 0)
+            self.assertEqual(fdec["delta_q_exec"], 0)
+
+        # NO-NEW-RISK allows risk reductions when q_pre exceeds target; ORDER-UNKNOWN blocks all orders
+        s_inp_over = json.loads(json.dumps(_valid_inputs()))
+        s_inp_over["funds"]["TQQQ"]["q_pre"] = 1000
+        s_inp_over["funds"]["SOXL"]["q_pre"] = 1000
+        out_reduce = compute_session_sizing(s_inp_over, active_control_state="NO-NEW-RISK")
+        balanced_red = next(t for t in out_reduce["tiers"] if t["tier_id"] == "balanced")
+        for fdec in balanced_red["funds"]:
+            self.assertLess(fdec["q_ideal"], fdec["q_pre"])
+            self.assertLess(fdec["delta_q_exec"], 0)
+
+        out_ou = compute_session_sizing(s_inp_over, active_control_state="ORDER-UNKNOWN")
+        balanced_ou = next(t for t in out_ou["tiers"] if t["tier_id"] == "balanced")
+        for fdec in balanced_ou["funds"]:
+            self.assertEqual(fdec["delta_q_exec"], 0)
+
+        # End-to-end build_record_body isolates per-fund V4 NO-NEW-RISK on TQQQ without blocking SOXL
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        inp_per_fund = json.loads(json.dumps(_valid_inputs()))
+        inp_per_fund["funds"]["TQQQ"]["q_pre"] = 0
+        inp_per_fund["funds"]["TQQQ"]["sigma_forecast"] = "0.50"  # trips V4 NO-NEW-RISK on TQQQ only
+        inp_per_fund["funds"]["SOXL"]["q_pre"] = 0
+        inp_per_fund["funds"]["SOXL"]["sigma_forecast"] = "0.22"
+        built = build_record_body(
+            chain_id="prod-per-fund-v4",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=inp_per_fund,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=VendoredFuseEvaluator(),
+            calendar_spec=spec,
+        )
+        self.assertTrue(built["appended"])
+        rec = built["record_body"]
+        balanced_rec = next(t for t in rec["tiers"] if t["tier_id"] == "balanced")
+        by_sym = {f["instrument"]: f for f in balanced_rec["funds"]}
+        self.assertEqual(by_sym["TQQQ"]["q_ideal"], 0)
+        self.assertEqual(by_sym["TQQQ"]["delta_q_exec"], 0)
+        self.assertGreater(by_sym["SOXL"]["q_ideal"], 0)
+        self.assertGreater(by_sym["SOXL"]["delta_q_exec"], 0)
 
 
 if __name__ == "__main__":

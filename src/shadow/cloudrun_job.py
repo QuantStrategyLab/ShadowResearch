@@ -22,6 +22,7 @@ from shadow.fuse_adapter import (
     verify_f1_entry_gates,
 )
 from shadow.feeder_live import Transport
+from shadow.ledger import ChainConcurrencyConflictError
 from shadow.ots import OpenTimestampsClient, OtsTransport
 from shadow.scheduler import (
     REPO_ROOT,
@@ -64,7 +65,6 @@ def run_cloudrun_job(
     sleeper: Callable[[float], None] | None = None,
     environ: Mapping[str, str] | None = None,
     allow_unanchored_on_ots_failure: bool | None = None,
-    unlock_production_override: bool = False,
 ) -> dict[str, object]:
     """Execute one idempotent Cloud Run Job task against vendored FUSE-1 + csa22-v2."""
     env = dict(os.environ) if environ is None else dict(environ)
@@ -95,12 +95,12 @@ def run_cloudrun_job(
 
     if target_mode == "production":
         cfg = load_production_scheduler_config(eff_config_path)
-        if unlock_production_override:
-            cfg = dataclasses.replace(cfg, production_chain_locked=False, clk01_active=True)
         if cfg.production_chain_locked is not False or not cfg.clk01_active:
             raise ProductionChainLockedError(
                 "Production chain is locked (OA-SH2-2); 0 appends permitted in Cloud Run job"
             )
+        if fixtures_dir is not None:
+            raise ValueError("production_mode_forbids_offline_fixtures")
     else:
         cfg = load_scheduler_config(eff_config_path)
         if cfg.fuse_engine_hash is None:
@@ -251,6 +251,16 @@ def main(argv: list[str] | None = None) -> int:
         }
         print(json.dumps(err_payload, indent=2, sort_keys=True))
         return 3
+    except ChainConcurrencyConflictError as exc:
+        err_payload = {
+            "schema_version": "sh2-cloudrun-job-result-v1",
+            "status": "chain_concurrency_conflict",
+            "appended": False,
+            "fail_closed": True,
+            "reason": str(exc),
+        }
+        print(json.dumps(err_payload, indent=2, sort_keys=True))
+        return 4
 
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0

@@ -284,20 +284,23 @@ def _validate_core_rth_bar_timestamp(
     raw_ts: object,
     session_date: str,
     calendar_session: Mapping[str, object] | None = None,
+    *,
+    allow_midnight_date_marker: bool = False,
 ) -> None:
     if not isinstance(raw_ts, str) or not raw_ts.strip():
         return
     txt = raw_ts.strip()
-    if len(txt) == 10:
-        if txt > session_date:
-            raise ValueError("next_trade_date_contamination")
-        return
-    if "T00:00:00" in txt and (txt.endswith("Z") or "+" in txt or txt.endswith("-00:00")):
-        # Canonical Tiingo midnight-UTC daily session marker ("YYYY-MM-DDT00:00:00.000Z")
-        row_d = txt[:10]
-        if row_d > session_date:
-            raise ValueError("next_trade_date_contamination")
-        return
+    if allow_midnight_date_marker:
+        if len(txt) == 10:
+            if txt > session_date:
+                raise ValueError("next_trade_date_contamination")
+            return
+        if "T00:00:00" in txt and (txt.endswith("Z") or "+" in txt or txt.endswith("-00:00")):
+            # Canonical Tiingo midnight-UTC daily session marker ("YYYY-MM-DDT00:00:00.000Z")
+            row_d = txt[:10]
+            if row_d > session_date:
+                raise ValueError("next_trade_date_contamination")
+            return
     iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
     try:
         dt_ny = datetime.fromisoformat(iso_norm).astimezone(_NY_TZ)
@@ -342,9 +345,19 @@ def select_tiingo_row(
                 extended_err = "extended_hours_overnight_rejected"
                 continue
             try:
-                _validate_core_rth_bar_timestamp(raw_date, session_date, calendar_session)
+                _validate_core_rth_bar_timestamp(
+                    raw_date,
+                    session_date,
+                    calendar_session,
+                    allow_midnight_date_marker=True,
+                )
                 if "timestamp" in row and row.get("timestamp") is not None:
-                    _validate_core_rth_bar_timestamp(row.get("timestamp"), session_date, calendar_session)
+                    _validate_core_rth_bar_timestamp(
+                        row.get("timestamp"),
+                        session_date,
+                        calendar_session,
+                        allow_midnight_date_marker=False,
+                    )
                 if "publicationTimestamp" in row and row.get("publicationTimestamp") is not None:
                     pub = str(row["publicationTimestamp"]).strip()
                     iso_pub = pub[:-1] + "+00:00" if pub.endswith("Z") else pub
@@ -377,6 +390,9 @@ def select_yahoo_close(
     if not isinstance(results, list) or not results or not isinstance(results[0], dict):
         raise ValueError("yahoo_empty_result")
     result0 = results[0]
+    meta = result0.get("meta") if isinstance(result0.get("meta"), dict) else {}
+    if "dataGranularity" in meta and meta.get("dataGranularity") not in ("1d", "1day", "daily"):
+        raise ValueError("yahoo_non_daily_granularity_rejected")
     timestamps = result0.get("timestamp") or []
     quote = ((result0.get("indicators") or {}).get("quote") or [{}])[0]
     closes = quote.get("close") or []
@@ -926,6 +942,7 @@ def emit_market_records_from_payloads(
                     "extended_hours_overnight_rejected",
                     "next_trade_date_contamination",
                     "yahoo_invalid_timestamp",
+                    "yahoo_non_daily_granularity_rejected",
                     "tiingo_invalid_timestamp",
                 )
                 and not err_msg.startswith(("invalid_numeric:", "nonfinite_numeric:"))
@@ -1324,3 +1341,97 @@ def validate_official_close_market_record(
             if not ok_ts:
                 return False, err
     return True, None
+
+
+def extract_prior_close_from_tiingo_bytes(
+    raw_bytes: bytes,
+    session_date: str,
+    *,
+    calendar_session: Mapping[str, object] | None = None,
+) -> str | None:
+    """Return latest valid prior-session (< session_date) close string from multi-day Tiingo JSON."""
+    try:
+        rows = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    candidates: list[tuple[str, Decimal]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_date = str(row.get("date", ""))
+        row_d = raw_date[:10]
+        if len(row_d) != 10 or row_d >= session_date or row.get("close") is None:
+            continue
+        if row.get("extendedHours") is True or row.get("isExtendedHours") is True:
+            continue
+        try:
+            _validate_core_rth_bar_timestamp(
+                raw_date,
+                row_d,
+                calendar_session,
+                allow_midnight_date_marker=True,
+            )
+            if "timestamp" in row and row.get("timestamp") is not None:
+                _validate_core_rth_bar_timestamp(
+                    row.get("timestamp"),
+                    row_d,
+                    calendar_session,
+                    allow_midnight_date_marker=False,
+                )
+            close_dec = _parse_finite_decimal(row["close"], "tiingo_prior_close")
+        except ValueError:
+            continue
+        candidates.append((row_d, close_dec))
+    if not candidates:
+        return None
+    _, best_close = max(candidates, key=lambda item: item[0])
+    return canonical_decimal_str(best_close)
+
+
+def extract_prior_close_from_yahoo_bytes(
+    raw_bytes: bytes,
+    session_date: str,
+    *,
+    calendar_session: Mapping[str, object] | None = None,
+) -> str | None:
+    """Return latest valid prior-session (< session_date) close string from multi-day Yahoo JSON."""
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    results = (payload.get("chart") or {}).get("result") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        return None
+    result0 = results[0]
+    meta = result0.get("meta") if isinstance(result0.get("meta"), dict) else {}
+    if "dataGranularity" in meta and meta.get("dataGranularity") not in ("1d", "1day", "daily"):
+        return None
+    timestamps = result0.get("timestamp") or []
+    quote = ((result0.get("indicators") or {}).get("quote") or [{}])[0]
+    closes = quote.get("close") or []
+    close_t = _official_close_time_for_calendar(calendar_session)
+    best: tuple[str, int, Decimal] | None = None
+    for ts, close in zip(timestamps, closes):
+        if ts is None or close is None or isinstance(ts, bool):
+            continue
+        try:
+            ts_int = int(ts)
+            bar_dt = datetime.fromtimestamp(ts_int, tz=_NY_TZ)
+            bar_date = bar_dt.date().isoformat()
+        except (ValueError, TypeError, OverflowError, OSError):
+            continue
+        if bar_date >= session_date:
+            continue
+        bar_t = bar_dt.time()
+        if bar_t < dt_time(9, 30) or bar_t > close_t or bar_t >= dt_time(21, 0):
+            continue
+        try:
+            c_dec = _parse_finite_decimal(close, "yahoo_prior_close")
+        except ValueError:
+            continue
+        cand = (bar_date, ts_int, c_dec)
+        if best is None or (cand[0], cand[1]) > (best[0], best[1]):
+            best = cand
+    return canonical_decimal_str(best[2]) if best is not None else None

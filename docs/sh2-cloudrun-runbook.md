@@ -22,8 +22,8 @@ The default [`config/production-scheduler.json`](../config/production-scheduler.
 
 While `production_chain_locked: true`, `python3 -m shadow.cloudrun_job --mode production` fails closed with `0` ledger appends (`exit 2`, `status="production_chain_locked"`).
 
-## 3. Stateless Retry Idempotency & Continuity
+## 3. Stateless Retry Idempotency, Lease Fencing & Continuity
 
-1. Both `run_daily_drill_cycle` and `run_production_cycle` serialize access with `ShadowLedger.chain_lock()`.
-2. Re-invoking `python3 -m shadow.cloudrun_job` on an already committed `(chain_id, session_date)` detects the committed record and returns `status: "already_committed_no_op"` (`idempotent_noop: true`, `appended: false`, `exit 0`) without re-evaluating or duplicating entries.
-3. Every committed session writes an identity-pinned atomic checkpoint under `state_snapshots/` (`seq_NNNNNN.state.json` + `latest.state.json`) verified against `engine_hash`, `spec_version`, `chain_id`, `sequence`, and `record_sha256` before the next session runs.
+1. **Cross-Instance Lease Fencing:** [`ShadowLedger.chain_lock()`](../src/shadow/ledger.py) combines local `fcntl.flock` with an exclusive `.chain.lease.json` lease file (`O_CREAT | O_EXCL`, mapped to GCS exclusive object create `ifGenerationMatch=0`). Active concurrent writers fail closed with `ChainConcurrencyConflictError` (`exit 4`) rather than overwriting shared state; only expired leases from crashed executions are reclaimed, and exit cleanup verifies matching `lease_id`. [`deploy/cloudrun/job-spec.example.yaml`](../deploy/cloudrun/job-spec.example.yaml) sets `parallelism: 1`, `taskCount: 1`, and `maxRetries: 0` so Cloud Run does not launch overlapping execution retries while a task holds the lease.
+2. **Idempotent Retry (`already_committed_no_op`):** Re-invoking `python3 -m shadow.cloudrun_job` after completion on an already committed `(chain_id, session_date)` returns `status: "already_committed_no_op"` (`idempotent_noop: true`, `appended: false`, `exit 0`) and verifies or deterministically recovers `state_snapshots/` if an abrupt interruption occurred.
+3. **Atomic State Checkpoints:** Every committed session stages `state_snapshots/seq_NNNNNN.state.json` and `latest.state.json` atomically inside `before_record_commit` (rolling back if commit fails). Rejected `O1`/`O2` evaluations persist `state_snapshots/pending_rejected_state.json` so breaker latches survive into the next session without fabricating ledger entries.
