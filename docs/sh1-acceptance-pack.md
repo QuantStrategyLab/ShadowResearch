@@ -9,8 +9,8 @@
 | Artifact | Value |
 | --- | --- |
 | `policy_id` | `policy_v0_pre` |
-| `policy_config_hash` | `cb79857600a4239876b0e1d50897ec6116061cc8b912f8b15d4aea13b8764d9d` |
-| `code_version_sha` | `ff443f53acca6e29624b942cb1fbc8d4752bff494d010c29fea4cba7edc6b26d` |
+| `policy_config_hash` | `8409ea2722f3ca25e2cd750a957aeb01054743b908341fb61936f44d247666fd` |
+| `code_version_sha` | `ad2ffcf244641a5d9055ab855810fc2c0bab68bdf84e627f5754476f33be4fa8` |
 | `csa22-v1` `spec_digest` | `6601c01f2907119c25a2687d4b67210285d3c13ebf2d86a2953745dbd1f6f2af` |
 | `StubEvaluator` `engine_hash` | `stub-d4dd72fbcf2f8d86` (synthetic drill only; `production_clock_capable = false`) |
 | Drill config | [`config/drill-scheduler.json`](../config/drill-scheduler.json) (`chain_id = "drill-sh1-v1"`, `mode = "drill"`, `clk01_active = false`) |
@@ -57,6 +57,6 @@ Reproduced offline via `PYTHONPATH=src python3 -m shadow.acceptance` and `python
 | `R-2` | Enrolled | `PrGovernance` workflows (`risk-gate.yml`, `pr-review-signal.yml`, `codex-nudge.yml`) active. |
 | `R-3` | Published | `csa22-v1` published in `specs/csa22-v1/`; `csa22-v2` published on `origin/feat/csa22-v2`. |
 | `R-4` | Pending Mini Activation | Unit templates + footprint budget (`<= 2 GiB`) verified; mini systemd linger & runner check upon deployment. |
-| `R-5` | Pinned | `policy_v0_pre` canonical digest `cb79857600a4239876b0e1d50897ec6116061cc8b912f8b15d4aea13b8764d9d` (covering policy params, effective run config including `half_day_run_time_et`, `decision_cutoff_et`, `treasury_endpoint`, and `yahoo_symbol_map`, calendar digest, and executable manifest). |
+| `R-5` | Pinned | `policy_v0_pre` canonical digest `8409ea2722f3ca25e2cd750a957aeb01054743b908341fb61936f44d247666fd` (covering policy params, effective run config including `half_day_run_time_et`, `decision_cutoff_et`, `treasury_endpoint`, and `yahoo_symbol_map`, calendar digest, and executable manifest). |
 | `R-6` | Partial | `docs/SH1-A02-PROBE.md` recorded; weekday post-close EOD timing carry-over pending live weekday window. |
 | `R-7` | Pinned | OpenTimestamps calendars + `23:30` ET commitment deadline pinned in `config/drill-scheduler.json`. |

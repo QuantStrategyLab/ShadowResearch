@@ -551,6 +551,37 @@ def _validate_bundle_session_against_record(
     return True, None
 
 
+def _has_committed_detached_receipt(ledger: ShadowLedger, seq: int) -> bool:
+    """Return True iff seq_NNNNNN.receipt.json is a structured committed receipt (not an empty/partial pre-commit stub)."""
+    rpath = ledger._receipt_path(seq)
+    if not rpath.is_file():
+        return False
+    try:
+        rcp = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(rcp, dict):
+        return False
+    anchor = rcp.get("anchor")
+    rec_seq = rcp.get("sequence")
+    rec_sha = rcp.get("record_sha256")
+    rec_ds = rcp.get("session_date")
+    obtained = rcp.get("obtained_at_utc")
+    if anchor not in ("opentimestamps", "synthetic-stub"):
+        return False
+    if isinstance(rec_seq, bool) or rec_seq != seq:
+        return False
+    if not isinstance(rec_sha, str) or len(rec_sha) != 64 or any(c not in "0123456789abcdef" for c in rec_sha):
+        return False
+    if not isinstance(rec_ds, str) or not _DATE_YYYY_MM_DD_RE.fullmatch(rec_ds):
+        return False
+    try:
+        date.fromisoformat(rec_ds)
+    except ValueError:
+        return False
+    return is_utc_ms_timestamp(obtained)
+
+
 def _validate_replay_bundle_matches_ledger(
     bundle_dir: Path,
     prior_records: list[dict],
@@ -649,6 +680,12 @@ def _validate_replay_bundle_matches_ledger(
                     f"{rep_err}:{tail_ds}:seq={n}",
                     None,
                 )
+        if ledger is not None and _has_committed_detached_receipt(ledger, n):
+            return (
+                False,
+                f"committed_session_missing_ledger_record:{tail_ds}:seq={n}",
+                None,
+            )
         if prune_uncommitted_tail:
             bundle_obj["sessions"] = list(sessions[:n])
             _atomic_write_text(bundle_path, json.dumps(bundle_obj, indent=2, sort_keys=True) + "\n")
@@ -1106,7 +1143,7 @@ def _commit_drill_session_atomically(
     session_entry: dict,
     post_ledger_hook: Callable[[], None] | None = None,
 ) -> dict:
-    """Serialize via chain_lock, stage .ots/.receipt/replay_bundle, and write seq_NNNNNN.record.json LAST."""
+    """Serialize via chain_lock, stage replay_bundle, commit seq_NNNNNN.record.json, then write detached .ots/.receipt."""
     with ledger.chain_lock():
         bundle_path = bundle_dir / "replay_bundle.json"
         prior_bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
@@ -1577,7 +1614,7 @@ def _run_daily_drill_cycle_locked(
             "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
         }
 
-    # 3a. Enforce ledger <-> replay_bundle consistency before any retry or subsequent-day append
+    # 3a. Enforce ledger <-> replay_bundle consistency and committed-receipt integrity before any retry or append
     bundle_obj_validated: dict | None = None
     if prior_records:
         bundle_ok, bundle_err, bundle_obj_validated = _validate_replay_bundle_matches_ledger(
@@ -1609,6 +1646,21 @@ def _run_daily_drill_cycle_locked(
                 "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists(),
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
+        if _has_committed_detached_receipt(ledger, len(prior_records)):
+            return {
+                "appended": False,
+                "recovered_missing_report": False,
+                "fail_closed": True,
+                "reason": "committed_evidence_without_ledger_records",
+                "detail": f"Committed detached receipt exists for seq={len(prior_records)} while record marker is missing",
+                "session_date": session_date,
+                "report": None,
+                "report_paths": [],
+                "report_written": False,
+                "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists()
+                or (reports_dir / f"completeness_{session_date}.md").exists(),
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
     else:
         prior_committed_artifacts = False
         if reports_dir.is_dir():
@@ -1625,6 +1677,8 @@ def _run_daily_drill_cycle_locked(
                     if has_ev:
                         prior_committed_artifacts = True
                         break
+        if not prior_committed_artifacts and _has_committed_detached_receipt(ledger, 0):
+            prior_committed_artifacts = True
         bundle_path = bundle_dir / "replay_bundle.json"
         if not prior_committed_artifacts and bundle_path.is_file():
             try:

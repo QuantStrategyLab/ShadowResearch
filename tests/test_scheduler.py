@@ -2169,11 +2169,12 @@ class SchedulerTest(unittest.TestCase):
                         _SimulatedSigkill("kill after bundle write before record rename")
                     ),
                 )
-            # Confirm crashed on-disk state: 1 ledger record, 2 bundle sessions, orphan seq 1 ots/receipt
+            # Confirm crashed on-disk state: 1 ledger record, 2 bundle sessions, zero pre-commit seq 1 ots/receipt
             self.assertEqual(len(ShadowLedger(crash_tail_dir / "ledger").load_records()), 1)
             crashed_bundle = json.loads((crash_tail_dir / "replay" / "replay_bundle.json").read_text(encoding="utf-8"))
             self.assertEqual(len(crashed_bundle["sessions"]), 2)
-            self.assertTrue((crash_tail_dir / "ledger" / "seq_000001.receipt.json").is_file())
+            self.assertFalse((crash_tail_dir / "ledger" / "seq_000001.receipt.json").exists())
+            self.assertFalse((crash_tail_dir / "ledger" / "seq_000001.ots").exists())
             self.assertFalse((crash_tail_dir / "ledger" / "seq_000001.record.json").exists())
 
             # Before retry, detect_missed keeps Day 1 'ok' and flags crashed Day 2 as missed
@@ -2754,6 +2755,157 @@ class SchedulerTest(unittest.TestCase):
                 ],
                 orig_evidence,
             )
+
+    def test_r11_missing_committed_record_never_overwritten_on_retry_or_next_day(self) -> None:
+        import contextlib
+        import io
+        from shadow import scheduler as sched_mod
+
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. Empty-ledger seq_0 committed after earlier fail-closed report, then seq_000000.record.json unlinked:
+            #    same-day 17:40 ET retry MUST refuse overwriting seq_000000 and preserve bundle/OTS/receipt bytes!
+            d1_dir = root / "same_day_seq0_missing_record"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=d1_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h, withhold_inst="TQQQ"),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["fail_closed"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "crash_after_commit"):
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=d1_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                    _post_record_commit_hook=lambda: (_ for _ in ()).throw(RuntimeError("crash_after_commit")),
+                )
+            (d1_dir / "ledger" / "seq_000000.record.json").unlink()
+            orig_seq0 = [
+                (d1_dir / rel).read_bytes()
+                for rel in ("replay/replay_bundle.json", "ledger/seq_000000.ots", "ledger/seq_000000.receipt.json")
+            ]
+
+            same_day_retry = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=d1_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21", "22:40:00"),
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(same_day_retry["appended"])
+            self.assertTrue(same_day_retry["fail_closed"])
+            self.assertEqual(same_day_retry["reason"], "committed_evidence_without_ledger_records")
+            self.assertEqual(
+                [
+                    (d1_dir / rel).read_bytes()
+                    for rel in ("replay/replay_bundle.json", "ledger/seq_000000.ots", "ledger/seq_000000.receipt.json")
+                ],
+                orig_seq0,
+            )
+
+            # 2. Non-empty ledger seq_1 committed after earlier fail-closed report on Day 2, then seq_000001.record.json unlinked:
+            #    Day 3 normal run MUST refuse pruning Day 2 or reusing seq 1, and detect-missed continues exiting 2!
+            d2_dir = root / "nonempty_seq1_missing_record"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=d2_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["appended"]
+            )
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-24",
+                    data_dir=d2_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h, withhold_inst="TQQQ"),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-24"),
+                    sleeper=lambda _: None,
+                )["fail_closed"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "crash_after_commit"):
+                run_daily_drill_cycle(
+                    session_date="2025-11-24",
+                    data_dir=d2_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-24"),
+                    sleeper=lambda _: None,
+                    _post_record_commit_hook=lambda: (_ for _ in ()).throw(RuntimeError("crash_after_commit")),
+                )
+            (d2_dir / "ledger" / "seq_000001.record.json").unlink()
+            orig_seq1 = [
+                (d2_dir / rel).read_bytes()
+                for rel in ("replay/replay_bundle.json", "ledger/seq_000001.ots", "ledger/seq_000001.receipt.json")
+            ]
+
+            day3_res = run_daily_drill_cycle(
+                session_date="2025-11-25",
+                data_dir=d2_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-25"),
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(day3_res["appended"])
+            self.assertTrue(day3_res["fail_closed"])
+            self.assertFalse((d2_dir / "ledger" / "seq_000001.record.json").exists())
+            self.assertEqual(
+                [
+                    (d2_dir / rel).read_bytes()
+                    for rel in ("replay/replay_bundle.json", "ledger/seq_000001.ots", "ledger/seq_000001.receipt.json")
+                ],
+                orig_seq1,
+            )
+
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc2 = sched_mod.main(
+                    [
+                        "detect-missed",
+                        "--start-date",
+                        "2025-11-21",
+                        "--as-of-utc",
+                        "2025-11-26T05:00:00.000Z",
+                        "--data-dir",
+                        str(d2_dir),
+                    ]
+                )
+            audit2 = json.loads(out_buf.getvalue())
+            self.assertEqual(rc2, 2)
+            self.assertTrue(audit2["missed_run_detected"])
+            self.assertIn("2025-11-24", audit2["silent_missed_days"])
+            self.assertIn("2025-11-24", audit2["failed_days"])
 
 
 if __name__ == "__main__":

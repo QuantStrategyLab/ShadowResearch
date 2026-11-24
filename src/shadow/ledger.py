@@ -1144,11 +1144,11 @@ class ShadowLedger:
             rec_path = self._record_path(seq)
             rcp_path = self._receipt_path(seq)
             ots_path = self._ots_path(seq)
-            # Only committed record marker indicates an existing sequence; orphan .ots/.receipt files from an abrupt kill are cleanly overwritten on retry.
+            # seq_NNNNNN.record.json commits BEFORE detached .ots/.receipt so a valid detached receipt without .record.json unambiguously signals a missing committed record.
             if rec_path.exists():
                 raise LedgerAppendError(f"target_sequence_already_exists: {seq}")
 
-            pre_marker_writes: list[tuple[Path, bytes]] = []
+            post_marker_writes: list[tuple[Path, bytes]] = []
             if not allow_unanchored:
                 if receipt is None:
                     if obtained_at_utc is None:
@@ -1180,8 +1180,8 @@ class ShadowLedger:
                 if not ok_rec:
                     raise LedgerAppendError(f"invalid_receipt: {err_rec}")
                 if ots_bytes is not None:
-                    pre_marker_writes.append((ots_path, ots_bytes))
-                pre_marker_writes.append((rcp_path, canonical_json_bytes(receipt_obj)))
+                    post_marker_writes.append((ots_path, ots_bytes))
+                post_marker_writes.append((rcp_path, canonical_json_bytes(receipt_obj)))
 
             self.root_dir.mkdir(parents=True, exist_ok=True)
             if allow_unanchored:
@@ -1194,14 +1194,14 @@ class ShadowLedger:
 
             created_paths: list[Path] = []
             try:
-                for target_path, data in pre_marker_writes:
-                    _atomic_write_bytes(target_path, data)
-                    created_paths.append(target_path)
                 if before_record_commit is not None:
                     before_record_commit()
-                # seq_NNNNNN.record.json is written LAST as the atomic commit marker
+                # Commit seq_NNNNNN.record.json BEFORE detached .ots/.receipt; rollback_sequence / except handler cleans up on Python exception.
                 _atomic_write_bytes(rec_path, canonical_json_bytes(envelope))
                 created_paths.append(rec_path)
+                for target_path, data in post_marker_writes:
+                    _atomic_write_bytes(target_path, data)
+                    created_paths.append(target_path)
             except Exception:
                 for created_path in reversed(created_paths):
                     if created_path.exists():
