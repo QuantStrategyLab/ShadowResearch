@@ -6,9 +6,10 @@ import csv
 import hashlib
 import io
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
@@ -231,6 +232,24 @@ def parse_flexible_iso_date(raw: str) -> str:
     raise ValueError(f"invalid_date:{raw!r}")
 
 
+def _parse_finite_decimal(raw: object, field_name: str) -> Decimal:
+    """Parse a finite non-boolean numeric value into Decimal or raise ValueError."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, Decimal, str)):
+        raise ValueError(f"invalid_numeric:{field_name}")
+    if isinstance(raw, float) and not math.isfinite(raw):
+        raise ValueError(f"nonfinite_numeric:{field_name}")
+    text = str(raw).strip()
+    if not text:
+        raise ValueError(f"invalid_numeric:{field_name}")
+    try:
+        dec = Decimal(text)
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"invalid_numeric:{field_name}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"nonfinite_numeric:{field_name}")
+    return dec
+
+
 def select_tiingo_row(raw_bytes: bytes, session_date: str) -> dict:
     """Parse Tiingo daily JSON array and return the row matching session_date with CA fields."""
     rows = json.loads(raw_bytes.decode("utf-8"))
@@ -244,6 +263,9 @@ def select_tiingo_row(raw_bytes: bytes, session_date: str) -> dict:
         ):
             if row.get("divCash") is None or row.get("splitFactor") is None:
                 raise ValueError("tiingo_missing_corporate_action_fields")
+            _parse_finite_decimal(row["close"], "tiingo_close")
+            _parse_finite_decimal(row["divCash"], "tiingo_divCash")
+            _parse_finite_decimal(row["splitFactor"], "tiingo_splitFactor")
             return row
     raise ValueError("session_not_in_payload")
 
@@ -264,9 +286,15 @@ def select_yahoo_close(raw_bytes: bytes, session_date: str) -> Decimal:
     for ts, close in zip(timestamps, closes):
         if ts is None or close is None:
             continue
-        bar_date = datetime.fromtimestamp(int(ts), tz=_NY_TZ).date().isoformat()
+        if isinstance(ts, bool):
+            raise ValueError("yahoo_invalid_timestamp")
+        try:
+            ts_int = int(ts)
+            bar_date = datetime.fromtimestamp(ts_int, tz=_NY_TZ).date().isoformat()
+        except (ValueError, TypeError, OverflowError, OSError) as exc:
+            raise ValueError("yahoo_invalid_timestamp") from exc
         if bar_date == session_date:
-            selected = Decimal(str(close))
+            selected = _parse_finite_decimal(close, "yahoo_close")
     if selected is not None:
         return selected
     raise ValueError("session_not_in_payload")
@@ -289,10 +317,12 @@ def select_nyfed_sofr_entry(raw_bytes: bytes, session_date: str) -> dict:
     ]
     if not eligible:
         raise ValueError("session_not_in_payload")
-    return max(
+    best = max(
         eligible,
         key=lambda e: (e["effectiveDate"], 1 if e.get("revisionIndicator") else 0),
     )
+    _parse_finite_decimal(best["percentRate"], "nyfed_percentRate")
+    return best
 
 
 def select_treasury_tbill_row(raw_bytes: bytes, session_date: str) -> tuple[str, Decimal]:
@@ -324,8 +354,8 @@ def select_treasury_tbill_row(raw_bytes: bytes, session_date: str) -> tuple[str,
             continue
         iso_d = parse_flexible_iso_date(raw_d)
         if iso_d <= session_date and (best_date is None or iso_d > best_date):
+            best_rate = _parse_finite_decimal(raw_v, "treasury_3m") / Decimal("100")
             best_date = iso_d
-            best_rate = Decimal(raw_v) / Decimal("100")
 
     if best_date is None or best_rate is None:
         raise ValueError("session_not_in_payload")
@@ -773,7 +803,11 @@ def emit_market_records_from_payloads(
             )
         except ValueError as exc:
             err_msg = str(exc)
-            if err_msg not in ("session_not_in_payload", "tiingo_missing_corporate_action_fields"):
+            if (
+                err_msg not in ("session_not_in_payload", "tiingo_missing_corporate_action_fields")
+                and not err_msg.startswith(("invalid_numeric:", "nonfinite_numeric:"))
+                and err_msg != "yahoo_invalid_timestamp"
+            ):
                 raise
             rec = _build_missing_record(
                 inst=inst,

@@ -20,6 +20,7 @@ from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_sessio
 from shadow.feeder import (
     DEMO_SERIES,
     SeriesSpec,
+    _parse_finite_decimal,
     default_eod_decision_cutoff_utc,
     emit_market_records_from_payloads,
     parse_flexible_iso_date,
@@ -529,10 +530,14 @@ class FredDtb3Adapter:
             raw_v = cleaned.get("DTB3", "")
             if not raw_d or raw_v in ("", ".", "N/A"):
                 continue
-            iso_d = parse_flexible_iso_date(raw_d)
+            try:
+                iso_d = parse_flexible_iso_date(raw_d)
+                rate_dec = _parse_finite_decimal(raw_v, "fred_dtb3")
+            except ValueError as exc:
+                raise SourceUnavailableError(f"fred_parse_error:{exc}") from exc
             if iso_d <= session_date and (best_date is None or iso_d > best_date):
                 best_date = iso_d
-                best_val = Decimal(raw_v) / Decimal("100")
+                best_val = rate_dec / Decimal("100")
 
         if best_date is None or best_val is None:
             raise SessionNotInPayloadError(f"fred_session_not_in_payload:{session_date}")

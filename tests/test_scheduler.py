@@ -3707,6 +3707,42 @@ class SchedulerTest(unittest.TestCase):
             self.assertTrue(audit["missed_run_detected"])
             self.assertEqual(audit["silent_missed_days"], ["2025-11-21"])
 
+    def test_r22_nonnumeric_tiingo_split_factor_triggers_o1_fail_closed_report(self) -> None:
+        """Close PR #6 Codex P2 (4682794364): nonnumeric Tiingo splitFactor emits O1 fail-closed report."""
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_tiingo_dir = Path(tmpdir) / "bad_tiingo_dir"
+
+            def _bad_tqqq_transport(url: str, headers: Mapping[str, str]) -> tuple[int, bytes]:
+                if "/tiingo/daily/TQQQ/" in url:
+                    return 200, json.dumps(
+                        [{"date": "2025-11-21T00:00:00.000Z", "close": 47.48, "divCash": 0.0, "splitFactor": "N/A"}]
+                    ).encode("utf-8")
+                return _mock_market_transport(url, headers)
+
+            res = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=bad_tiingo_dir,
+                config=cfg,
+                transport=_bad_tqqq_transport,
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=lambda: datetime(2025, 11, 21, 22, 30, tzinfo=timezone.utc),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertEqual(
+                res["reason"],
+                "missing_required_input:TQQQ_close; market_input_ineligible:TQQQ:source_unavailable:tiingo",
+            )
+            self.assertTrue(res["report_written"])
+            rep = json.loads((bad_tiingo_dir / "reports" / "completeness_2025-11-21.json").read_text(encoding="utf-8"))
+            by_inst = {item["instrument"]: item for item in rep["required_series"]}
+            self.assertEqual(by_inst["TQQQ"]["status"], "missing")
+            self.assertEqual(by_inst["TQQQ"]["reason"], "source_unavailable:tiingo")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 _SRC = str(Path(__file__).resolve().parents[1] / "src")
@@ -26,6 +27,7 @@ from shadow.feeder import (
     run_reconstruction_window,
     select_nyfed_sofr_entry,
     select_tiingo_row,
+    select_treasury_tbill_row,
     select_yahoo_close,
 )
 from shadow.ledger import check_forward_clock_credit
@@ -309,6 +311,42 @@ class FeederTest(unittest.TestCase):
             self.assertFalse(jan08_rec["eligibility"]["eligible"])
             self.assertEqual(jan08_rec["eligibility"]["reason"], "sofr_stale_effective_date")
             self.assertEqual(jan08_rec["disclosures"]["expected_effective_date"], "2025-01-09")
+
+    def test_parsers_reject_nonnumeric_and_nonfinite_values(self) -> None:
+        """Close PR #6 P2: reject nonnumeric/nonfinite Tiingo & sibling market fields cleanly."""
+        for bad_row in (
+            {"date": "2025-11-21T00:00:00.000Z", "close": 47.48, "divCash": 0.0, "splitFactor": "N/A"},
+            {"date": "2025-11-21T00:00:00.000Z", "close": "NaN", "divCash": 0.0, "splitFactor": 1.0},
+            {"date": "2025-11-21T00:00:00.000Z", "close": 47.48, "divCash": "Infinity", "splitFactor": 1.0},
+            {"date": "2025-11-21T00:00:00.000Z", "close": True, "divCash": 0.0, "splitFactor": 1.0},
+        ):
+            with self.assertRaises(ValueError):
+                select_tiingo_row(json.dumps([bad_row]).encode("utf-8"), "2025-11-21")
+
+        bad_yahoo = json.dumps(
+            {
+                "chart": {
+                    "result": [
+                        {
+                            "timestamp": [int(datetime(2025, 11, 21, 21, 0, tzinfo=timezone.utc).timestamp())],
+                            "indicators": {"quote": [{"close": ["NaN"]}]},
+                        }
+                    ]
+                }
+            }
+        ).encode("utf-8")
+        with self.assertRaises(ValueError):
+            select_yahoo_close(bad_yahoo, "2025-11-21")
+
+        bad_sofr = json.dumps(
+            {"refRates": [{"effectiveDate": "2025-11-20", "type": "SOFR", "percentRate": "N/A"}]}
+        ).encode("utf-8")
+        with self.assertRaises(ValueError):
+            select_nyfed_sofr_entry(bad_sofr, "2025-11-21")
+
+        bad_treasury = b"Date,3 Mo\n2025-11-20,invalid_rate\n"
+        with self.assertRaises(ValueError):
+            select_treasury_tbill_row(bad_treasury, "2025-11-21")
 
 
 if __name__ == "__main__":
