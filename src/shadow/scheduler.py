@@ -703,6 +703,64 @@ def _report_has_committed_evidence(
     return False, None
 
 
+def _detect_orphaned_committed_evidence_for_session(
+    root: Path,
+    ledger: ShadowLedger,
+    records: list[dict],
+    reports_dir: Path,
+    session_date: str,
+) -> str | None:
+    """Detect committed evidence on disk (report MD/JSON, replay_bundle, or uncommitted receipt/OTS) without a ledger record for session_date."""
+    has_rep_ev, rep_err = _report_has_committed_evidence(reports_dir, session_date)
+    if has_rep_ev:
+        return rep_err or "committed_report_without_ledger_record"
+
+    bundle_path = root / "replay" / "replay_bundle.json"
+    bundle_sessions: list[object] = []
+    if bundle_path.is_file():
+        try:
+            bundle_obj = parse_json_no_duplicates(bundle_path.read_text(encoding="utf-8"))
+        except Exception:
+            return "corrupt_replay_bundle_without_ledger_record"
+        if not isinstance(bundle_obj, dict) or not isinstance(bundle_obj.get("sessions"), list):
+            return "corrupt_replay_bundle_without_ledger_record"
+        bundle_sessions = bundle_obj["sessions"]
+        for entry in bundle_sessions:
+            if not isinstance(entry, dict):
+                return "corrupt_replay_bundle_without_ledger_record"
+            if entry.get("session_date") == session_date:
+                return "orphaned_replay_bundle_without_ledger_record"
+
+    committed_seqs = {
+        r["record_body"]["sequence"]
+        for r in records
+        if isinstance(r, dict)
+        and isinstance(r.get("record_body"), dict)
+        and isinstance(r["record_body"].get("sequence"), int)
+        and not isinstance(r["record_body"].get("sequence"), bool)
+    }
+    if ledger.root_dir.is_dir():
+        for rpath in sorted(ledger.root_dir.glob("seq_*.receipt.json")):
+            stem = rpath.name[len("seq_") : -len(".receipt.json")]
+            if not stem.isdigit():
+                continue
+            seq_num = int(stem)
+            if seq_num in committed_seqs:
+                continue
+            try:
+                rcp_obj = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
+            except Exception:
+                return f"corrupt_orphaned_receipt_seq_{seq_num}"
+            if isinstance(rcp_obj, dict) and rcp_obj.get("session_date") == session_date:
+                return f"orphaned_receipt_without_ledger_record_seq_{seq_num}"
+        if not records and (ledger._ots_path(0).is_file() or ledger._receipt_path(0).is_file()):
+            # Empty ledger with seq_0 detached OTS/receipt and any existing bundle/report evidence indicates orphaned/missing seq_0
+            if bundle_sessions or (reports_dir / f"completeness_{session_date}.json").is_file():
+                return "orphaned_seq0_proof_without_ledger_record"
+
+    return None
+
+
 def _bundle_deadline_config_mismatch(
     bundle_obj: object,
     cfg: DrillSchedulerConfig,
@@ -1519,28 +1577,6 @@ def _run_daily_drill_cycle_locked(
             "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
         }
 
-    # 3. Post-commitment-deadline backfill guard on normal execution path
-    if now_utc_ms > deadline_utc:
-        fail_reason = "late_after_commitment_deadline_backfill_rejected"
-        return _build_fail_closed_result(
-            t_start=t_start,
-            root=root,
-            reports_dir=reports_dir,
-            cfg=cfg,
-            cal=cal,
-            session_date=session_date,
-            decision_utc=now_utc_ms,
-            deadlines=deadlines,
-            head_hash=head_hash,
-            consecutive_count=prior_streak,
-            created_at_utc=now_utc_ms,
-            reason_key=fail_reason,
-            fail_reason=fail_reason,
-            required_series=[],
-            receipt_status="late_backfill_rejected",
-            receipt_reasons=[fail_reason, "drill_mode"],
-        )
-
     # 3a. Enforce ledger <-> replay_bundle consistency before any retry or subsequent-day append
     bundle_obj_validated: dict | None = None
     if prior_records:
@@ -1550,7 +1586,7 @@ def _run_daily_drill_cycle_locked(
             cfg=cfg,
             spec=spec,
             allow_trailing_uncommitted_tail=True,
-            prune_uncommitted_tail=True,
+            prune_uncommitted_tail=(now_utc_ms <= deadline_utc),
             ledger=ledger,
             reports_dir=reports_dir,
         )
@@ -1866,6 +1902,46 @@ def _run_daily_drill_cycle_locked(
             "existing_report_preserved": False,
             "footprint": footprint,
         }
+
+    # 3c. Post-commitment-deadline backfill guard (after committed-session/bundle checks so committed sessions never write appended=False reports)
+    if now_utc_ms > deadline_utc:
+        orphan_err = _detect_orphaned_committed_evidence_for_session(
+            root, ledger, prior_records, reports_dir, session_date
+        )
+        if orphan_err is not None:
+            return {
+                "appended": False,
+                "recovered_missing_report": False,
+                "fail_closed": True,
+                "reason": "committed_evidence_without_ledger_records",
+                "detail": orphan_err,
+                "session_date": session_date,
+                "report": None,
+                "report_paths": [],
+                "report_written": False,
+                "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists()
+                or (reports_dir / f"completeness_{session_date}.md").exists(),
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
+        fail_reason = "late_after_commitment_deadline_backfill_rejected"
+        return _build_fail_closed_result(
+            t_start=t_start,
+            root=root,
+            reports_dir=reports_dir,
+            cfg=cfg,
+            cal=cal,
+            session_date=session_date,
+            decision_utc=now_utc_ms,
+            deadlines=deadlines,
+            head_hash=head_hash,
+            consecutive_count=prior_streak,
+            created_at_utc=now_utc_ms,
+            reason_key=fail_reason,
+            fail_reason=fail_reason,
+            required_series=[],
+            receipt_status="late_backfill_rejected",
+            receipt_reasons=[fail_reason, "drill_mode"],
+        )
 
     eff_treasury = treasury_endpoint if treasury_endpoint is not None else cfg.treasury_endpoint
     eff_yahoo_map = (
@@ -2373,11 +2449,19 @@ def detect_missed_runs(
             rep_appended = rep_ledger.get("appended") is True
             rep_reason = str(rep_ledger.get("fail_closed_reason", ""))
             rep_decision = rep_obj.get("decision_timestamp_utc")
+            orphan_err = _detect_orphaned_committed_evidence_for_session(
+                root, ledger, records, reports_dir, ds
+            )
             if rep_appended:
                 status = "incomplete_or_corrupt_replay_bundle"
                 silent_missed_days.append(ds)
                 failed_days.append(ds)
                 detail = "committed_report_present_without_ledger_record"
+            elif orphan_err is not None:
+                status = "incomplete_or_corrupt_replay_bundle"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = orphan_err
             elif (
                 not is_utc_ms_timestamp(rep_created)
                 or rep_created < deadlines["session_close_utc"]
@@ -2402,12 +2486,14 @@ def detect_missed_runs(
                 failed_days.append(ds)
                 detail = f"documented_fail_closed:{rep_reason}"
         else:
-            has_md_ev, md_ev_reason = _report_has_committed_evidence(reports_dir, ds)
-            if has_md_ev:
+            orphan_err = _detect_orphaned_committed_evidence_for_session(
+                root, ledger, records, reports_dir, ds
+            )
+            if orphan_err is not None:
                 status = "incomplete_or_corrupt_replay_bundle"
                 silent_missed_days.append(ds)
                 failed_days.append(ds)
-                detail = str(md_ev_reason or "committed_evidence_without_ledger_record")
+                detail = orphan_err
             else:
                 status = "missed_run_silent_failure"
                 silent_missed_days.append(ds)

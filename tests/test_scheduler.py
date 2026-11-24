@@ -2637,6 +2637,124 @@ class SchedulerTest(unittest.TestCase):
             )
             self.assertEqual(missed_1745["ok_days"], [])
 
+    def test_r10_post_deadline_committed_config_conflict_and_prior_fail_report_masking_missing_seq0(self) -> None:
+        import contextlib
+        import io
+        from shadow import scheduler as sched_mod
+
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. R10 #1: Commit under 18:00 ET, crash before writing report, tighten cutoff to 17:45 ET,
+            #    then retry PAST commitment deadline (23:31 ET) -> MUST fail closed with committed_bundle_deadline_config_mismatch
+            #    and write ZERO appended=False report!
+            post_dl_dir = root / "post_deadline_committed_tightened"
+            with self.assertRaisesRegex(RuntimeError, "crash_before_report"):
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=post_dl_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                    _post_record_commit_hook=lambda: (_ for _ in ()).throw(RuntimeError("crash_before_report")),
+                )
+            self.assertTrue((post_dl_dir / "ledger" / "seq_000000.record.json").is_file())
+            self.assertFalse((post_dl_dir / "reports" / "completeness_2025-11-21.json").exists())
+
+            tighter_1745 = replace(cfg, decision_cutoff_et="17:45")
+            late_retry = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=post_dl_dir,
+                config=tighter_1745,
+                wall_clock=_tick_clock("2025-11-22", "04:31:00"),  # 23:31 EST on 2025-11-21
+            )
+            self.assertFalse(late_retry["appended"])
+            self.assertTrue(late_retry["fail_closed"])
+            self.assertEqual(late_retry["reason"], "committed_bundle_deadline_config_mismatch")
+            self.assertFalse(late_retry["report_written"])
+            self.assertFalse((post_dl_dir / "reports" / "completeness_2025-11-21.json").exists())
+            self.assertFalse((post_dl_dir / "reports" / "completeness_2025-11-21.md").exists())
+
+            # Same-config retry past commitment deadline after post-commit missing report ALSO never writes appended=False
+            late_same_cfg = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=post_dl_dir,
+                config=cfg,
+                wall_clock=_tick_clock("2025-11-22", "04:31:00"),
+            )
+            self.assertFalse(late_same_cfg["appended"])
+            self.assertTrue(late_same_cfg["fail_closed"])
+            self.assertEqual(late_same_cfg["reason"], "late_after_commitment_deadline_backfill_rejected")
+            self.assertFalse(late_same_cfg["report_written"])
+            self.assertFalse((post_dl_dir / "reports" / "completeness_2025-11-21.json").exists())
+
+            # 2. R10 #2: Earlier fail-closed report (withhold TQQQ) followed by same-day commit crash before report upgrade,
+            #    then seq_000000.record.json deleted -> detect-missed MUST flag missed_run_detected=True & exit non-zero!
+            masked_dir = root / "prior_fail_then_missing_seq0"
+            first_fail = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=masked_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h, withhold_inst="TQQQ"),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(first_fail["report_written"])
+            self.assertTrue(first_fail["fail_closed"])
+            with self.assertRaisesRegex(RuntimeError, "crash_after_commit"):
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=masked_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                    _post_record_commit_hook=lambda: (_ for _ in ()).throw(RuntimeError("crash_after_commit")),
+                )
+            (masked_dir / "ledger" / "seq_000000.record.json").unlink()
+            orig_evidence = [
+                (masked_dir / rel).read_bytes()
+                for rel in ("replay/replay_bundle.json", "ledger/seq_000000.ots", "ledger/seq_000000.receipt.json")
+            ]
+
+            cli_out = io.StringIO()
+            with contextlib.redirect_stdout(cli_out):
+                rc = sched_mod.main(
+                    [
+                        "detect-missed",
+                        "--start-date",
+                        "2025-11-21",
+                        "--as-of-utc",
+                        "2025-11-22T05:00:00.000Z",
+                        "--data-dir",
+                        str(masked_dir),
+                    ]
+                )
+            audit = json.loads(cli_out.getvalue())
+            self.assertEqual(rc, 2)
+            self.assertTrue(audit["missed_run_detected"])
+            self.assertEqual(audit["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit["failed_days"], ["2025-11-21"])
+            self.assertEqual(audit["evaluated_trading_days"][0]["status"], "incomplete_or_corrupt_replay_bundle")
+            self.assertEqual(
+                [
+                    (masked_dir / rel).read_bytes()
+                    for rel in ("replay/replay_bundle.json", "ledger/seq_000000.ots", "ledger/seq_000000.receipt.json")
+                ],
+                orig_evidence,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
