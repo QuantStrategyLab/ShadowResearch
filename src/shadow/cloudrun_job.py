@@ -22,7 +22,7 @@ from shadow.fuse_adapter import (
     verify_f1_entry_gates,
 )
 from shadow.feeder_live import Transport
-from shadow.ledger import ChainConcurrencyConflictError
+from shadow.ledger import ChainConcurrencyConflictError, parse_json_no_duplicates
 from shadow.ots import OpenTimestampsClient, OtsTransport
 from shadow.scheduler import (
     REPO_ROOT,
@@ -49,6 +49,24 @@ def _default_session_date(
     return str(resolved["trade_date"])
 
 
+def _load_bitcoin_merkle_roots_file(path: str | Path) -> dict[int, object]:
+    p = Path(path)
+    if not p.is_file():
+        raise EngineIdentityError(f"missing_bitcoin_merkle_roots_file:{p}")
+    try:
+        raw_obj = parse_json_no_duplicates(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"invalid_bitcoin_merkle_roots_file:{exc}") from exc
+    if not isinstance(raw_obj, dict):
+        raise EngineIdentityError("bitcoin_merkle_roots JSON must be an object mapping height -> root")
+    out: dict[int, object] = {}
+    for k, v in raw_obj.items():
+        if isinstance(k, bool) or not isinstance(k, str) or not k.isdigit():
+            raise EngineIdentityError(f"invalid_bitcoin_height_key:{k!r}")
+        out[int(k)] = v
+    return out
+
+
 def run_cloudrun_job(
     *,
     data_dir: str | Path | None = None,
@@ -65,6 +83,9 @@ def run_cloudrun_job(
     sleeper: Callable[[float], None] | None = None,
     environ: Mapping[str, str] | None = None,
     allow_unanchored_on_ots_failure: bool | None = None,
+    expected_prior_head_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    bitcoin_merkle_roots_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Execute one idempotent Cloud Run Job task against vendored FUSE-1 + csa22-v2."""
     env = dict(os.environ) if environ is None else dict(environ)
@@ -123,6 +144,20 @@ def run_cloudrun_job(
     )
 
     if target_mode == "production":
+        eff_expected_prior_head = (
+            expected_prior_head_sha256
+            if expected_prior_head_sha256 is not None
+            else (env.get("SHADOW_TRUSTED_HEAD_SHA256", "").strip() or None)
+        )
+        eff_roots: Mapping[int, object] | None = bitcoin_merkle_roots
+        if eff_roots is None:
+            roots_path_raw = (
+                str(bitcoin_merkle_roots_path)
+                if bitcoin_merkle_roots_path is not None
+                else env.get("SHADOW_BITCOIN_MERKLE_ROOTS_PATH", "").strip()
+            )
+            if roots_path_raw:
+                eff_roots = _load_bitcoin_merkle_roots_file(roots_path_raw)
         result = run_production_cycle(
             session_date=eff_session,
             data_dir=eff_data_dir,
@@ -138,6 +173,8 @@ def run_cloudrun_job(
             sleeper=sleeper,
             allow_unanchored_on_ots_failure=False,
             evaluator=ev,
+            expected_prior_head_sha256=eff_expected_prior_head,
+            bitcoin_merkle_roots=eff_roots,
         )
     else:
         allow_unanchored = (
@@ -218,6 +255,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--session-date", help="Explicit ISO session date YYYY-MM-DD")
     parser.add_argument("--fixtures-dir", help="Optional offline recorded fixture directory")
     parser.add_argument("--spec-dir", help="Optional C-SA-22 spec directory override")
+    parser.add_argument(
+        "--expected-prior-head-sha256",
+        help="Expected prior production ledger head SHA-256 (overrides SHADOW_TRUSTED_HEAD_SHA256)",
+    )
+    parser.add_argument(
+        "--bitcoin-merkle-roots-path",
+        help="Path to trusted Bitcoin merkle roots JSON (overrides SHADOW_BITCOIN_MERKLE_ROOTS_PATH)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -228,6 +273,8 @@ def main(argv: list[str] | None = None) -> int:
             session_date=args.session_date,
             fixtures_dir=args.fixtures_dir,
             spec_dir=args.spec_dir,
+            expected_prior_head_sha256=args.expected_prior_head_sha256,
+            bitcoin_merkle_roots_path=args.bitcoin_merkle_roots_path,
         )
     except ProductionChainLockedError as exc:
         err_payload = {

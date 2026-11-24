@@ -22,7 +22,7 @@ if _DEMO not in sys.path:
 
 from run_sh2_demo import _build_session_fixture_files, build_live_mock_transport  # noqa: E402
 from shadow.cloudrun_job import run_cloudrun_job  # noqa: E402
-from shadow.fuse_adapter import PINNED_FUSE_ENGINE_HASH, ProductionChainLockedError  # noqa: E402
+from shadow.fuse_adapter import EngineIdentityError, PINNED_FUSE_ENGINE_HASH, ProductionChainLockedError  # noqa: E402
 from shadow.ledger import ChainConcurrencyConflictError, ShadowLedger  # noqa: E402
 from shadow.ots import OpenTimestampsClient, build_synthetic_ots_fixture  # noqa: E402
 
@@ -329,6 +329,132 @@ class CloudRunJobTest(unittest.TestCase):
                 )
             self.assertTrue(lease_path.is_file())
             self.assertEqual(json.loads(lease_path.read_text(encoding="utf-8"))["lease_id"], "someone-elses-lease")
+
+    def test_cloudrun_production_history_authentication_and_exit3_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ddir = Path(tmpdir) / "cloudrun_prod_auth"
+            raw_cfg = json.loads(
+                (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+            )
+            raw_cfg["production_chain_locked"] = False
+            raw_cfg["clk01_active"] = True
+            unlocked_cfg = Path(tmpdir) / "unlocked-production.json"
+            unlocked_cfg.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            hdrs: dict[int, dict[str, str]] = {}
+            heights = {"2026-01-05": 880100, "2026-01-06": 880101}
+
+            def _make_ots(session_date: str, block_ts: str):
+                class _Ots(OpenTimestampsClient):
+                    def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                        bh = heights[session_date]
+                        ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=bh)
+                        assert root_hex is not None
+                        hdrs[bh] = {"merkle_root": root_hex, "timestamp": block_ts}
+                        return ots_b, "https://a.pool.opentimestamps.org"
+
+                return _Ots()
+
+            tick = [1000.0]
+
+            def _fast_clk() -> float:
+                tick[0] += 25.0
+                return tick[0]
+
+            r0 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+            )
+            self.assertEqual(r0["status"], "committed")
+            seq0_sha = str(r0["record_sha256"])
+
+            # Without SHADOW_TRUSTED_HEAD_SHA256 / SHADOW_BITCOIN_MERKLE_ROOTS_PATH -> EngineIdentityError & CLI exit 3
+            with self.assertRaises(EngineIdentityError):
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-06",
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_make_ots("2026-01-06", "2026-01-07T03:00:00.000Z"),
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clk,
+                    sleeper=lambda _s: None,
+                )
+
+            proc3 = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(ddir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-06",
+                ],
+                cwd=_REPO_ROOT,
+                env={"PYTHONPATH": _SRC, "PATH": "/usr/local/bin:/usr/bin:/bin"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc3.returncode, 3)
+            p3_out = json.loads(proc3.stdout)
+            self.assertEqual(p3_out["status"], "engine_identity_error")
+            self.assertFalse(p3_out["appended"])
+            self.assertIn("production_history_unauthenticated", p3_out["reason"])
+
+            # Retry seq=0 with SHADOW_TRUSTED_HEAD_SHA256 returns already_committed_no_op
+            retry0 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
+                },
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
+            )
+            self.assertEqual(retry0["status"], "already_committed_no_op")
+            self.assertTrue(retry0["idempotent_noop"])
+
+            # Advance to seq=1 authenticated via SHADOW_BITCOIN_MERKLE_ROOTS_PATH external file
+            roots_file = Path(tmpdir) / "trusted-roots.json"
+            roots_file.write_text(json.dumps({str(k): v for k, v in hdrs.items()}), encoding="utf-8")
+            r1 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-06",
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
+                    "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                },
+                ots_client=_make_ots("2026-01-06", "2026-01-07T03:00:00.000Z"),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+            )
+            self.assertEqual(r1["status"], "committed")
+            self.assertEqual(r1["sequence"], 1)
+            self.assertEqual(len(ShadowLedger(ddir / "ledger").load_records()), 2)
 
 
 if __name__ == "__main__":

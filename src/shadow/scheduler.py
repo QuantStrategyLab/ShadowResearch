@@ -1895,6 +1895,8 @@ def run_production_cycle(
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = False,
     evaluator: object | None = None,
+    expected_prior_head_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
 ) -> dict:
     """Execute one CLK-01 production cycle ONLY when OA-SH2-2 lock is explicitly unlocked."""
     t_start = time.monotonic()
@@ -1940,6 +1942,8 @@ def run_production_cycle(
         revision_seq=revision_seq,
         allow_unanchored_on_ots_failure=False,
         evaluator=ev,
+        expected_prior_head_sha256=expected_prior_head_sha256,
+        bitcoin_merkle_roots=bitcoin_merkle_roots,
         _post_ledger_commit_hook=None,
         _post_record_commit_hook=None,
         _post_report_json_hook=None,
@@ -1968,6 +1972,8 @@ def _execute_cycle_with_config(
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
+    expected_prior_head_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
     _post_report_json_hook: Callable[[], None] | None,
@@ -2042,6 +2048,8 @@ def _execute_cycle_with_config(
             revision_seq=revision_seq,
             allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
             evaluator=evaluator,
+            expected_prior_head_sha256=expected_prior_head_sha256,
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
             _post_ledger_commit_hook=_post_ledger_commit_hook,
             _post_record_commit_hook=_post_record_commit_hook,
             _post_report_json_hook=_post_report_json_hook,
@@ -2130,6 +2138,40 @@ def _committed_expected_next_state_sha256(record_env: Mapping[str, object]) -> s
     return nrs_sha
 
 
+def _retire_superseded_pending_rejected_state(
+    snapshots_dir: Path,
+    *,
+    committed_seq: int,
+    committed_session_date: str,
+    expected_chain_id: str | None = None,
+) -> bool:
+    """Remove stale pending_rejected_state.json strictly superseded by an already-committed session."""
+    pending_path = snapshots_dir / "pending_rejected_state.json"
+    if not pending_path.is_file():
+        return False
+    try:
+        payload = parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt pending rejected state snapshot {pending_path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-pending-rejected-state-v1":
+        raise EngineIdentityError(f"Invalid pending rejected state snapshot schema in {pending_path}")
+    if expected_chain_id is not None and payload.get("chain_id") != expected_chain_id:
+        return False
+    base_seq = payload.get("base_sequence")
+    rej_ds = payload.get("rejected_session_date")
+    if (
+        isinstance(base_seq, int)
+        and not isinstance(base_seq, bool)
+        and base_seq < committed_seq
+        and isinstance(rej_ds, str)
+        and _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds)
+        and rej_ds <= committed_session_date
+    ):
+        pending_path.unlink(missing_ok=True)
+        return True
+    return False
+
+
 def _reconcile_committed_state_snapshot_if_missing(
     *,
     snapshots_dir: Path,
@@ -2144,9 +2186,16 @@ def _reconcile_committed_state_snapshot_if_missing(
 ) -> None:
     """Verify or deterministically rebuild seq_{ex_seq}.state.json after mid-commit interruption."""
     ex_body = existing_env["record_body"]
+    ex_sess_date = str(ex_body["session_date"])
     ex_hash = ex_body.get("engine_hash")
     ex_spec = (ex_body.get("evaluator") or {}).get("spec_version")
     if ex_hash != PINNED_FUSE_ENGINE_HASH or ex_spec != PINNED_FUSE_SPEC_VERSION:
+        _retire_superseded_pending_rejected_state(
+            snapshots_dir,
+            committed_seq=ex_seq,
+            committed_session_date=ex_sess_date,
+            expected_chain_id=cfg.chain_id,
+        )
         return
     ex_expected_state_sha = _committed_expected_next_state_sha256(existing_env)
     try:
@@ -2180,6 +2229,12 @@ def _reconcile_committed_state_snapshot_if_missing(
                             expected_state_sha256=ex_expected_state_sha,
                             allow_missing_at_genesis=False,
                         )
+                        _retire_superseded_pending_rejected_state(
+                            snapshots_dir,
+                            committed_seq=ex_seq,
+                            committed_session_date=ex_sess_date,
+                            expected_chain_id=cfg.chain_id,
+                        )
                         return
                 except Exception:
                     pass
@@ -2187,12 +2242,18 @@ def _reconcile_committed_state_snapshot_if_missing(
                 snapshots_dir,
                 chain_id=cfg.chain_id,
                 sequence=ex_seq,
-                session_date=str(ex_body["session_date"]),
+                session_date=ex_sess_date,
                 record_sha256=existing_env["record_sha256"],
                 engine_hash=PINNED_FUSE_ENGINE_HASH,
                 spec_version=PINNED_FUSE_SPEC_VERSION,
                 next_row_state=seq_state,
             )
+        _retire_superseded_pending_rejected_state(
+            snapshots_dir,
+            committed_seq=ex_seq,
+            committed_session_date=ex_sess_date,
+            expected_chain_id=cfg.chain_id,
+        )
         return
     except Exception:
         pass
@@ -2264,20 +2325,81 @@ def _reconcile_committed_state_snapshot_if_missing(
         snapshots_dir,
         chain_id=cfg.chain_id,
         sequence=ex_seq,
-        session_date=str(ex_body["session_date"]),
+        session_date=ex_sess_date,
         record_sha256=existing_env["record_sha256"],
         engine_hash=PINNED_FUSE_ENGINE_HASH,
         spec_version=PINNED_FUSE_SPEC_VERSION,
         next_row_state=rebuilt["next_row_state"],
     )
-    pending_rej = snapshots_dir / "pending_rejected_state.json"
-    if pending_rej.is_file():
-        try:
-            pobj = parse_json_no_duplicates(pending_rej.read_text(encoding="utf-8"))
-            if isinstance(pobj, dict) and str(pobj.get("rejected_session_date", "")) < str(ex_body["session_date"]):
-                pending_rej.unlink()
-        except Exception:
-            pass
+    _retire_superseded_pending_rejected_state(
+        snapshots_dir,
+        committed_seq=ex_seq,
+        committed_session_date=ex_sess_date,
+        expected_chain_id=cfg.chain_id,
+    )
+
+
+def _authenticate_production_history(
+    *,
+    ledger: ShadowLedger,
+    cfg: DrillSchedulerConfig,
+    prior_records: list[dict],
+    session_date: str,
+    expected_prior_head_sha256: str | None,
+    bitcoin_merkle_roots: Mapping[int, object] | None,
+) -> None:
+    """Fail closed if persisted production history is unauthenticated before reuse."""
+    if cfg.mode != "production":
+        return
+    if expected_prior_head_sha256 is not None:
+        if not isinstance(expected_prior_head_sha256, str) or not _HEX64_RE.fullmatch(
+            expected_prior_head_sha256
+        ):
+            raise EngineIdentityError(
+                f"invalid_expected_prior_head_sha256:{expected_prior_head_sha256!r}"
+            )
+    if not prior_records:
+        if expected_prior_head_sha256 is not None and expected_prior_head_sha256 != GENESIS_PREV_HASH:
+            raise EngineIdentityError("production_trusted_head_mismatch:empty_ledger")
+        return
+
+    if expected_prior_head_sha256 is None and bitcoin_merkle_roots is None:
+        raise EngineIdentityError(
+            "production_history_unauthenticated: require expected_prior_head_sha256 or bitcoin_merkle_roots"
+        )
+
+    if expected_prior_head_sha256 is not None:
+        existing_env = next(
+            (
+                r
+                for r in prior_records
+                if isinstance(r, dict)
+                and isinstance(r.get("record_body"), dict)
+                and r["record_body"].get("session_date") == session_date
+            ),
+            None,
+        )
+        head_rec_sha = prior_records[-1]["record_sha256"]
+        if existing_env is None:
+            if head_rec_sha != expected_prior_head_sha256:
+                raise EngineIdentityError("production_trusted_head_mismatch")
+        else:
+            ex_seq = existing_env["record_body"]["sequence"]
+            ex_prev = existing_env["record_body"]["prev_record_sha256"]
+            if ex_seq != len(prior_records) - 1 or expected_prior_head_sha256 not in (
+                existing_env["record_sha256"],
+                ex_prev,
+            ):
+                raise EngineIdentityError("production_trusted_head_mismatch")
+
+    if bitcoin_merkle_roots is not None:
+        ok_credit, credit_issues = ledger.assess_receipt_creditability(
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
+            commitment_deadline_et=cfg.commitment_deadline_et,
+            runtime_config=cfg,
+        )
+        if not ok_credit:
+            raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
 
 
 def _run_daily_drill_cycle_locked(
@@ -2309,6 +2431,8 @@ def _run_daily_drill_cycle_locked(
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
+    expected_prior_head_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
     _post_report_json_hook: Callable[[], None] | None,
@@ -2363,6 +2487,14 @@ def _run_daily_drill_cycle_locked(
     head_env = ledger.head()
     head_hash = head_env["record_sha256"] if head_env is not None else GENESIS_PREV_HASH
     prior_records = ledger.load_records()
+    _authenticate_production_history(
+        ledger=ledger,
+        cfg=cfg,
+        prior_records=prior_records,
+        session_date=session_date,
+        expected_prior_head_sha256=expected_prior_head_sha256,
+        bitcoin_merkle_roots=bitcoin_merkle_roots,
+    )
     prior_streak = _count_consecutive_trading_sessions(
         prior_records,
         session_date,

@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -70,6 +70,7 @@ from shadow.replay import replay_window  # noqa: E402
 from shadow.scheduler import (  # noqa: E402
     CalendarCoverageError,
     DrillOnlyViolationError,
+    _retire_superseded_pending_rejected_state,
     detect_missed_runs,
     load_production_scheduler_config,
     load_scheduler_config,
@@ -1237,6 +1238,426 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertEqual(b_v4["outputs"]["TQQQ"]["clearing_counter"], 2)
             rep = replay_window(root / "replay", root / "ledger")
             self.assertTrue(rep["bit_for_bit_match"])
+
+    def test_v4_10th_session_clearing_allowed_while_premature_clearing_rejected(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        trading_days: list[str] = []
+        d_cur = datetime(2026, 1, 5, tzinfo=timezone.utc).date()
+        while len(trading_days) < 11:
+            ds = d_cur.isoformat()
+            if resolve_session("XNYS", ds, spec=spec_v2).get("is_trading_day"):
+                trading_days.append(ds)
+            d_cur = d_cur + timedelta(days=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "v4_clear_10"
+            fix_root = Path(tmpdir) / "fixtures"
+            for ds in trading_days:
+                _build_session_fixture_files(fix_root / ds, ds)
+
+            # Day 0: V4 trip (clearing_counter=0); Days 1..8: 8 calm sessions -> counter=8
+            for idx, ds in enumerate(trading_days[:9]):
+                sig = "0.50" if idx == 0 else "0.24"
+                res = run_daily_drill_cycle(
+                    session_date=ds,
+                    data_dir=root,
+                    config=drill_cfg,
+                    fixtures_dir=fix_root / ds,
+                    sigma_by_inst={"TQQQ": sig, "SOXL": "0.24"},
+                    wall_clock=lambda d=ds: datetime.fromisoformat(f"{d}T22:30:00+00:00"),
+                )
+                self.assertTrue(res["appended"])
+
+            ledger = ShadowLedger(root / "ledger")
+            recs_8 = ledger.load_records()
+            s8_env = recs_8[-1]
+            s8_nrs_sha = s8_env["record_body"]["evaluator"]["next_row_state_sha256"]
+            s8_state, _ = load_row_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id="drill-v0",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_sequence=8,
+                expected_record_sha256=s8_env["record_sha256"],
+                expected_state_sha256=s8_nrs_sha,
+                allow_missing_at_genesis=False,
+            )
+            self.assertEqual(s8_state["V4"]["TQQQ"]["clearing_counter"], 8)
+
+            # Negative control: premature V4 clearing at counter=8 on the 9th day (1 day gap) MUST fail
+            premature_state = json.loads(json.dumps(s8_state))
+            premature_state["V4"] = {}
+            save_pending_rejected_state_snapshot(
+                root / "state_snapshots",
+                chain_id="drill-v0",
+                base_sequence=8,
+                base_record_sha256=s8_env["record_sha256"],
+                rejected_session_date=trading_days[9],
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=premature_state,
+                base_prior_row_state=s8_state,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    root / "state_snapshots",
+                    expected_chain_id="drill-v0",
+                    expected_base_sequence=8,
+                    expected_base_record_sha256=s8_env["record_sha256"],
+                    current_session_date=trading_days[9],
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                    expected_base_prior_state_sha256=s8_nrs_sha,
+                    committed_base_prior_row_state=s8_state,
+                    expected_base_session_date=trading_days[8],
+                )
+            (root / "state_snapshots" / "pending_rejected_state.json").unlink()
+
+            # Day 9 commits clearing_counter=9
+            d9 = trading_days[9]
+            r9 = run_daily_drill_cycle(
+                session_date=d9,
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=fix_root / d9,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda d=d9: datetime.fromisoformat(f"{d}T22:30:00+00:00"),
+            )
+            self.assertTrue(r9["appended"])
+
+            # Day 10 (10th calm session): O1 rejects (missing Treasury) while V4 reaches 10 & clears entry
+            d10 = trading_days[10]
+            bad_d10 = Path(tmpdir) / "bad_d10"
+            _build_session_fixture_files(bad_d10, d10)
+            (bad_d10 / f"treasury_tbill_{d10}.csv").unlink()
+            r10_rej = run_daily_drill_cycle(
+                session_date=d10,
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=bad_d10,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda d=d10: datetime.fromisoformat(f"{d}T22:20:00+00:00"),
+            )
+            self.assertFalse(r10_rej["appended"])
+            self.assertTrue((root / "state_snapshots" / "pending_rejected_state.json").is_file())
+
+            # Restoring Treasury & retrying Day 10 loads cleared V4 state cleanly, commits NORMAL, replays bit-for-bit
+            r10_ok = run_daily_drill_cycle(
+                session_date=d10,
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=fix_root / d10,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda d=d10: datetime.fromisoformat(f"{d}T22:35:00+00:00"),
+            )
+            self.assertTrue(r10_ok["appended"])
+            self.assertEqual(r10_ok["sequence"], 10)
+            self.assertFalse((root / "state_snapshots" / "pending_rejected_state.json").exists())
+            recs = ledger.load_records()
+            b_v4_10 = {b["id"]: b for b in recs[-1]["record_body"]["evaluator"]["breakers"]}["V4"]
+            self.assertEqual(b_v4_10["state"], "NORMAL")
+            self.assertFalse(b_v4_10["would_have_tripped"])
+            rep = replay_window(root / "replay", root / "ledger")
+            self.assertTrue(rep["bit_for_bit_match"])
+
+    def test_retry_committed_session_retires_superseded_pending_rejected_state(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "retire_pending"
+            f5_bad = Path(tmpdir) / "fix_05_bad"
+            f6 = Path(tmpdir) / "fix_06"
+            f7 = Path(tmpdir) / "fix_07"
+            _build_session_fixture_files(f5_bad, "2026-01-05")
+            (f5_bad / "treasury_tbill_2026-01-05.csv").unlink()
+            _build_session_fixture_files(f6, "2026-01-06")
+            _build_session_fixture_files(f7, "2026-01-07")
+
+            # Jan 5 rejects -> saves pending_rejected_state.json (base_sequence=-1, rejected_session_date=2026-01-05)
+            r5 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5_bad,
+                sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 20, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r5["appended"])
+            pend_path = root / "state_snapshots" / "pending_rejected_state.json"
+            stale_pending_bytes = pend_path.read_bytes()
+
+            # Jan 6 commits seq=0 cleanly, then simulate crash right before post-commit unlink of pending file
+            r6 = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f6,
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r6["appended"])
+            self.assertEqual(r6["sequence"], 0)
+            self.assertTrue((root / "state_snapshots" / "seq_000000.state.json").is_file())
+            self.assertTrue((root / "state_snapshots" / "latest.state.json").is_file())
+            pend_path.write_bytes(stale_pending_bytes)
+
+            # Retrying Jan 6 when state_snapshots are already valid MUST still retire stale pending file
+            r6_retry = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f6,
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r6_retry["appended"])
+            self.assertEqual(r6_retry["reason"], "already_committed_session_preserved")
+            self.assertFalse(pend_path.exists())
+
+            # Non-superseded pending file (base_sequence >= committed_seq) is preserved untouched
+            future_pending = json.loads(stale_pending_bytes.decode("utf-8"))
+            future_pending["base_sequence"] = 0
+            future_pending["rejected_session_date"] = "2026-01-07"
+            pend_path.write_text(json.dumps(future_pending), encoding="utf-8")
+            self.assertFalse(
+                _retire_superseded_pending_rejected_state(
+                    root / "state_snapshots",
+                    committed_seq=0,
+                    committed_session_date="2026-01-06",
+                    expected_chain_id="drill-v0",
+                )
+            )
+            self.assertTrue(pend_path.is_file())
+            pend_path.unlink()
+
+            # Next session (Jan 7) now runs and commits seq=1 cleanly
+            r7 = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f7,
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r7["appended"])
+            self.assertEqual(r7["sequence"], 1)
+
+    def test_extract_prior_close_from_tiingo_rejects_extended_session_markers(self) -> None:
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal_jan5 = resolve_session("XNYS", "2026-01-05", spec=spec_v2)
+
+        for extra_fields in (
+            {"session": "extended_overnight_open"},
+            {"market_session": "overnight"},
+            {"session_window": "after_hours"},
+            {"session_time": "pre_market"},
+            {"session_time": "18:30"},
+            {"session_time": "2026-01-05T21:15:00-05:00"},
+            {"publicationTimestamp": "2026-01-06T12:00:00Z"},
+        ):
+            payload = json.dumps(
+                [
+                    {
+                        "date": "2026-01-05T00:00:00.000Z",
+                        "close": 49.0,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        **extra_fields,
+                    }
+                ]
+            ).encode("utf-8")
+            self.assertIsNone(
+                extract_prior_close_from_tiingo_bytes(
+                    payload,
+                    "2026-01-06",
+                    calendar_session=cal_jan5,
+                    target_prior_date="2026-01-05",
+                ),
+                f"Expected None for contaminated prior row {extra_fields}",
+            )
+
+        clean_payload = json.dumps(
+            [
+                {
+                    "date": "2026-01-05T00:00:00.000Z",
+                    "close": 49.0,
+                    "divCash": 0.0,
+                    "splitFactor": 1.0,
+                    "session": "regular",
+                    "session_time": "regular",
+                }
+            ]
+        ).encode("utf-8")
+        self.assertEqual(
+            extract_prior_close_from_tiingo_bytes(
+                clean_payload,
+                "2026-01-06",
+                calendar_session=cal_jan5,
+                target_prior_date="2026-01-05",
+            ),
+            "49",
+        )
+
+        # End-to-end genesis cycle on Jan 6 with extended-session Jan 5 Tiingo print MUST fail O1 closed
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ext_prior"
+            f6_ext = Path(tmpdir) / "fix_06_ext"
+            _build_session_fixture_files(f6_ext, "2026-01-06")
+            tqqq_path = f6_ext / "tiingo_tqqq_2026-01-06.json"
+            rows = json.loads(tqqq_path.read_text(encoding="utf-8"))
+            rows[0]["session"] = "extended_overnight_open"
+            tqqq_path.write_text(json.dumps(rows), encoding="utf-8")
+            res = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f6_ext,
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 0)
+
+    def test_production_history_authentication_prevents_forged_prior_chain(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "unlocked.json"
+            cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            root = Path(tmpdir) / "prod_auth"
+            hdrs: dict[int, dict[str, str]] = {}
+            heights_by_date = {"2026-01-05": 880100, "2026-01-06": 880101, "2026-01-07": 880102}
+
+            def _make_ots(block_ts: str, session_date: str):
+                class _Ots(OpenTimestampsClient):
+                    def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                        bh = heights_by_date[session_date]
+                        ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=bh)
+                        assert root_hex is not None
+                        hdrs[bh] = {"merkle_root": root_hex, "timestamp": block_ts}
+                        return ots_b, "https://a.pool.opentimestamps.org"
+
+                return _Ots()
+
+            # 1. seq=0 (empty ledger) commits without prior head authentication
+            r0 = run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_make_ots("2026-01-06T03:00:00.000Z", "2026-01-05"),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+            )
+            self.assertTrue(r0["appended"])
+            seq0_sha = r0["record_sha256"]
+
+            # 2. Unauthenticated non-empty production ledger fails closed (0 appends)
+            with self.assertRaises(EngineIdentityError) as unauth_ctx:
+                run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_make_ots("2026-01-07T03:00:00.000Z", "2026-01-06"),
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                )
+            self.assertIn("production_history_unauthenticated", str(unauth_ctx.exception))
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 1)
+
+            # 3. Mismatched trusted head or non-creditable Bitcoin roots fail closed (0 appends)
+            with self.assertRaises(EngineIdentityError):
+                run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_make_ots("2026-01-07T03:00:00.000Z", "2026-01-06"),
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    expected_prior_head_sha256="f" * 64,
+                )
+            with self.assertRaises(EngineIdentityError):
+                run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_make_ots("2026-01-07T03:00:00.000Z", "2026-01-06"),
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    bitcoin_merkle_roots={880100: {"merkle_root": "a" * 64, "timestamp": "2026-01-06T03:00:00.000Z"}},
+                )
+
+            # 4. Authenticated with valid bitcoin_merkle_roots -> seq=1 commits cleanly
+            r1 = run_production_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_make_ots("2026-01-07T03:00:00.000Z", "2026-01-06"),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                bitcoin_merkle_roots=dict(hdrs),
+            )
+            self.assertTrue(r1["appended"])
+            self.assertEqual(r1["sequence"], 1)
+            seq1_sha = r1["record_sha256"]
+
+            # 5. Idempotent retry of seq=1 accepts either pre-run seq0_sha or seq1_sha
+            for trusted_sha in (seq0_sha, seq1_sha):
+                r1_retry = run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                    expected_prior_head_sha256=trusted_sha,
+                )
+                self.assertEqual(r1_retry["reason"], "already_committed_session_preserved")
+
+            # 6. Advancing to seq=2 with stale seq0_sha fails closed; matching seq1_sha commits seq=2
+            with self.assertRaises(EngineIdentityError):
+                run_production_cycle(
+                    session_date="2026-01-07",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_make_ots("2026-01-08T03:00:00.000Z", "2026-01-07"),
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    expected_prior_head_sha256=seq0_sha,
+                )
+            r2 = run_production_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-07"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_make_ots("2026-01-08T03:00:00.000Z", "2026-01-07"),
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                expected_prior_head_sha256=seq1_sha,
+            )
+            self.assertTrue(r2["appended"])
+            self.assertEqual(r2["sequence"], 2)
 
 
 if __name__ == "__main__":

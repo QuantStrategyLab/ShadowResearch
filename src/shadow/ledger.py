@@ -1680,8 +1680,16 @@ class ShadowLedger:
         commitment_deadline_et: object | None = None,
         repo_root: str | Path | None = None,
         config_path: str | Path | None = None,
+        runtime_config: object | None = None,
     ) -> tuple[bool, list[object]]:
         """Require valid chain + non-empty ledger with timely OTS receipts verified against trusted Bitcoin headers & block timestamps."""
+        eff_commitment_deadline_et = commitment_deadline_et
+        if eff_commitment_deadline_et is None and runtime_config is not None:
+            eff_commitment_deadline_et = (
+                runtime_config.get("commitment_deadline_et")
+                if isinstance(runtime_config, Mapping)
+                else getattr(runtime_config, "commitment_deadline_et", None)
+            )
         chain_ok, bad_seq, chain_err = self.verify_chain()
         if not chain_ok:
             return False, [{"sequence": bad_seq, "reason": f"chain_invalid:{chain_err}"}]
@@ -1724,7 +1732,7 @@ class ShadowLedger:
                     raise ValueError("missing_session_date")
                 expected_deadline = compute_session_commitment_deadline_utc(
                     sess_date,
-                    commitment_deadline_et,
+                    eff_commitment_deadline_et,
                     repo_root=repo_root,
                     config_path=config_path,
                 )
@@ -2078,12 +2086,6 @@ def _assert_pending_state_preserves_committed_breakers(
             if isinstance(cf, Mapping) and cf.get("clearing_counter") is not None:
                 c_cnt = cf["clearing_counter"]
                 c_last = cf.get("last_session_below_threshold")
-                pf = p_v4.get(fund) if isinstance(p_v4, Mapping) else None
-                p_cnt = pf.get("clearing_counter") if isinstance(pf, Mapping) else None
-                if isinstance(p_cnt, bool) or not isinstance(p_cnt, int):
-                    raise EngineIdentityError(
-                        f"Pending state cleared active V4.{fund} clearing state"
-                    )
                 if not isinstance(c_cnt, int) or isinstance(c_cnt, bool):
                     raise EngineIdentityError(f"Invalid committed V4.{fund} clearing_counter")
                 max_steps = _max_elapsed_session_steps(
@@ -2091,6 +2093,25 @@ def _assert_pending_state_preserves_committed_breakers(
                     rej_ds,
                     default_when_unknown=1,
                 )
+                if not isinstance(p_v4, Mapping):
+                    raise EngineIdentityError(
+                        f"Pending state cleared active V4.{fund} clearing state"
+                    )
+                pf = p_v4.get(fund)
+                if pf is not None and not isinstance(pf, Mapping):
+                    raise EngineIdentityError(f"Invalid pending V4.{fund} clearing state")
+                p_cnt = pf.get("clearing_counter") if isinstance(pf, Mapping) else None
+                if pf is None or p_cnt is None:
+                    # FUSE-1 clear_v4_state removes V4[fund] only once clearing reaches 10 calm sessions
+                    if c_cnt + max_steps < 10:
+                        raise EngineIdentityError(
+                            f"Pending state cleared active V4.{fund} clearing state"
+                        )
+                    continue
+                if isinstance(p_cnt, bool) or not isinstance(p_cnt, int):
+                    raise EngineIdentityError(
+                        f"Pending state cleared active V4.{fund} clearing state"
+                    )
                 max_allowed = c_cnt + max_steps
                 if p_cnt < 0 or p_cnt >= 10 or p_cnt > max_allowed:
                     raise EngineIdentityError(

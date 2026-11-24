@@ -318,6 +318,65 @@ def _validate_core_rth_bar_timestamp(
         raise ValueError("extended_hours_overnight_rejected")
 
 
+def _validate_tiingo_official_close_row(
+    row: Mapping[str, object],
+    session_date: str,
+    calendar_session: Mapping[str, object] | None = None,
+    *,
+    max_publication_date: str | None = None,
+) -> None:
+    """Validate that a Tiingo row represents core RTH Official Close, not extended/overnight/T+1."""
+    for marker_key in ("session", "market_session", "session_window", "session_time"):
+        marker_val = row.get(marker_key)
+        if isinstance(marker_val, str) and marker_val.strip().lower() in _EXTENDED_SESSION_MARKERS:
+            raise ValueError("extended_hours_overnight_rejected")
+    session_time_val = row.get("session_time")
+    if isinstance(session_time_val, str) and ":" in session_time_val:
+        st_txt = session_time_val.strip()
+        if "T" in st_txt or " " in st_txt or "+" in st_txt or st_txt.endswith("Z"):
+            _validate_core_rth_bar_timestamp(
+                st_txt,
+                session_date,
+                calendar_session,
+                allow_midnight_date_marker=False,
+            )
+        else:
+            try:
+                bar_t = dt_time.fromisoformat(st_txt)
+            except ValueError as exc:
+                raise ValueError("tiingo_invalid_timestamp") from exc
+            close_t = _official_close_time_for_calendar(calendar_session)
+            if bar_t >= dt_time(21, 0):
+                raise ValueError("next_trade_date_contamination")
+            if bar_t < dt_time(9, 30) or bar_t > close_t:
+                raise ValueError("extended_hours_overnight_rejected")
+    if row.get("extendedHours") is True or row.get("isExtendedHours") is True:
+        raise ValueError("extended_hours_overnight_rejected")
+    _validate_core_rth_bar_timestamp(
+        str(row.get("date", "")),
+        session_date,
+        calendar_session,
+        allow_midnight_date_marker=True,
+    )
+    if "timestamp" in row and row.get("timestamp") is not None:
+        _validate_core_rth_bar_timestamp(
+            row.get("timestamp"),
+            session_date,
+            calendar_session,
+            allow_midnight_date_marker=False,
+        )
+    if "publicationTimestamp" in row and row.get("publicationTimestamp") is not None:
+        pub = str(row["publicationTimestamp"]).strip()
+        iso_pub = pub[:-1] + "+00:00" if pub.endswith("Z") else pub
+        try:
+            pub_ny = datetime.fromisoformat(iso_pub).astimezone(_NY_TZ)
+        except ValueError as exc:
+            raise ValueError("tiingo_invalid_timestamp") from exc
+        pub_limit = max_publication_date or session_date
+        if pub_ny.date().isoformat() > pub_limit:
+            raise ValueError("next_trade_date_contamination")
+
+
 def select_tiingo_row(
     raw_bytes: bytes,
     session_date: str,
@@ -335,44 +394,17 @@ def select_tiingo_row(
         raw_date = str(row.get("date", ""))
         if not raw_date.startswith(session_date) or row.get("close") is None:
             continue
-        for marker_key in ("session", "market_session", "session_window", "session_time"):
-            marker_val = row.get(marker_key)
-            if isinstance(marker_val, str) and marker_val.strip().lower() in _EXTENDED_SESSION_MARKERS:
-                extended_err = "extended_hours_overnight_rejected"
-                break
-        else:
-            if row.get("extendedHours") is True or row.get("isExtendedHours") is True:
-                extended_err = "extended_hours_overnight_rejected"
-                continue
-            try:
-                _validate_core_rth_bar_timestamp(
-                    raw_date,
-                    session_date,
-                    calendar_session,
-                    allow_midnight_date_marker=True,
-                )
-                if "timestamp" in row and row.get("timestamp") is not None:
-                    _validate_core_rth_bar_timestamp(
-                        row.get("timestamp"),
-                        session_date,
-                        calendar_session,
-                        allow_midnight_date_marker=False,
-                    )
-                if "publicationTimestamp" in row and row.get("publicationTimestamp") is not None:
-                    pub = str(row["publicationTimestamp"]).strip()
-                    iso_pub = pub[:-1] + "+00:00" if pub.endswith("Z") else pub
-                    pub_ny = datetime.fromisoformat(iso_pub).astimezone(_NY_TZ)
-                    if pub_ny.date().isoformat() > session_date:
-                        raise ValueError("next_trade_date_contamination")
-            except ValueError as exc:
-                extended_err = str(exc)
-                continue
-            if row.get("divCash") is None or row.get("splitFactor") is None:
-                raise ValueError("tiingo_missing_corporate_action_fields")
-            _parse_finite_decimal(row["close"], "tiingo_close")
-            _parse_finite_decimal(row["divCash"], "tiingo_divCash")
-            _parse_finite_decimal(row["splitFactor"], "tiingo_splitFactor")
-            return row
+        try:
+            _validate_tiingo_official_close_row(row, session_date, calendar_session)
+        except ValueError as exc:
+            extended_err = str(exc)
+            continue
+        if row.get("divCash") is None or row.get("splitFactor") is None:
+            raise ValueError("tiingo_missing_corporate_action_fields")
+        _parse_finite_decimal(row["close"], "tiingo_close")
+        _parse_finite_decimal(row["divCash"], "tiingo_divCash")
+        _parse_finite_decimal(row["splitFactor"], "tiingo_splitFactor")
+        return row
     if extended_err is not None:
         raise ValueError(extended_err)
     raise ValueError("session_not_in_payload")
@@ -1370,22 +1402,8 @@ def extract_prior_close_from_tiingo_bytes(
                 continue
         elif row_d >= session_date:
             continue
-        if row.get("extendedHours") is True or row.get("isExtendedHours") is True:
-            continue
         try:
-            _validate_core_rth_bar_timestamp(
-                raw_date,
-                row_d,
-                calendar_session,
-                allow_midnight_date_marker=True,
-            )
-            if "timestamp" in row and row.get("timestamp") is not None:
-                _validate_core_rth_bar_timestamp(
-                    row.get("timestamp"),
-                    row_d,
-                    calendar_session,
-                    allow_midnight_date_marker=False,
-                )
+            _validate_tiingo_official_close_row(row, row_d, calendar_session)
             close_dec = _parse_finite_decimal(row["close"], "tiingo_prior_close")
         except ValueError:
             continue

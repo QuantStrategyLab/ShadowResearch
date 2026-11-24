@@ -4,6 +4,9 @@
 # Single-writer concurrency discipline: maxRetries: 0 with parallelism: 1 and taskCount: 1
 # prevents concurrent overlapping Cloud Run tasks; cross-instance writes are additionally fenced by
 # ledger/.chain.lease.json (GCS exclusive create ifGenerationMatch=0 semantics).
+# Production history authentication (non-empty production ledger): set SHADOW_TRUSTED_HEAD_SHA256
+# (e.g., via Secret Manager) and/or SHADOW_BITCOIN_MERKLE_ROOTS_PATH pointing outside SHADOW_DATA_DIR
+# so compromised bucket history fails closed with exit 3 before reuse.
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
@@ -34,6 +37,14 @@ spec:
                   value: /app/config/production-scheduler.json
                 - name: SHADOW_CHAIN_MODE
                   value: production
+                # Non-empty production chains require external history authentication:
+                # - name: SHADOW_TRUSTED_HEAD_SHA256
+                #   valueFrom:
+                #     secretKeyRef:
+                #       name: shadow-trusted-head-sha256
+                #       key: latest
+                # - name: SHADOW_BITCOIN_MERKLE_ROOTS_PATH
+                #   value: /var/run/shadow/trusted/bitcoin-merkle-roots.json
                 - name: TIINGO_API_KEY
                   valueFrom:
                     secretKeyRef:
