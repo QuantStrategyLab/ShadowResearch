@@ -584,9 +584,17 @@ def _finite_number(raw: object) -> float | None:
     return val
 
 
-def _map_calendar_statuses(calendar_session: Mapping[str, Any] | None) -> tuple[str | None, str | None]:
+def _map_calendar_statuses(
+    calendar_session: Mapping[str, Any] | None,
+    *,
+    session_date: str | None = None,
+) -> tuple[str | None, str | None]:
     if not isinstance(calendar_session, Mapping):
         return None, None
+    if session_date is not None and "trade_date" in calendar_session:
+        raw_td = calendar_session.get("trade_date")
+        if raw_td is None or str(raw_td) != str(session_date):
+            return None, None
     state = calendar_session.get("session_state")
     reason = str(calendar_session.get("reason") or "")
     disagreement = bool(calendar_session.get("venue_disagreement"))
@@ -611,6 +619,13 @@ _FUND_BENCHMARK_INDEX = {
     "TQQQ": "XNDX",
     "SOXL": "SEMI",
 }
+
+_FUND_EXPOSURE_BETA = {
+    "TQQQ": Decimal("1"),
+    "SOXL": Decimal("1.5"),
+}
+
+_LEVERAGE_MULTIPLE = Decimal("3")
 
 _INDEX_RETURN_LABELS = (
     ("XNDX", "NDX"),
@@ -798,6 +813,36 @@ def _derive_default_max_loss_cap(
         return None
 
 
+def _derive_conv_scale(
+    session_inputs: Mapping[str, Any],
+    bankroll_val: float | None,
+    hwm_val: float | None,
+) -> Decimal | None:
+    """Compute U-01 Step 6 convexity denominator (1 + H / E*), failing closed on invalid inputs."""
+    try:
+        raw_e_star = session_inputs.get("E_star")
+        if raw_e_star is not None:
+            if _finite_number(raw_e_star) is None:
+                return None
+            e_star_dec = Decimal(str(raw_e_star))
+        elif hwm_val is not None:
+            e_star_dec = Decimal(str(hwm_val))
+        elif bankroll_val is not None:
+            e_star_dec = Decimal(str(bankroll_val))
+        else:
+            return Decimal("1")
+
+        raw_h = session_inputs.get("H", "0")
+        if raw_h is None or _finite_number(raw_h) is None:
+            return None
+        h_dec = Decimal(str(raw_h))
+        if e_star_dec <= 0 or h_dec < 0:
+            return None
+        return Decimal("1") + (h_dec / e_star_dec)
+    except (ArithmeticError, ValueError):
+        return None
+
+
 def build_fuse_validated_inputs(
     session_inputs: Mapping[str, Any],
     calendar_session: Mapping[str, Any] | None,
@@ -838,7 +883,7 @@ def build_fuse_validated_inputs(
     if hwm_val is None and bankroll_val is not None:
         hwm_val = bankroll_val
 
-    cal_status, exch_status = _map_calendar_statuses(calendar_session)
+    cal_status, exch_status = _map_calendar_statuses(calendar_session, session_date=session_date)
     if "tier_joint_cap" in session_inputs:
         tier_joint_cap = _finite_number(session_inputs.get("tier_joint_cap"))
     elif bankroll_val is not None:
@@ -901,8 +946,9 @@ def build_fuse_validated_inputs(
             if v is not None:
                 cur_closes[str(k)] = v
 
+    conv_scale = _derive_conv_scale(session_inputs, bankroll_val, hwm_val)
     fuse_funds: dict[str, dict[str, Any]] = {}
-    joint_exposure = 0.0
+    joint_exposure_dec: Decimal | None = Decimal("0") if conv_scale is not None else None
     for symbol in sorted(raw_funds.keys()):
         fdata = raw_funds[symbol]
         if not isinstance(fdata, Mapping):
@@ -915,7 +961,11 @@ def build_fuse_validated_inputs(
         if close_val is None or q_pre_val is None:
             mkt_ok = False
         pos_val = (close_val * q_pre_val) if (close_val is not None and q_pre_val is not None) else 0.0
-        joint_exposure += pos_val
+        if joint_exposure_dec is not None and conv_scale is not None:
+            beta_dec = _FUND_EXPOSURE_BETA.get(symbol, Decimal("1"))
+            joint_exposure_dec += (
+                _LEVERAGE_MULTIPLE * beta_dec * Decimal(str(pos_val))
+            ) / conv_scale
         long_run_vol = _finite_number(fdata.get("long_run_volatility"))
         if long_run_vol is None:
             long_run_vol = 0.24
@@ -1047,14 +1097,15 @@ def build_fuse_validated_inputs(
     }
     source_records = {k: v for k, v in raw_source_records.items() if v is not None}
 
+    derived_joint_exposure = float(joint_exposure_dec) if joint_exposure_dec is not None else None
     out: dict[str, Any] = {
         "tier": tier,
         "bankroll": bankroll_val,
         "high_water_mark": hwm_val,
-        "joint_exposure": _finite_number(session_inputs.get("joint_exposure")) if session_inputs.get("joint_exposure") is not None else joint_exposure,
+        "joint_exposure": _finite_number(session_inputs.get("joint_exposure")) if session_inputs.get("joint_exposure") is not None else derived_joint_exposure,
         "tier_joint_cap": tier_joint_cap,
         "max_loss_cap": max_loss_cap,
-        "proposed_exposure": _finite_number(session_inputs.get("proposed_exposure")) if session_inputs.get("proposed_exposure") is not None else joint_exposure,
+        "proposed_exposure": _finite_number(session_inputs.get("proposed_exposure")) if session_inputs.get("proposed_exposure") is not None else derived_joint_exposure,
         "one_session_loss": _derive_one_session_loss(session_inputs),
         "market_halt_level": session_inputs.get("market_halt_level", None),
         "index_one_session_returns": idx_returns,
@@ -1084,6 +1135,9 @@ def build_fuse_validated_inputs(
         out["hwm_adjusted"] = session_inputs["hwm_adjusted"]
     if session_inputs.get("kill_switch_tripped") is True:
         out["kill_switch_tripped"] = True
+    for o7_key in ("o7_runtime_silent", "o7_monitor_silent"):
+        if o7_key in session_inputs:
+            out[o7_key] = bool(session_inputs[o7_key])
     for key in ("tier_change_event", "o9_change_descriptors"):
         if key in session_inputs:
             out[key] = copy.deepcopy(session_inputs[key])

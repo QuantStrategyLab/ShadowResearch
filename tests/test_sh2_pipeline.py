@@ -2456,6 +2456,165 @@ class Sh2PipelineTest(unittest.TestCase):
                     expected_base_session_date="2026-01-05",
                 )
 
+    def test_o5_unlatched_rejection_count_resets_across_sessions_while_latch_protected(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "o5_reset"
+            f5 = Path(tmpdir) / "fix_05"
+            _build_session_fixture_files(f5, "2026-01-05")
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r0["appended"])
+            recs0 = ShadowLedger(root / "ledger").load_records()
+            from shadow.ledger import sha256_canonical
+
+            s0_rec_sha = sha256_canonical(recs0[0]["record_body"])
+            s0_state, _ = load_row_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id=drill_cfg.chain_id,
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_sequence=0,
+                expected_record_sha256=s0_rec_sha,
+            )
+
+            # 1. Committed unlatched O5 count=2 on 2026-01-05 legitimately resets to count=1 on 2026-01-06
+            base_unlatched = json.loads(json.dumps(s0_state))
+            base_unlatched["O5"] = {
+                "rejection_count": 2,
+                "last_rejection_session": "2026-01-05",
+                "latched": False,
+            }
+            base_unlatched_sha = _sha256_canonical_state_dict(base_unlatched)
+            pend_dir = Path(tmpdir) / "o5_cross_day"
+            save_row_state_snapshot(
+                pend_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                sequence=0,
+                session_date="2026-01-05",
+                record_sha256=s0_rec_sha,
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=base_unlatched,
+            )
+            pend_next = json.loads(json.dumps(s0_state))
+            pend_next["O5"] = {
+                "rejection_count": 1,
+                "last_rejection_session": "2026-01-06",
+                "latched": False,
+            }
+            save_pending_rejected_state_snapshot(
+                pend_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=s0_rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=pend_next,
+                base_prior_row_state=base_unlatched,
+            )
+            loaded, _ = load_pending_rejected_state_snapshot(
+                pend_dir / "state_snapshots",
+                expected_chain_id=drill_cfg.chain_id,
+                expected_base_sequence=0,
+                expected_base_record_sha256=s0_rec_sha,
+                current_session_date="2026-01-06",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_base_prior_state_sha256=base_unlatched_sha,
+                committed_base_prior_row_state=base_unlatched,
+                expected_base_session_date="2026-01-05",
+            )
+            self.assertEqual(loaded["O5"]["rejection_count"], 1)
+
+            # 2. Same-session retry MUST NOT reduce committed O5 rejection_count
+            same_day_bad = json.loads(json.dumps(s0_state))
+            same_day_bad["O5"] = {
+                "rejection_count": 1,
+                "last_rejection_session": "2026-01-05",
+                "latched": False,
+            }
+            save_pending_rejected_state_snapshot(
+                pend_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=s0_rec_sha,
+                rejected_session_date="2026-01-05",
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=same_day_bad,
+                base_prior_row_state=base_unlatched,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    pend_dir / "state_snapshots",
+                    expected_chain_id=drill_cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=s0_rec_sha,
+                    current_session_date="2026-01-05",
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                    expected_base_prior_state_sha256=base_unlatched_sha,
+                    committed_base_prior_row_state=base_unlatched,
+                    expected_base_session_date="2026-01-05",
+                )
+
+            # 3. Latched O5 on 2026-01-05 still rejects cross-session latch clear & count drop on 2026-01-06
+            base_latched = json.loads(json.dumps(s0_state))
+            base_latched["O5"] = {
+                "rejection_count": 3,
+                "last_rejection_session": "2026-01-05",
+                "latched": True,
+            }
+            base_latched_sha = _sha256_canonical_state_dict(base_latched)
+            lat_dir = Path(tmpdir) / "o5_latched"
+            save_row_state_snapshot(
+                lat_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                sequence=0,
+                session_date="2026-01-05",
+                record_sha256=s0_rec_sha,
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=base_latched,
+            )
+            forged_lat = json.loads(json.dumps(s0_state))
+            forged_lat["O5"] = {
+                "rejection_count": 1,
+                "last_rejection_session": "2026-01-06",
+                "latched": False,
+            }
+            save_pending_rejected_state_snapshot(
+                lat_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=s0_rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=forged_lat,
+                base_prior_row_state=base_latched,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    lat_dir / "state_snapshots",
+                    expected_chain_id=drill_cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=s0_rec_sha,
+                    current_session_date="2026-01-06",
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                    expected_base_prior_state_sha256=base_latched_sha,
+                    committed_base_prior_row_state=base_latched,
+                    expected_base_session_date="2026-01-05",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

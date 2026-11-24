@@ -1032,6 +1032,102 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(rows_list_rearm["V1"]["state"], "NORMAL")
         self.assertFalse(rows_list_rearm["V1"]["would_have_tripped"])
 
+    def test_joint_exposure_scaling_o7_silence_flags_and_stale_calendar_rejected(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        # 1. Joint exposure is scaled into sizing-stack units (3x * beta / conv_scale)
+        si_exp = _valid_inputs()
+        vin_exp = build_fuse_validated_inputs(
+            si_exp,
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertAlmostEqual(vin_exp["joint_exposure"], 33000.0, places=6)
+        rows_exp, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            vin_exp,
+            {},
+            None,
+        )
+        self.assertTrue(rows_exp["J1"]["would_have_tripped"])
+        self.assertEqual(rows_exp["J1"]["reason"], "joint_cap_exceeded")
+        self.assertTrue(rows_exp["L0"]["would_have_tripped"])
+        self.assertTrue(rows_exp["L0"]["outputs"]["cap_breached"])
+
+        si_conv = _valid_inputs()
+        si_conv["H"] = "10000"
+        vin_conv = build_fuse_validated_inputs(
+            si_conv,
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertAlmostEqual(vin_conv["joint_exposure"], 27500.0, places=6)
+
+        # 2. Explicit O7 runtime/monitor silence signals trip O7 even with fresh heartbeat
+        for flag in ("o7_runtime_silent", "o7_monitor_silent"):
+            si_o7 = _valid_inputs()
+            si_o7["last_heartbeat"] = "2026-01-06T22:00:00.000Z"
+            si_o7[flag] = True
+            vin_o7 = build_fuse_validated_inputs(
+                si_o7,
+                cal6,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            )
+            rows_o7, _, _ = ev.evaluate(
+                ev.spec_version,
+                ev.engine_hash,
+                "p",
+                "2026-01-06",
+                "2026-01-06T22:00:00.000Z",
+                "shadow",
+                vin_o7,
+                {},
+                None,
+            )
+            self.assertEqual(rows_o7["O7"]["state"], "NO-NEW-RISK")
+            self.assertTrue(rows_o7["O7"]["would_have_tripped"])
+            self.assertEqual(rows_o7["O7"]["reason"], "dead_mans_switch")
+
+        # 3. Stale calendar_session from another trade_date fails closed in O2 & O1
+        cal_prev = resolve_session("XNYS", "2026-01-16", spec=spec)
+        si_cal = _valid_inputs()
+        vin_stale_cal = build_fuse_validated_inputs(
+            si_cal,
+            cal_prev,
+            policy_hash="p",
+            session_date="2026-01-19",
+            as_of="2026-01-19T22:00:00.000Z",
+        )
+        self.assertIsNone(vin_stale_cal["session_calendar_status"])
+        self.assertIsNone(vin_stale_cal["exchange_status"])
+        self.assertNotIn("session_calendar", vin_stale_cal["source_records"])
+        rows_stale_cal, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-19",
+            "2026-01-19T22:00:00.000Z",
+            "shadow",
+            vin_stale_cal,
+            {},
+            None,
+        )
+        self.assertTrue(rows_stale_cal["O2"]["would_have_tripped"])
+        self.assertTrue(rows_stale_cal["O1"]["would_have_tripped"])
+
 
 if __name__ == "__main__":
     unittest.main()

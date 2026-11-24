@@ -1987,14 +1987,30 @@ def _assert_pending_state_preserves_committed_breakers(
     c_o5 = committed_state.get("O5")
     if isinstance(c_o5, Mapping):
         c_cnt = c_o5.get("rejection_count", 0)
+        c_latched = c_o5.get("latched") is True
+        c_last_sess = c_o5.get("last_rejection_session")
         p_o5 = pending_state.get("O5")
-        if c_o5.get("latched") is True:
+        if c_latched:
             if not isinstance(p_o5, Mapping) or p_o5.get("latched") is not True:
                 raise EngineIdentityError("Pending state cleared committed O5 latch")
-        if isinstance(c_cnt, int) and not isinstance(c_cnt, bool) and c_cnt > 0:
+        same_o5_session = (
+            c_last_sess is None
+            or c_last_sess == rej_ds
+            or (isinstance(p_o5, Mapping) and p_o5.get("last_rejection_session") == c_last_sess)
+        )
+        if (
+            (c_latched or same_o5_session)
+            and isinstance(c_cnt, int)
+            and not isinstance(c_cnt, bool)
+            and c_cnt > 0
+        ):
             p_cnt = p_o5.get("rejection_count", 0) if isinstance(p_o5, Mapping) else -1
             if isinstance(p_cnt, bool) or not isinstance(p_cnt, int) or p_cnt < c_cnt:
                 raise EngineIdentityError("Pending state reduced committed O5 rejection_count")
+        elif isinstance(p_o5, Mapping) and "rejection_count" in p_o5:
+            p_cnt = p_o5.get("rejection_count")
+            if isinstance(p_cnt, bool) or not isinstance(p_cnt, int) or p_cnt < 0:
+                raise EngineIdentityError("Pending state invalid O5 rejection_count")
 
     c_l5 = committed_state.get("L5")
     if isinstance(c_l5, Mapping):
