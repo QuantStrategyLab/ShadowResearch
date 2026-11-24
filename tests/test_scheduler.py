@@ -2500,6 +2500,143 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(missed_tight["ok_days"], [])
             self.assertIn("2025-11-21", missed_tight["failed_days"])
 
+    def test_r9_seq0_missing_markdown_evidence_and_bundle_config_conflict(self) -> None:
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. R9 #1: Removing seq_000000.record.json while keeping committed artifacts MUST fail closed without overwriting seq 0
+            seq0_dir = root / "seq0_missing_record"
+            d1_ok = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=seq0_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(d1_ok["appended"])
+            rec0 = seq0_dir / "ledger" / "seq_000000.record.json"
+            ots0 = seq0_dir / "ledger" / "seq_000000.ots"
+            rcp0 = seq0_dir / "ledger" / "seq_000000.receipt.json"
+            bundle0_bytes = (seq0_dir / "replay" / "replay_bundle.json").read_bytes()
+            ots0_bytes = ots0.read_bytes()
+            rcp0_bytes = rcp0.read_bytes()
+            rec0.unlink()
+
+            day2_after_seq0 = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=seq0_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24"),
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(day2_after_seq0["appended"])
+            self.assertTrue(day2_after_seq0["fail_closed"])
+            self.assertEqual(day2_after_seq0["reason"], "committed_evidence_without_ledger_records")
+            self.assertEqual((seq0_dir / "replay" / "replay_bundle.json").read_bytes(), bundle0_bytes)
+            self.assertEqual(ots0.read_bytes(), ots0_bytes)
+            self.assertEqual(rcp0.read_bytes(), rcp0_bytes)
+            missed_seq0 = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-25T05:00:00.000Z",
+                data_dir=seq0_dir,
+                config=cfg,
+            )
+            self.assertEqual(missed_seq0["ok_days"], [])
+
+            # 2. R9 #2: Missing JSON or literal 'null' JSON with Markdown '- **Ledger Appended:** `True`' MUST fail closed without pruning seq 1
+            for mode in ("deleted_json", "null_json"):
+                md_dir = root / f"md_only_{mode}"
+                for ds in ("2025-11-21", "2025-11-24"):
+                    self.assertTrue(
+                        run_daily_drill_cycle(
+                            session_date=ds,
+                            data_dir=md_dir,
+                            config=cfg,
+                            transport=lambda u, h: _mock_market_transport(u, h),
+                            environ={"TIINGO_API_KEY": "test-key"},
+                            ots_transport=_mock_ots_transport,
+                            wall_clock=_tick_clock(ds),
+                            sleeper=lambda _: None,
+                        )["appended"]
+                    )
+                (md_dir / "ledger" / "seq_000001.record.json").unlink()
+                rep1_json = md_dir / "reports" / "completeness_2025-11-24.json"
+                if mode == "deleted_json":
+                    rep1_json.unlink()
+                else:
+                    rep1_json.write_text("null\n", encoding="utf-8")
+                self.assertTrue((md_dir / "reports" / "completeness_2025-11-24.md").is_file())
+                ots1_b = (md_dir / "ledger" / "seq_000001.ots").read_bytes()
+                rcp1_b = (md_dir / "ledger" / "seq_000001.receipt.json").read_bytes()
+
+                d3_md = run_daily_drill_cycle(
+                    session_date="2025-11-25",
+                    data_dir=md_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-25"),
+                    sleeper=lambda _: None,
+                )
+                self.assertFalse(d3_md["appended"])
+                self.assertTrue(d3_md["fail_closed"])
+                self.assertEqual((md_dir / "ledger" / "seq_000001.ots").read_bytes(), ots1_b)
+                self.assertEqual((md_dir / "ledger" / "seq_000001.receipt.json").read_bytes(), rcp1_b)
+                missed_md = detect_missed_runs(
+                    window_start_date="2025-11-21",
+                    as_of_utc="2025-11-25T05:00:00.000Z",
+                    data_dir=md_dir,
+                    config=cfg,
+                )
+                self.assertEqual(missed_md["ok_days"], [])
+
+            # 3. R9 #3: Crash after commit BEFORE writing completeness JSON/MD, then tighten cutoff (18:00 -> 17:45) MUST fail closed
+            cfg_bundle_dir = root / "bundle_cutoff_tightened"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=cfg_bundle_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["appended"]
+            )
+            (cfg_bundle_dir / "reports" / "completeness_2025-11-21.json").unlink()
+            (cfg_bundle_dir / "reports" / "completeness_2025-11-21.md").unlink()
+            tighter_1745 = replace(cfg, decision_cutoff_et="17:45")
+            retry_1745 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=cfg_bundle_dir,
+                config=tighter_1745,
+                wall_clock=_tick_clock("2025-11-21", "22:40:00"),
+            )
+            self.assertFalse(retry_1745["appended"])
+            self.assertTrue(retry_1745["fail_closed"])
+            self.assertEqual(retry_1745["reason"], "committed_bundle_deadline_config_mismatch")
+            self.assertFalse(retry_1745["report_written"])
+            self.assertFalse((cfg_bundle_dir / "reports" / "completeness_2025-11-21.json").exists())
+            missed_1745 = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+                data_dir=cfg_bundle_dir,
+                config=tighter_1745,
+            )
+            self.assertEqual(missed_1745["ok_days"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

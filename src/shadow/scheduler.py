@@ -642,40 +642,13 @@ def _validate_replay_bundle_matches_ledger(
         except ValueError:
             return False, f"invalid_trailing_bundle_session_date:{tail_ds!r}", None
         if reports_dir is not None:
-            tail_json = reports_dir / f"completeness_{tail_ds}.json"
-            tail_md = reports_dir / f"completeness_{tail_ds}.md"
-            if tail_json.is_file():
-                try:
-                    tail_rep = parse_json_no_duplicates(tail_json.read_text(encoding="utf-8"))
-                except Exception:
-                    return False, f"committed_tail_report_unreadable:{tail_ds}", None
-                if isinstance(tail_rep, dict):
-                    tail_lmeta = tail_rep.get("ledger")
-                    if isinstance(tail_lmeta, dict) and (
-                        tail_lmeta.get("appended") is True
-                        or tail_lmeta.get("sequence") == n
-                        or (
-                            isinstance(tail_lmeta.get("chain_head_digest"), str)
-                            and len(tail_lmeta.get("chain_head_digest")) == 64
-                            and tail_lmeta.get("fail_closed_reason") is None
-                        )
-                    ):
-                        return (
-                            False,
-                            f"committed_session_missing_ledger_record:{tail_ds}:seq={n}",
-                            None,
-                        )
-            elif tail_md.is_file():
-                try:
-                    md_txt = tail_md.read_text(encoding="utf-8")
-                except Exception:
-                    return False, f"committed_tail_report_unreadable:{tail_ds}", None
-                if "- **Appended:** `True`" in md_txt or f"- **Sequence:** `{n}`" in md_txt:
-                    return (
-                        False,
-                        f"committed_session_missing_ledger_record:{tail_ds}:seq={n}",
-                        None,
-                    )
+            has_committed_rep, rep_err = _report_has_committed_evidence(reports_dir, tail_ds, expected_seq=n)
+            if has_committed_rep:
+                return (
+                    False,
+                    f"{rep_err}:{tail_ds}:seq={n}",
+                    None,
+                )
         if prune_uncommitted_tail:
             bundle_obj["sessions"] = list(sessions[:n])
             _atomic_write_text(bundle_path, json.dumps(bundle_obj, indent=2, sort_keys=True) + "\n")
@@ -687,6 +660,70 @@ def _validate_replay_bundle_matches_ledger(
                 return False, "replay_bundle_prune_verification_failed", None
 
     return True, None, bundle_obj
+
+
+def _report_has_committed_evidence(
+    reports_dir: Path,
+    session_date: str,
+    *,
+    expected_seq: int | None = None,
+) -> tuple[bool, str | None]:
+    """Return (True, reason) if completeness JSON or Markdown shows committed ledger evidence or corrupt committed state."""
+    tail_json = reports_dir / f"completeness_{session_date}.json"
+    tail_md = reports_dir / f"completeness_{session_date}.md"
+    if tail_json.is_file():
+        try:
+            tail_rep = parse_json_no_duplicates(tail_json.read_text(encoding="utf-8"))
+        except Exception:
+            return True, "committed_tail_report_unreadable"
+        if not isinstance(tail_rep, dict):
+            return True, "committed_tail_report_unreadable"
+        tail_lmeta = tail_rep.get("ledger")
+        if isinstance(tail_lmeta, dict) and (
+            tail_lmeta.get("appended") is True
+            or (expected_seq is not None and tail_lmeta.get("sequence") == expected_seq)
+            or (
+                isinstance(tail_lmeta.get("chain_head_digest"), str)
+                and len(tail_lmeta.get("chain_head_digest")) == 64
+                and tail_lmeta.get("fail_closed_reason") is None
+            )
+        ):
+            return True, "committed_session_missing_ledger_record"
+    if tail_md.is_file():
+        try:
+            md_txt = tail_md.read_text(encoding="utf-8")
+        except Exception:
+            return True, "committed_tail_report_unreadable"
+        if (
+            "- **Ledger Appended:** `True`" in md_txt
+            or "- **Appended:** `True`" in md_txt
+            or (expected_seq is not None and f"- **Sequence:** `{expected_seq}`" in md_txt)
+        ):
+            return True, "committed_session_missing_ledger_record"
+    return False, None
+
+
+def _bundle_deadline_config_mismatch(
+    bundle_obj: object,
+    cfg: DrillSchedulerConfig,
+) -> str | None:
+    if not isinstance(bundle_obj, dict):
+        return None
+    rcfg = bundle_obj.get("runtime_config")
+    if not isinstance(rcfg, dict):
+        return None
+    for key in (
+        "decision_instant_et",
+        "half_day_run_time_et",
+        "decision_cutoff_et",
+        "decision_cutoff_half_day_et",
+        "commitment_deadline_et",
+    ):
+        committed_val = rcfg.get(key)
+        cur_val = getattr(cfg, key)
+        if committed_val != cur_val:
+            return f"committed_bundle_config_mismatch:{key}:committed={committed_val!r}!=current={cur_val!r}"
+    return None
 
 
 def _is_committed_session_report_valid(
@@ -1536,6 +1573,41 @@ def _run_daily_drill_cycle_locked(
                 "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists(),
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
+    else:
+        prior_committed_artifacts = (
+            (bundle_dir / "replay_bundle.json").exists()
+            or ledger._ots_path(0).exists()
+            or ledger._receipt_path(0).exists()
+        )
+        if not prior_committed_artifacts and reports_dir.is_dir():
+            for rep_candidate in sorted(reports_dir.glob("completeness_*.json")):
+                stem_ds = rep_candidate.stem.removeprefix("completeness_")
+                has_ev, _ = _report_has_committed_evidence(reports_dir, stem_ds, expected_seq=0)
+                if has_ev:
+                    prior_committed_artifacts = True
+                    break
+            if not prior_committed_artifacts:
+                for md_candidate in sorted(reports_dir.glob("completeness_*.md")):
+                    stem_ds = md_candidate.stem.removeprefix("completeness_")
+                    has_ev, _ = _report_has_committed_evidence(reports_dir, stem_ds, expected_seq=0)
+                    if has_ev:
+                        prior_committed_artifacts = True
+                        break
+        if prior_committed_artifacts:
+            return {
+                "appended": False,
+                "recovered_missing_report": False,
+                "fail_closed": True,
+                "reason": "committed_evidence_without_ledger_records",
+                "detail": "Existing replay_bundle/OTS/receipt or committed report found when ledger has 0 records; refusing seq=0 overwrite",
+                "session_date": session_date,
+                "report": None,
+                "report_paths": [],
+                "report_written": False,
+                "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists()
+                or (reports_dir / f"completeness_{session_date}.md").exists(),
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
 
     # 3b. Reconcile already-committed session if completeness report is missing, invalid, or out-of-sync with ledger+bundle
     existing_env = next(
@@ -1610,6 +1682,23 @@ def _run_daily_drill_cycle_locked(
                 "report_paths": [str(json_path), str(md_path)],
                 "report_written": False,
                 "existing_report_preserved": True,
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
+
+        cfg_mismatch_err = _bundle_deadline_config_mismatch(bundle_obj_validated, cfg)
+        if cfg_mismatch_err is not None:
+            return {
+                "appended": False,
+                "recovered_missing_report": False,
+                "fail_closed": True,
+                "reason": "committed_bundle_deadline_config_mismatch",
+                "detail": cfg_mismatch_err,
+                "sequence": ex_seq,
+                "record_sha256": existing_env["record_sha256"],
+                "report": None,
+                "report_paths": [p for p in (str(json_path), str(md_path)) if Path(p).is_file()],
+                "report_written": False,
+                "existing_report_preserved": json_path.exists() or md_path.exists(),
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
 
@@ -2232,6 +2321,11 @@ def detect_missed_runs(
                             silent_missed_days.append(ds)
                             failed_days.append(ds)
                             detail = str(bundle_err or "committed_record_missing_valid_replay_bundle")
+                        elif (bundle_cfg_err := _bundle_deadline_config_mismatch(bundle_obj_validated, cfg)) is not None:
+                            status = "incomplete_or_corrupt_replay_bundle"
+                            silent_missed_days.append(ds)
+                            failed_days.append(ds)
+                            detail = bundle_cfg_err
                         else:
                             b_sess = bundle_obj_validated["sessions"][seq]
                             bmkt = b_sess["market_records"]
@@ -2297,10 +2391,17 @@ def detect_missed_runs(
                 failed_days.append(ds)
                 detail = f"documented_fail_closed:{rep_reason}"
         else:
-            status = "missed_run_silent_failure"
-            silent_missed_days.append(ds)
-            failed_days.append(ds)
-            detail = "no_ledger_record_and_no_completeness_report_past_deadline"
+            has_md_ev, md_ev_reason = _report_has_committed_evidence(reports_dir, ds)
+            if has_md_ev:
+                status = "incomplete_or_corrupt_replay_bundle"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = str(md_ev_reason or "committed_evidence_without_ledger_record")
+            else:
+                status = "missed_run_silent_failure"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = "no_ledger_record_and_no_completeness_report_past_deadline"
 
         evaluated_days.append(
             {
