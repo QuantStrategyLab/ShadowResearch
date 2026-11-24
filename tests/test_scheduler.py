@@ -3473,6 +3473,39 @@ class SchedulerTest(unittest.TestCase):
                 self.assertEqual(audit_fc["silent_missed_days"], ["2025-11-21"])
                 self.assertEqual(audit_fc["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
 
+            # 2b. Non-string list status in required_series or dropping TBILL_3M row must classify silent_missed without TypeError
+            from shadow.scheduler import _render_completeness_markdown as _rcm_r19
+
+            list_status_rep = json.loads(json.dumps(orig_fc_rep))
+            list_status_rep["required_series"][0]["status"] = []
+            fc_rep_path.write_text(json.dumps(list_status_rep), encoding="utf-8")
+            (fc_dir / "reports" / "completeness_2025-11-21.md").write_text(_rcm_r19(list_status_rep), encoding="utf-8")
+            audit_list_st = detect_missed_runs(
+                data_dir=fc_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_list_st["missed_run_detected"])
+            self.assertEqual(audit_list_st["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_list_st["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
+            dropped_tbill_rep = json.loads(json.dumps(orig_fc_rep))
+            dropped_tbill_rep["required_series"] = [
+                r for r in dropped_tbill_rep["required_series"] if r.get("instrument") != "TBILL_3M"
+            ]
+            fc_rep_path.write_text(json.dumps(dropped_tbill_rep), encoding="utf-8")
+            (fc_dir / "reports" / "completeness_2025-11-21.md").write_text(_rcm_r19(dropped_tbill_rep), encoding="utf-8")
+            audit_dropped = detect_missed_runs(
+                data_dir=fc_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_dropped["missed_run_detected"])
+            self.assertEqual(audit_dropped["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_dropped["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
             # 3. Half-day (2025-11-28) run-drill --session auto with truncated seq_000000 fails closed cleanly (ledger_integrity)
             half_dir = root / "halfday_auto_trunc"
             (half_dir / "ledger").mkdir(parents=True, exist_ok=True)

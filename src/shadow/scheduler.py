@@ -1015,6 +1015,12 @@ _REQUIRED_SERIES_ROW_KEYS = frozenset(
 _VALID_REQUIRED_SERIES_STATUSES = frozenset({"arrived", "revised", "missing", "late", "pre_close"})
 
 
+_PRE_INGEST_FAIL_CLOSED_PREFIXES = (
+    "existing_chain_verification_failed:",
+    "O2:",
+)
+
+
 def _is_fail_closed_session_report_valid(
     *,
     rep_path: Path,
@@ -1090,25 +1096,42 @@ def _is_fail_closed_session_report_valid(
     req_series = rep_obj.get("required_series")
     if not isinstance(req_series, list):
         return False
+    is_pre_ingest = any(fc_reason.startswith(prefix) for prefix in _PRE_INGEST_FAIL_CLOSED_PREFIXES)
+    if is_pre_ingest:
+        if req_series != []:
+            return False
+    else:
+        if len(req_series) != len(REQUIRED_MARKET_SERIES):
+            return False
+    seen_instruments: set[str] = set()
     for row in req_series:
         if not isinstance(row, dict) or set(row.keys()) != _REQUIRED_SERIES_ROW_KEYS:
             return False
+        inst = row.get("instrument")
+        prov = row.get("provider")
+        sid = row.get("series_id")
+        status = row.get("status")
         if (
-            not isinstance(row.get("instrument"), str)
-            or not row.get("instrument")
-            or not isinstance(row.get("provider"), str)
-            or not row.get("provider")
-            or not isinstance(row.get("series_id"), str)
-            or not row.get("series_id")
-            or row.get("status") not in _VALID_REQUIRED_SERIES_STATUSES
+            not isinstance(inst, str)
+            or not inst
+            or inst in seen_instruments
+            or not isinstance(prov, str)
+            or not prov
+            or not isinstance(sid, str)
+            or not sid
+            or not isinstance(status, str)
+            or status not in _VALID_REQUIRED_SERIES_STATUSES
         ):
             return False
+        seen_instruments.add(inst)
         ret_utc = row.get("retrieval_time_utc")
-        if row.get("status") in ("arrived", "revised"):
+        if status in ("arrived", "revised"):
             if not is_utc_ms_timestamp(ret_utc):
                 return False
         elif ret_utc is not None and not is_utc_ms_timestamp(ret_utc):
             return False
+    if not is_pre_ingest and seen_instruments != set(REQUIRED_MARKET_SERIES):
+        return False
 
     rep_rcp = rep_obj.get("receipt")
     if not isinstance(rep_rcp, dict):
