@@ -682,6 +682,139 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertEqual(vin_direct["loaded_policy_hash"], "p")
 
+    def test_per_tier_q_pre_step3_max_loss_cap_and_fund_hwm_preserved(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # 1. Per-tier q_pre mapping resolves selected tier cleanly (and fails closed if tier absent)
+        tiered = json.loads(json.dumps(_valid_inputs()))
+        tiered["funds"]["TQQQ"]["q_pre"] = {"conservative": 50, "balanced": 100, "aggressive": 150}
+        tiered["funds"]["SOXL"]["q_pre"] = {"conservative": 50, "balanced": 100, "aggressive": 150}
+        vin_tiered = build_fuse_validated_inputs(
+            tiered,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_tiered["funds"]["TQQQ"]["share_count"], 100)
+        self.assertEqual(vin_tiered["funds"]["TQQQ"]["broker_position"], 100)
+        rows_tiered, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_tiered,
+            {},
+            None,
+        )
+        self.assertEqual(rows_tiered["O1"]["state"], "NORMAL")
+        self.assertEqual(rows_tiered["O2"]["state"], "NORMAL")
+        built_tiered = build_record_body(
+            chain_id="prod-tiered-qpre",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=tiered,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec,
+        )
+        self.assertTrue(built_tiered["appended"])
+
+        missing_tier = json.loads(json.dumps(tiered))
+        missing_tier["funds"]["TQQQ"]["q_pre"] = {"conservative": 50}
+        built_missing = build_record_body(
+            chain_id="prod-missing-tier-qpre",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=missing_tier,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec,
+        )
+        self.assertFalse(built_missing["appended"])
+        self.assertTrue(built_missing["o1_output"]["would_have_tripped"])
+
+        # 2. Default max_loss_cap comes from sizing Step 3 x_ML * E (~$10,064.44 for balanced $50k),
+        # so $15,000 TQQQ exposure trips L0 even though it is below x_joint * E ($20,000).
+        l0_case = json.loads(json.dumps(_valid_inputs()))
+        l0_case["funds"]["TQQQ"]["q_pre"] = 300
+        l0_case["funds"]["SOXL"]["q_pre"] = 0
+        vin_l0 = build_fuse_validated_inputs(
+            l0_case,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        sizing_bal = next(
+            t for t in compute_session_sizing(_valid_inputs())["tiers"] if t["tier_id"] == "balanced"
+        )
+        self.assertAlmostEqual(
+            vin_l0["max_loss_cap"],
+            float(sizing_bal["x_ML"]) * 50000.0,
+            places=2,
+        )
+        self.assertLess(vin_l0["max_loss_cap"], 15000.0)
+        rows_l0, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_l0,
+            {},
+            None,
+        )
+        self.assertTrue(rows_l0["L0"]["outputs"]["cap_breached"])
+        self.assertTrue(rows_l0["L0"]["would_have_tripped"])
+
+        # 3. Fund-level hwm_adjusted=False is preserved even when corporate_action.hwm_adjusted=True
+        ca_fund_false = json.loads(json.dumps(_valid_inputs()))
+        ca_fund_false["funds"]["TQQQ"]["hwm_adjusted"] = False
+        ca_fund_false["funds"]["TQQQ"]["corporate_action"] = {
+            "type": "split",
+            "ratio": 2,
+            "adjustment_complete": True,
+            "exact_reconciliation": True,
+            "hwm_adjusted": True,
+        }
+        vin_ca = build_fuse_validated_inputs(
+            ca_fund_false,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIs(vin_ca["funds"]["TQQQ"]["hwm_adjusted"], False)
+        rows_ca, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_ca,
+            {},
+            None,
+        )
+        self.assertEqual(rows_ca["V2"]["state"], "HALT")
+        self.assertTrue(rows_ca["V2"]["would_have_tripped"])
+        self.assertEqual(rows_ca["V2"]["reason"], "reconciliation_mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()

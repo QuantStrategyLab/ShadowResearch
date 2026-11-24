@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from shadow.evaluator import ALL_BREAKER_IDS, REQUIRED_MARKET_SERIES, StubEvaluator
-from shadow.sizing import TIER_CONFIGS, canonical_decimal_str
+from shadow.sizing import (
+    TIER_CONFIGS,
+    SizingInputError,
+    canonical_decimal_str,
+    compute_tier_max_loss_fraction,
+)
 
 PINNED_FUSE_SPEC_VERSION = "fuse-eval-spec/v1"
 PINNED_FUSE_ENGINE_HASH = (
@@ -653,6 +658,70 @@ def _map_market_corporate_action(mca: Mapping[str, Any] | None) -> dict[str, Any
     return None
 
 
+def _resolve_tier_quantity(raw_val: object, tier: str) -> float | None:
+    """Resolve scalar or tier-keyed quantity before numeric coercion."""
+    if isinstance(raw_val, Mapping):
+        if tier not in raw_val:
+            return None
+        return _finite_number(raw_val[tier])
+    return _finite_number(raw_val)
+
+
+def _derive_default_max_loss_cap(
+    session_inputs: Mapping[str, Any],
+    tier: str,
+    bankroll_val: float | None,
+    hwm_val: float | None,
+) -> float | None:
+    """Derive L0 max_loss_cap from U-01 sizing Step 3 x_ML(c) * E, failing closed on bad inputs."""
+    if bankroll_val is None or bankroll_val <= 0 or tier not in TIER_CONFIGS:
+        return None
+    try:
+        e_dec = Decimal(str(session_inputs["E"]))
+        raw_e_star = session_inputs.get("E_star")
+        if raw_e_star is not None:
+            if _finite_number(raw_e_star) is None:
+                return None
+            e_star_dec = Decimal(str(raw_e_star))
+        elif hwm_val is not None:
+            e_star_dec = Decimal(str(hwm_val))
+        else:
+            e_star_dec = e_dec
+
+        raw_h = session_inputs.get("H", "0")
+        if raw_h is None or _finite_number(raw_h) is None:
+            return None
+        h_dec = Decimal(str(raw_h))
+
+        raw_w_ref = session_inputs.get("W_ref")
+        w_ref_dec: Decimal | None = None
+        if raw_w_ref is not None:
+            if _finite_number(raw_w_ref) is None:
+                return None
+            w_ref_dec = Decimal(str(raw_w_ref))
+
+        raw_l = session_inputs.get("L")
+        if raw_l is not None:
+            if _finite_number(raw_l) is None:
+                return None
+            l_dec = Decimal(str(raw_l))
+        else:
+            w_ref_eff = w_ref_dec if w_ref_dec is not None else (e_star_dec + h_dec)
+            l_dec = max(Decimal("0"), w_ref_eff - (e_dec + h_dec))
+
+        _, _, x_ml = compute_tier_max_loss_fraction(
+            tier,
+            e_val=e_dec,
+            e_star=e_star_dec,
+            l_val=l_dec,
+            h_val=h_dec,
+            w_ref=w_ref_dec,
+        )
+        return float(x_ml * e_dec)
+    except (SizingInputError, ArithmeticError, ValueError, KeyError):
+        return None
+
+
 def build_fuse_validated_inputs(
     session_inputs: Mapping[str, Any],
     calendar_session: Mapping[str, Any] | None,
@@ -703,7 +772,7 @@ def build_fuse_validated_inputs(
     if "max_loss_cap" in session_inputs:
         max_loss_cap = _finite_number(session_inputs.get("max_loss_cap"))
     else:
-        max_loss_cap = tier_joint_cap
+        max_loss_cap = _derive_default_max_loss_cap(session_inputs, tier, bankroll_val, hwm_val)
 
     raw_funds = session_inputs.get("funds") if isinstance(session_inputs.get("funds"), Mapping) else {}
     mkt_recs = session_inputs.get("market_records")
@@ -763,7 +832,7 @@ def build_fuse_validated_inputs(
         if not isinstance(fdata, Mapping):
             continue
         close_val = _finite_number(fdata.get("close_price"))
-        q_pre_val = _finite_number(fdata.get("q_pre", 0))
+        q_pre_val = _resolve_tier_quantity(fdata.get("q_pre", 0), tier)
         sigma_val = _finite_number(fdata.get("sigma_forecast"))
         if sigma_val is None:
             vol_ok = False
@@ -798,6 +867,11 @@ def build_fuse_validated_inputs(
                 by_inst[symbol].get("corporate_action")  # type: ignore[arg-type]
             )
 
+        broker_pos_val = (
+            _resolve_tier_quantity(fdata.get("broker_position"), tier)
+            if "broker_position" in fdata and fdata.get("broker_position") is not None
+            else q_pre_val
+        )
         fund_entry: dict[str, Any] = {
             "symbol": symbol,
             "exposure": _finite_number(fdata.get("exposure")) if fdata.get("exposure") is not None else pos_val,
@@ -817,11 +891,13 @@ def build_fuse_validated_inputs(
             "session_time": str(fdata.get("session_time", "regular")),
             "share_count": int(q_pre_val) if q_pre_val is not None else 0,
             "ledger_value": _finite_number(fdata.get("ledger_value")) if fdata.get("ledger_value") is not None else pos_val,
-            "broker_position": int(_finite_number(fdata.get("broker_position"))) if fdata.get("broker_position") is not None else (int(q_pre_val) if q_pre_val is not None else 0),
+            "broker_position": int(broker_pos_val) if broker_pos_val is not None else None,
             "broker_value": _finite_number(fdata.get("broker_value")) if fdata.get("broker_value") is not None else pos_val,
             "corporate_action": ca_obj,
             "fund_event": copy.deepcopy(fdata.get("fund_event")),
         }
+        if "hwm_adjusted" in fdata:
+            fund_entry["hwm_adjusted"] = fdata["hwm_adjusted"]
         if "v5_tolerance" in fdata:
             fund_entry["v5_tolerance"] = fdata["v5_tolerance"]
         if "v7_spread_width" in fdata:

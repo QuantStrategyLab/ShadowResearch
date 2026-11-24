@@ -387,6 +387,49 @@ def _most_restrictive_sizing_state(base_state: str, fund_state: str | None) -> s
     return base_state
 
 
+def compute_tier_max_loss_fraction(
+    tier_id: str,
+    *,
+    e_val: Decimal,
+    e_star: Decimal,
+    l_val: Decimal,
+    h_val: Decimal = Decimal("0"),
+    w_ref: Decimal | None = None,
+) -> tuple[Decimal, str, Decimal]:
+    """Compute Step 3 (cushion, binding_subbound, x_ML) using prec=28 U-01 math."""
+    if tier_id not in TIER_CONFIGS:
+        raise SizingInputError("tier_id", f"Unknown tier {tier_id!r}")
+    if e_val <= 0:
+        raise SizingInputError("E", f"Equity E must be > 0, got {e_val}")
+    if e_star <= 0 or e_val > e_star:
+        raise SizingInputError("E_star", f"Must satisfy 0 < E <= E_star ({e_val}, {e_star})")
+    if h_val < 0:
+        raise SizingInputError("H", f"External capital H must be >= 0, got {h_val}")
+    if l_val < 0:
+        raise SizingInputError("L", f"Loss L must be >= 0, got {l_val}")
+
+    with localcontext() as ctx:
+        ctx.prec = 28
+        ctx.rounding = ROUND_HALF_EVEN
+        d_budget = Decimal(TIER_CONFIGS[tier_id]["D"])
+        w_ref_eff = w_ref if w_ref is not None else (e_star + h_val)
+        if w_ref_eff - l_val <= 0:
+            raise SizingInputError("W_ref", "W_ref - L must be > 0")
+        if l_val >= d_budget * w_ref_eff:
+            cushion = Decimal("0")
+        else:
+            cushion = (d_budget * w_ref_eff - l_val) / (w_ref_eff - l_val)
+        ln_one_minus_shock = (Decimal("1") - Decimal("0.83")).ln()
+        bound_a = Decimal("3") * cushion
+        bound_b = Decimal("2") * cushion
+        bound_c = _m0_cap(cushion, ln_one_minus_shock)
+        subbound, x_ml = min(
+            [("a", bound_a), ("b", bound_b), ("c", bound_c)],
+            key=lambda item: item[1],
+        )
+        return cushion, subbound, x_ml
+
+
 def compute_session_sizing(
     inputs: dict,
     active_control_state: str = "NORMAL",
@@ -462,19 +505,14 @@ def compute_session_sizing(
             w_max = Decimal(tc["w_max"])
             sigma_target = Decimal(tc["sigma_target"])
 
-            # Cushion per U-01 §3.4 & DEMO-BRIEF
-            if l_val >= d_budget * w_ref:
-                cushion = Decimal("0")
-            else:
-                cushion = (d_budget * w_ref - l_val) / (w_ref - l_val)
-
-            # Step 3: x_ML(c) = min(3c, 2c, M0(c))
-            bound_a = Decimal("3") * cushion
-            bound_b = Decimal("2") * cushion
-            bound_c = _m0_cap(cushion, ln_one_minus_shock)
-            subbound, x_ml = min(
-                [("a", bound_a), ("b", bound_b), ("c", bound_c)],
-                key=lambda item: item[1],
+            # Cushion & Step 3 x_ML(c) = min(3c, 2c, M0(c)) per U-01 §3.4 & DEMO-BRIEF
+            cushion, subbound, x_ml = compute_tier_max_loss_fraction(
+                tier_id,
+                e_val=e_val,
+                e_star=e_star,
+                l_val=l_val,
+                h_val=h_val,
+                w_ref=w_ref,
             )
             cap_23 = min(x_cap, x_ml)
 

@@ -3313,23 +3313,26 @@ def _run_daily_drill_cycle_locked(
                 calendar_spec=spec,
             )
 
+    def _persist_pending_rejected_state() -> str | None:
+        if is_stub_evaluator(ev) or not isinstance(built.get("next_row_state"), dict):
+            return None
+        pending_path = save_pending_rejected_state_snapshot(
+            snapshots_dir,
+            chain_id=cfg.chain_id,
+            base_sequence=seq - 1,
+            base_record_sha256=head_hash,
+            rejected_session_date=session_date,
+            engine_hash=ev.engine_hash,
+            spec_version=ev.spec_version,
+            next_row_state=built["next_row_state"],
+            base_prior_row_state=session_base_prior_state,
+        )
+        return compute_pending_rejected_state_sha256(
+            parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
+        )
+
     if not built["appended"]:
-        pending_sha: str | None = None
-        if not is_stub_evaluator(ev) and isinstance(built.get("next_row_state"), dict):
-            pending_path = save_pending_rejected_state_snapshot(
-                snapshots_dir,
-                chain_id=cfg.chain_id,
-                base_sequence=seq - 1,
-                base_record_sha256=head_hash,
-                rejected_session_date=session_date,
-                engine_hash=ev.engine_hash,
-                spec_version=ev.spec_version,
-                next_row_state=built["next_row_state"],
-                base_prior_row_state=session_base_prior_state,
-            )
-            pending_sha = compute_pending_rejected_state_sha256(
-                parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
-            )
+        pending_sha = _persist_pending_rejected_state()
         fail_reason = built["o1_output"].get("reason") or built.get("o2_output", {}).get("reason")
         fail_res = _build_fail_closed_result(
             t_start=t_start,
@@ -3373,8 +3376,9 @@ def _run_daily_drill_cycle_locked(
     rcp_obtained_utc = post_stamp_utc
 
     if post_stamp_utc > deadline_utc:
+        pending_sha = _persist_pending_rejected_state()
         fail_reason = "late_after_commitment_deadline_backfill_rejected"
-        return _build_fail_closed_result(
+        fail_res = _build_fail_closed_result(
             t_start=t_start,
             root=root,
             reports_dir=reports_dir,
@@ -3394,9 +3398,18 @@ def _run_daily_drill_cycle_locked(
             receipt_obtained_at_utc=rcp_obtained_utc,
             receipt_reasons=[fail_reason, "drill_mode"],
         )
+        if pending_sha is not None:
+            fail_res["pending_rejected_state_sha256"] = pending_sha
+        return fail_res
 
     if ots_bytes is None and not allow_unanchored_on_ots_failure:
-        raise RuntimeError(f"OTS receipt acquisition failed: {ots_error}")
+        pending_sha = _persist_pending_rejected_state()
+        suffix = (
+            f" (pending_rejected_state_sha256={pending_sha})"
+            if pending_sha is not None
+            else ""
+        )
+        raise RuntimeError(f"OTS receipt acquisition failed: {ots_error}{suffix}")
 
     session_entry: dict[str, object] = {
         "session_date": session_date,

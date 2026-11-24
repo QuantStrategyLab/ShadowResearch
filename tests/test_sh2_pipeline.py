@@ -58,6 +58,7 @@ from shadow.ledger import (  # noqa: E402
     build_record_body,
     check_forward_clock_credit,
     compute_code_manifest_hash,
+    compute_pending_rejected_state_sha256,
     load_pending_rejected_state_snapshot,
     load_row_state_snapshot,
     save_pending_rejected_state_snapshot,
@@ -2056,6 +2057,130 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertEqual(v4_row["state"], "NO-NEW-RISK")
             self.assertEqual(v4_row["reason"], "volatility_below_2x_but_not_yet_cleared")
             self.assertEqual(v4_row["outputs"]["TQQQ"]["clearing_counter"], 1)
+
+    def test_post_evaluation_ots_failure_and_deadline_preserve_evaluated_breaker_state(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+
+        class _OkOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
+        class _FailingOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                raise RuntimeError("ots calendar unavailable")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "unlocked.json"
+            cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            # Case A: Jan 5 V4 trip followed by OTS outage (allow_unanchored_on_ots_failure=False)
+            root_ots = Path(tmpdir) / "prod_ots_fail"
+            with self.assertRaises(RuntimeError) as ctx_ots:
+                run_production_cycle(
+                    session_date="2026-01-05",
+                    data_dir=root_ots,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-05"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_FailingOts(),
+                    wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                    expected_prior_head_sha256=GENESIS_PREV_HASH,
+                )
+            self.assertIn("OTS receipt acquisition failed:", str(ctx_ots.exception))
+            self.assertIn("pending_rejected_state_sha256=", str(ctx_ots.exception))
+            self.assertEqual(len(ShadowLedger(root_ots / "ledger").load_records()), 0)
+            pend_ots = root_ots / "state_snapshots" / "pending_rejected_state.json"
+            self.assertTrue(pend_ots.is_file())
+            pend_ots_sha = compute_pending_rejected_state_sha256(
+                json.loads(pend_ots.read_text(encoding="utf-8"))
+            )
+            self.assertIn(pend_ots_sha, str(ctx_ots.exception))
+
+            # Jan 6 with calm vol must retain V4 10-session clearing interlock (not NORMAL)
+            r_next_ots = run_production_cycle(
+                session_date="2026-01-06",
+                data_dir=root_ots,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_OkOts(),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                sigma_by_inst={"TQQQ": "0.22", "SOXL": "0.22"},
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+                expected_pending_state_sha256=pend_ots_sha,
+            )
+            self.assertTrue(r_next_ots["appended"])
+            self.assertEqual(r_next_ots["sequence"], 0)
+            self.assertFalse(pend_ots.exists())
+            recs_ots = ShadowLedger(root_ots / "ledger").load_records()
+            v4_ots = next(b for b in recs_ots[0]["record_body"]["evaluator"]["breakers"] if b["id"] == "V4")
+            self.assertEqual(v4_ots["state"], "NO-NEW-RISK")
+            self.assertEqual(v4_ots["reason"], "volatility_below_2x_but_not_yet_cleared")
+            self.assertEqual(v4_ots["outputs"]["TQQQ"]["clearing_counter"], 1)
+
+            # Case B: Jan 5 V4 trip followed by post-stamp deadline overrun preserves V4 state
+            root_dl = Path(tmpdir) / "prod_deadline_fail"
+            stamped = [False]
+
+            class _SlowOts(OpenTimestampsClient):
+                def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                    stamped[0] = True
+                    ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880101)
+                    return ots_b, "https://a.pool.opentimestamps.org"
+
+            def _deadline_clock() -> datetime:
+                if not stamped[0]:
+                    return datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc)
+                return datetime(2026, 1, 6, 5, 0, tzinfo=timezone.utc)
+
+            r_dl = run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root_dl,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_SlowOts(),
+                wall_clock=_deadline_clock,
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+            )
+            self.assertFalse(r_dl["appended"])
+            self.assertEqual(r_dl["reason"], "late_after_commitment_deadline_backfill_rejected")
+            self.assertEqual(len(ShadowLedger(root_dl / "ledger").load_records()), 0)
+            pend_dl_sha = str(r_dl["pending_rejected_state_sha256"])
+
+            r_next_dl = run_production_cycle(
+                session_date="2026-01-06",
+                data_dir=root_dl,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_OkOts(),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                sigma_by_inst={"TQQQ": "0.22", "SOXL": "0.22"},
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+                expected_pending_state_sha256=pend_dl_sha,
+            )
+            self.assertTrue(r_next_dl["appended"])
+            recs_dl = ShadowLedger(root_dl / "ledger").load_records()
+            v4_dl = next(b for b in recs_dl[0]["record_body"]["evaluator"]["breakers"] if b["id"] == "V4")
+            self.assertEqual(v4_dl["state"], "NO-NEW-RISK")
+            self.assertEqual(v4_dl["reason"], "volatility_below_2x_but_not_yet_cleared")
+            self.assertEqual(v4_dl["outputs"]["TQQQ"]["clearing_counter"], 1)
 
 
 if __name__ == "__main__":
