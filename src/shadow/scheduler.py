@@ -2515,6 +2515,25 @@ def _run_daily_drill_cycle_locked(
         consecutive_now=consecutive_now,
     )
     report_created_utc = _format_utc_ms(clock_fn())
+    if report_created_utc > deadline_utc:
+        fail_reason = "late_after_commitment_deadline_backfill_rejected"
+        return {
+            "appended": True,
+            "fail_closed": True,
+            "reason": fail_reason,
+            "detail": (
+                f"{fail_reason}: report creation crossed commitment deadline "
+                f"({report_created_utc} > {deadline_utc})"
+            ),
+            "sequence": seq,
+            "record_sha256": env["record_sha256"],
+            "report": None,
+            "report_paths": [],
+            "report_written": False,
+            "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists()
+            or (reports_dir / f"completeness_{session_date}.md").exists(),
+            "footprint": footprint,
+        }
     report_paths, wrote_report = _write_completeness_report(
         reports_dir,
         report,

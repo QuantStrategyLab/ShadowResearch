@@ -3649,6 +3649,64 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(by_day["2025-11-21"], "incomplete_or_corrupt_replay_bundle")
             self.assertEqual(by_day["2025-11-24"], "failed_documented")
 
+    def test_r21_late_report_creation_after_commitment_deadline_fails_closed(self) -> None:
+        """Close PR #6 Codex P2: crossing commitment deadline between post-stamp and report write fails closed."""
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            late_rep_dir = Path(tmpdir) / "late_report_dir"
+            ots_called = [0]
+
+            def _crossing_ots_transport(
+                method: str,
+                url: str,
+                body: bytes | None,
+                headers: Mapping[str, str],
+                timeout: float,
+            ) -> tuple[int, bytes]:
+                ots_called[0] += 1
+                return _mock_ots_transport(method, url, body, headers, timeout)
+
+            post_ots_ticks = iter(
+                [
+                    "2025-11-22T04:29:59.000Z",  # post_stamp_utc (before 04:30:00Z deadline)
+                    "2025-11-22T04:30:01.000Z",  # report_created_utc (crossed 04:30:00Z deadline)
+                ]
+            )
+
+            def _crossing_clock() -> datetime:
+                raw = "2025-11-21T22:30:00.000Z" if ots_called[0] == 0 else next(post_ots_ticks)
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+            def _timed_market_transport(url: str, headers: Mapping[str, str]) -> tuple[int, bytes]:
+                return _mock_market_transport(url, headers)
+
+            res = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=late_rep_dir,
+                config=cfg,
+                transport=_timed_market_transport,
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_crossing_ots_transport,
+                wall_clock=_crossing_clock,
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertFalse(res["report_written"])
+            self.assertEqual(res["reason"], "late_after_commitment_deadline_backfill_rejected")
+            self.assertFalse((late_rep_dir / "reports" / "completeness_2025-11-21.json").exists())
+            self.assertFalse((late_rep_dir / "reports" / "completeness_2025-11-21.md").exists())
+
+            audit = detect_missed_runs(
+                data_dir=late_rep_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit["missed_run_detected"])
+            self.assertEqual(audit["silent_missed_days"], ["2025-11-21"])
+
 
 if __name__ == "__main__":
     unittest.main()
