@@ -243,7 +243,10 @@ def run_all_cases() -> list[tuple[str, bool, str]]:
                 prior_row_state=prior_state,
             )
             assert built["appended"] is True
-            env = d1_ledger.append_record(built["record_body"])
+            env = d1_ledger.append_record(
+                built["record_body"],
+                obtained_at_utc=sess["decision_timestamp_utc"],
+            )
             prev = env["record_sha256"]
             prior_state = built["next_row_state"]
             d1_sizing_by_sid[sid] = built["record_body"]
@@ -359,7 +362,10 @@ def run_all_cases() -> list[tuple[str, bool, str]]:
         mut_dir = tmp / "d5_mut"
         mut_ledger = ShadowLedger(mut_dir)
         for env in d1_records:
-            mut_ledger.append_record(env["record_body"])
+            mut_ledger.append_record(
+                env["record_body"],
+                obtained_at_utc=env["record_body"]["decision_timestamp_utc"],
+            )
         rec2 = mut_dir / "seq_000002.record.json"
         raw2 = bytearray(rec2.read_bytes())
         pos = raw2.index(b'"50000"') + 2
@@ -377,7 +383,10 @@ def run_all_cases() -> list[tuple[str, bool, str]]:
         fork_body["prev_record_sha256"] = "a" * 64
         fork_rejected = False
         try:
-            d1_ledger.append_record(fork_body)
+            d1_ledger.append_record(
+                fork_body,
+                obtained_at_utc=fork_body["decision_timestamp_utc"],
+            )
         except LedgerAppendError:
             fork_rejected = True
         assert fork_rejected
@@ -386,7 +395,10 @@ def run_all_cases() -> list[tuple[str, bool, str]]:
         gap_dir = tmp / "d5_gap"
         gap_ledger = ShadowLedger(gap_dir)
         for env in d1_records:
-            gap_ledger.append_record(env["record_body"])
+            gap_ledger.append_record(
+                env["record_body"],
+                obtained_at_utc=env["record_body"]["decision_timestamp_utc"],
+            )
         (gap_dir / "seq_000001.record.json").unlink()
         ok_g, bad_g, _ = gap_ledger.verify_chain()
         assert ok_g is False and bad_g == 1
@@ -397,7 +409,10 @@ def run_all_cases() -> list[tuple[str, bool, str]]:
         dup_body["prev_record_sha256"] = head_d1["record_sha256"]
         dup_rejected = False
         try:
-            d1_ledger.append_record(dup_body)
+            d1_ledger.append_record(
+                dup_body,
+                obtained_at_utc=dup_body["decision_timestamp_utc"],
+            )
         except LedgerAppendError:
             dup_rejected = True
         assert dup_rejected

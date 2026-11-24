@@ -1,0 +1,8 @@
+# synthetic FRED DTB3 CSV test fixture (schema shape + historical leading rows)
+observation_date,DTB3
+1999-01-04,1.00
+1999-01-05,1.05
+2026-11-16,4.10
+2026-11-17,4.10
+2026-11-18,4.05
+2026-11-19,4.05

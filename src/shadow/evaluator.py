@@ -45,6 +45,30 @@ _STATE_PRECEDENCE = {
 }
 
 
+REQUIRED_MARKET_SERIES: tuple[str, ...] = (
+    "TQQQ",
+    "SOXL",
+    "QQQ",
+    "XNDX",
+    "SEMI",
+    "SOFR",
+    "TBILL_3M",
+)
+
+Y2_REQUIRED_MARKET_SERIES: tuple[str, ...] = (
+    "TQQQ",
+    "SOXL",
+    "XNDX",
+    "SEMI",
+    "SOFR",
+    "TBILL_3M",
+)
+
+
+class StubProductionForbiddenError(RuntimeError):
+    """Raised when the SH-1 stub evaluator is invoked for production forward-clock mode."""
+
+
 def stub_engine_hash() -> str:
     """Return pinned synthetic stub evaluator hash."""
     payload = json.dumps(
@@ -57,6 +81,8 @@ def stub_engine_hash() -> str:
 
 class StubEvaluator:
     """Fixture-driven synthetic C-FUSE-EVAL stub with zero ledger handles."""
+
+    production_clock_capable: bool = False
 
     def __init__(self, spec_version: str = "c-fuse-eval-stub-v1") -> None:
         self.spec_version = spec_version
@@ -75,6 +101,12 @@ class StubEvaluator:
         authorized_events: dict | list | None = None,
     ) -> tuple[dict[str, dict], dict[str, str], dict]:
         """Evaluate all 24 named breaker rows synchronously with no ledger side effects."""
+        if mode == "production":
+            raise StubProductionForbiddenError(
+                "StubEvaluator is structurally incapable of production forward-clock evaluation; "
+                "SH-2 requires the accepted FUSE-1 engine"
+            )
+
         rows_by_id: dict[str, dict] = {}
         for row_id in ALL_BREAKER_IDS:
             defn = BREAKER_DEFINITIONS[row_id]
@@ -92,11 +124,26 @@ class StubEvaluator:
                     "session": session,
                     "as_of": as_of,
                     "synthetic_stub": True,
+                    "production_clock_capable": False,
                 },
             }
 
-        # O1 fail-closed validation on required market/bankroll inputs
+        # Apply synthetic overrides before mandatory O1/O2 fail-closed checks
+        overrides = (
+            validated_inputs.get("stub_breaker_overrides")
+            if isinstance(validated_inputs, dict)
+            else None
+        )
+        if isinstance(overrides, dict):
+            for row_id, ov in overrides.items():
+                if row_id not in rows_by_id:
+                    raise ValueError(f"Unknown breaker ID in override: {row_id}")
+                if isinstance(ov, dict):
+                    rows_by_id[row_id].update(ov)
+
+        # Mandatory O1 & O2 fail-closed validation (cannot be cleared by stub overrides)
         missing_reasons: list[str] = []
+        o2_tripped_reason: str | None = None
         if not isinstance(validated_inputs, dict):
             missing_reasons.append("validated_inputs_not_dict")
         else:
@@ -105,22 +152,65 @@ class StubEvaluator:
             except SizingInputError as exc:
                 missing_reasons.append(f"missing_required_input:{exc.field}")
 
-            cal = validated_inputs.get("calendar")
-            if isinstance(cal, dict):
-                if cal.get("blocks_eligibility") or not cal.get("is_trading_day"):
-                    rows_by_id["O2"]["state"] = "NO-NEW-RISK"
-                    rows_by_id["O2"]["would_have_tripped"] = True
-                    rows_by_id["O2"]["reason"] = cal.get("reason") or "calendar_closed_or_disagreement"
+            if "calendar" in validated_inputs:
+                cal = validated_inputs.get("calendar")
+                if not isinstance(cal, dict):
+                    o2_tripped_reason = "missing_or_invalid_calendar"
+                else:
+                    trade_date_mismatch = bool(cal.get("trade_date") and cal.get("trade_date") != session)
+                    if (
+                        cal.get("blocks_eligibility")
+                        or cal.get("blocks_orders")
+                        or cal.get("session_state") == "unknown"
+                        or not cal.get("is_trading_day")
+                        or cal.get("venue_disagreement")
+                        or trade_date_mismatch
+                    ):
+                        o2_tripped_reason = (
+                            "calendar_session_date_mismatch"
+                            if trade_date_mismatch
+                            else (cal.get("reason") or "calendar_closed_or_disagreement")
+                        )
 
-            overrides = validated_inputs.get("stub_breaker_overrides")
-            if isinstance(overrides, dict):
-                for row_id, ov in overrides.items():
-                    if row_id not in rows_by_id:
-                        raise ValueError(f"Unknown breaker ID in override: {row_id}")
-                    if isinstance(ov, dict):
-                        rows_by_id[row_id].update(ov)
+            if "market_records" in validated_inputs:
+                mkt_recs = validated_inputs.get("market_records")
+                req_series = validated_inputs.get("required_series", REQUIRED_MARKET_SERIES)
+                cal_obj = validated_inputs.get("calendar") if isinstance(validated_inputs.get("calendar"), dict) else None
+                if not isinstance(mkt_recs, list):
+                    missing_reasons.append("market_records_not_list")
+                else:
+                    by_inst = {
+                        r.get("instrument"): r
+                        for r in mkt_recs
+                        if isinstance(r, dict) and r.get("instrument")
+                    }
+                    for inst in req_series:
+                        rec = by_inst.get(inst)
+                        if rec is None:
+                            missing_reasons.append(f"missing_required_series:{inst}")
+                            continue
+                        elig = rec.get("eligibility") if isinstance(rec.get("eligibility"), dict) else {}
+                        if rec.get("normalized_value") is None or not elig.get("eligible"):
+                            reason = elig.get("reason") or "ineligible_or_missing_value"
+                            missing_reasons.append(f"market_input_ineligible:{inst}:{reason}")
+                            continue
+                        if cal_obj is not None and rec.get("calendar_spec_digest") != cal_obj.get("spec_digest"):
+                            missing_reasons.append(f"calendar_spec_digest_mismatch:{inst}")
+
+        if o2_tripped_reason is not None:
+            if isinstance(overrides, dict) and isinstance(overrides.get("O2"), dict):
+                ov_o2 = overrides["O2"]
+                if ov_o2.get("state") == "NORMAL" or ov_o2.get("would_have_tripped") is False:
+                    raise ValueError("stub_override_cannot_clear_mandatory_breaker:O2")
+            rows_by_id["O2"]["state"] = "NO-NEW-RISK"
+            rows_by_id["O2"]["would_have_tripped"] = True
+            rows_by_id["O2"]["reason"] = o2_tripped_reason
 
         if missing_reasons:
+            if isinstance(overrides, dict) and isinstance(overrides.get("O1"), dict):
+                ov_o1 = overrides["O1"]
+                if ov_o1.get("state") == "NORMAL" or ov_o1.get("would_have_tripped") is False:
+                    raise ValueError("stub_override_cannot_clear_mandatory_breaker:O1")
             rows_by_id["O1"]["state"] = "NO-NEW-RISK"
             rows_by_id["O1"]["would_have_tripped"] = True
             rows_by_id["O1"]["reason"] = "; ".join(missing_reasons)

@@ -1,0 +1,12 @@
+[Unit]
+Description=SHADOW-N SH-1 Independent Missed-Run Detector Timer (drill chain only)
+
+[Timer]
+# Pinned strictly to America/New_York across EST/EDT DST transitions, 15m after 23:30 ET commitment deadline.
+OnCalendar=Mon..Fri *-*-* 23:45:00 America/New_York
+Persistent=false
+AccuracySec=30s
+Unit=shadow-missed-run.service
+
+[Install]
+WantedBy=timers.target

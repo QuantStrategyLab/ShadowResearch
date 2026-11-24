@@ -48,7 +48,12 @@ def load_spec(spec_dir: str | Path | None = None) -> dict:
             )
 
     spec_path = base_dir / "SPEC.md"
-    exc_path = base_dir / "exceptions-2025.json"
+    exc_candidates = sorted(
+        name for name in recorded_files if name.startswith("exceptions-") and name.endswith(".json")
+    )
+    if len(exc_candidates) != 1:
+        raise CalendarDigestError(f"expected single exceptions-*.json in manifest, got {exc_candidates}")
+    exc_path = base_dir / exc_candidates[0]
     computed_spec_digest = hashlib.sha256(
         spec_path.read_bytes() + exc_path.read_bytes()
     ).hexdigest()
@@ -244,3 +249,44 @@ def resolve_session(
         result["observed_venue_status"] = observed_venue_status
 
     return result
+
+
+def resolve_prior_close_session(
+    decision_instant_utc: str,
+    spec: dict | None = None,
+    venue: str = "XNYS",
+) -> dict:
+    """Resolve the calendar's latest trading session whose close_utc <= decision_instant_utc."""
+    loaded = spec if spec is not None else load_spec()
+    rules = loaded["rules"]
+    spec_digest = loaded["spec_digest"]
+    tz = ZoneInfo(rules["timezone"])
+
+    if venue != rules["exchange"]:
+        return _unknown_session(venue, decision_instant_utc[:10], rules, spec_digest, "unsupported_venue")
+
+    iso_norm = decision_instant_utc[:-1] + "+00:00" if decision_instant_utc.endswith("Z") else decision_instant_utc
+    try:
+        dt_utc = datetime.fromisoformat(iso_norm).astimezone(timezone.utc)
+    except ValueError:
+        return _unknown_session(venue, decision_instant_utc[:10], rules, spec_digest, "invalid_timestamp")
+
+    instant_ms_utc = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt_utc.microsecond // 1000:03d}Z"
+    local_date = dt_utc.astimezone(tz).date()
+    cov_start = date.fromisoformat(rules["coverage_start_date"])
+    cov_end = date.fromisoformat(rules["coverage_end_date"])
+
+    if local_date < cov_start or local_date > cov_end:
+        return _unknown_session(venue, local_date.isoformat(), rules, spec_digest, "out_of_range")
+
+    for offset in range(15):
+        cand = local_date - timedelta(days=offset)
+        if cand < cov_start:
+            break
+        sess = resolve_session(venue, cand.isoformat(), spec=loaded)
+        close_utc = sess.get("close_utc")
+        if sess.get("is_trading_day") and not sess.get("blocks_eligibility") and close_utc is not None:
+            if close_utc <= instant_ms_utc:
+                return sess
+
+    return _unknown_session(venue, local_date.isoformat(), rules, spec_digest, "out_of_range")
