@@ -2907,6 +2907,130 @@ class SchedulerTest(unittest.TestCase):
             self.assertIn("2025-11-24", audit2["silent_missed_days"])
             self.assertIn("2025-11-24", audit2["failed_days"])
 
+    def test_r12_valid_ots_permission_error_and_direct_ledger_append_protection(self) -> None:
+        from shadow import ledger as ledger_mod
+
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            def _setup_committed_seq1_missing_record(tag: str) -> tuple[Path, ShadowLedger]:
+                d = root / tag
+                self.assertTrue(
+                    run_daily_drill_cycle(
+                        session_date="2025-11-21",
+                        data_dir=d,
+                        config=cfg,
+                        transport=lambda u, h: _mock_market_transport(u, h),
+                        environ={"TIINGO_API_KEY": "test-key"},
+                        ots_transport=_mock_ots_transport,
+                        wall_clock=_tick_clock("2025-11-21"),
+                        sleeper=lambda _: None,
+                    )["appended"]
+                )
+                self.assertTrue(
+                    run_daily_drill_cycle(
+                        session_date="2025-11-24",
+                        data_dir=d,
+                        config=cfg,
+                        transport=lambda u, h: _mock_market_transport(u, h, withhold_inst="TQQQ"),
+                        environ={"TIINGO_API_KEY": "test-key"},
+                        ots_transport=_mock_ots_transport,
+                        wall_clock=_tick_clock("2025-11-24"),
+                        sleeper=lambda _: None,
+                    )["fail_closed"]
+                )
+                with self.assertRaisesRegex(RuntimeError, "crash_after_commit"):
+                    run_daily_drill_cycle(
+                        session_date="2025-11-24",
+                        data_dir=d,
+                        config=cfg,
+                        transport=lambda u, h: _mock_market_transport(u, h),
+                        environ={"TIINGO_API_KEY": "test-key"},
+                        ots_transport=_mock_ots_transport,
+                        wall_clock=_tick_clock("2025-11-24"),
+                        sleeper=lambda _: None,
+                        _post_record_commit_hook=lambda: (_ for _ in ()).throw(RuntimeError("crash_after_commit")),
+                    )
+                led = ShadowLedger(d / "ledger")
+                led._record_path(1).unlink()
+                return d, led
+
+            # 1. R12 #1: Valid .ots proof even WITHOUT .receipt.json blocks Day 3 pruning/reuse of seq=1
+            ots_dir, ots_led = _setup_committed_seq1_missing_record("valid_ots_no_receipt")
+            ots_led._receipt_path(1).unlink()
+            ots_bytes_before = ots_led._ots_path(1).read_bytes()
+            bundle_before = (ots_dir / "replay" / "replay_bundle.json").read_bytes()
+            d3_ots = run_daily_drill_cycle(
+                session_date="2025-11-25",
+                data_dir=ots_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-25"),
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(d3_ots["appended"])
+            self.assertTrue(d3_ots["fail_closed"])
+            self.assertEqual(ots_led._ots_path(1).read_bytes(), ots_bytes_before)
+            self.assertEqual((ots_dir / "replay" / "replay_bundle.json").read_bytes(), bundle_before)
+
+            # 2. R12 #2: PermissionError / OSError reading seq_000001.receipt.json aborts BEFORE pruning
+            perm_dir, perm_led = _setup_committed_seq1_missing_record("permission_error_receipt")
+            denied_rcp = perm_led._receipt_path(1)
+            rcp_bytes_before = denied_rcp.read_bytes()
+            orig_read_text = Path.read_text
+
+            def _deny_receipt_read(self_path: Path, *args: object, **kwargs: object) -> str:
+                if self_path == denied_rcp:
+                    raise PermissionError("simulated_read_denied")
+                return orig_read_text(self_path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", _deny_receipt_read):
+                d3_perm = run_daily_drill_cycle(
+                    session_date="2025-11-25",
+                    data_dir=perm_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-25"),
+                    sleeper=lambda _: None,
+                )
+            self.assertFalse(d3_perm["appended"])
+            self.assertTrue(d3_perm["fail_closed"])
+            self.assertEqual(denied_rcp.read_bytes(), rcp_bytes_before)
+
+            # 3. R12 #3: Direct ShadowLedger.append_record(allow_unanchored=True) refuses overwriting seq=1 evidence
+            direct_dir, direct_led = _setup_committed_seq1_missing_record("direct_append_protected")
+            clean_dir = root / "clean_source"
+            for ds in ("2025-11-21", "2025-11-25"):
+                self.assertTrue(
+                    run_daily_drill_cycle(
+                        session_date=ds,
+                        data_dir=clean_dir,
+                        config=cfg,
+                        transport=lambda u, h: _mock_market_transport(u, h),
+                        environ={"TIINGO_API_KEY": "test-key"},
+                        ots_transport=_mock_ots_transport,
+                        wall_clock=_tick_clock(ds),
+                        sleeper=lambda _: None,
+                    )["appended"]
+                )
+            replacement_body = ShadowLedger(clean_dir / "ledger").head()["record_body"]
+            orig_direct_ots = direct_led._ots_path(1).read_bytes()
+            orig_direct_rcp = direct_led._receipt_path(1).read_bytes()
+            with self.assertRaisesRegex(LedgerAppendError, "committed_evidence_exists_without_record"):
+                direct_led.append_record(replacement_body, allow_unanchored=True)
+            self.assertFalse(direct_led._record_path(1).exists())
+            self.assertEqual(direct_led._ots_path(1).read_bytes(), orig_direct_ots)
+            self.assertEqual(direct_led._receipt_path(1).read_bytes(), orig_direct_rcp)
+            self.assertTrue(ledger_mod.has_committed_detached_evidence(direct_led, 1)[0])
+
 
 if __name__ == "__main__":
     unittest.main()

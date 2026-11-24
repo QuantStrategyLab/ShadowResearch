@@ -40,6 +40,7 @@ from shadow.ledger import (
     compute_code_manifest_hash,
     compute_inputs_digest,
     compute_session_commitment_deadline_utc,
+    has_committed_detached_evidence,
     is_receipt_timely,
     is_utc_ms_timestamp,
     parse_json_no_duplicates,
@@ -551,37 +552,6 @@ def _validate_bundle_session_against_record(
     return True, None
 
 
-def _has_committed_detached_receipt(ledger: ShadowLedger, seq: int) -> bool:
-    """Return True iff seq_NNNNNN.receipt.json is a structured committed receipt (not an empty/partial pre-commit stub)."""
-    rpath = ledger._receipt_path(seq)
-    if not rpath.is_file():
-        return False
-    try:
-        rcp = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    if not isinstance(rcp, dict):
-        return False
-    anchor = rcp.get("anchor")
-    rec_seq = rcp.get("sequence")
-    rec_sha = rcp.get("record_sha256")
-    rec_ds = rcp.get("session_date")
-    obtained = rcp.get("obtained_at_utc")
-    if anchor not in ("opentimestamps", "synthetic-stub"):
-        return False
-    if isinstance(rec_seq, bool) or rec_seq != seq:
-        return False
-    if not isinstance(rec_sha, str) or len(rec_sha) != 64 or any(c not in "0123456789abcdef" for c in rec_sha):
-        return False
-    if not isinstance(rec_ds, str) or not _DATE_YYYY_MM_DD_RE.fullmatch(rec_ds):
-        return False
-    try:
-        date.fromisoformat(rec_ds)
-    except ValueError:
-        return False
-    return is_utc_ms_timestamp(obtained)
-
-
 def _validate_replay_bundle_matches_ledger(
     bundle_dir: Path,
     prior_records: list[dict],
@@ -680,12 +650,14 @@ def _validate_replay_bundle_matches_ledger(
                     f"{rep_err}:{tail_ds}:seq={n}",
                     None,
                 )
-        if ledger is not None and _has_committed_detached_receipt(ledger, n):
-            return (
-                False,
-                f"committed_session_missing_ledger_record:{tail_ds}:seq={n}",
-                None,
-            )
+        if ledger is not None:
+            has_det_ev, det_reason = has_committed_detached_evidence(ledger, n)
+            if has_det_ev:
+                return (
+                    False,
+                    f"committed_session_missing_ledger_record:{tail_ds}:seq={n}:{det_reason}",
+                    None,
+                )
         if prune_uncommitted_tail:
             bundle_obj["sessions"] = list(sessions[:n])
             _atomic_write_text(bundle_path, json.dumps(bundle_obj, indent=2, sort_keys=True) + "\n")
@@ -790,6 +762,16 @@ def _detect_orphaned_committed_evidence_for_session(
                 return f"corrupt_orphaned_receipt_seq_{seq_num}"
             if isinstance(rcp_obj, dict) and rcp_obj.get("session_date") == session_date:
                 return f"orphaned_receipt_without_ledger_record_seq_{seq_num}"
+        for opath in sorted(ledger.root_dir.glob("seq_*.ots")):
+            ostem = opath.name[len("seq_") : -len(".ots")]
+            if not ostem.isdigit():
+                continue
+            oseq = int(ostem)
+            if oseq in committed_seqs:
+                continue
+            has_o_ev, o_reason = has_committed_detached_evidence(ledger, oseq)
+            if has_o_ev:
+                return str(o_reason or f"orphaned_ots_without_ledger_record_seq_{oseq}")
         if not records and (ledger._ots_path(0).is_file() or ledger._receipt_path(0).is_file()):
             # Empty ledger with seq_0 detached OTS/receipt and any existing bundle/report evidence indicates orphaned/missing seq_0
             if bundle_sessions or (reports_dir / f"completeness_{session_date}.json").is_file():
@@ -1646,13 +1628,14 @@ def _run_daily_drill_cycle_locked(
                 "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists(),
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
-        if _has_committed_detached_receipt(ledger, len(prior_records)):
+        det_ok, det_reason = has_committed_detached_evidence(ledger, len(prior_records))
+        if det_ok:
             return {
                 "appended": False,
                 "recovered_missing_report": False,
                 "fail_closed": True,
                 "reason": "committed_evidence_without_ledger_records",
-                "detail": f"Committed detached receipt exists for seq={len(prior_records)} while record marker is missing",
+                "detail": str(det_reason or f"Committed detached evidence exists for seq={len(prior_records)}"),
                 "session_date": session_date,
                 "report": None,
                 "report_paths": [],
@@ -1677,8 +1660,10 @@ def _run_daily_drill_cycle_locked(
                     if has_ev:
                         prior_committed_artifacts = True
                         break
-        if not prior_committed_artifacts and _has_committed_detached_receipt(ledger, 0):
-            prior_committed_artifacts = True
+        if not prior_committed_artifacts:
+            has_seq0_ev, _ = has_committed_detached_evidence(ledger, 0)
+            if has_seq0_ev:
+                prior_committed_artifacts = True
         bundle_path = bundle_dir / "replay_bundle.json"
         if not prior_committed_artifacts and bundle_path.is_file():
             try:

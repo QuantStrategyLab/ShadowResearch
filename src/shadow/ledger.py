@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
 from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator
 from shadow.manifest import compute_code_manifest_hash, load_effective_runtime_config
-from shadow.ots import verify_ots_bytes
+from shadow.ots import OtsFormatError, parse_ots_proof, verify_ots_bytes
 from shadow.sizing import (
     INSTRUMENT_ORDER,
     TIER_ORDER,
@@ -976,6 +976,57 @@ def check_forward_clock_credit(
     return len(reasons) == 0, reasons
 
 
+def has_committed_detached_evidence(ledger: "ShadowLedger", seq: int) -> tuple[bool, str | None]:
+    """Detect structured committed .receipt.json, valid OTS binary proof, or unreadable/corrupt detached evidence at seq."""
+    rpath = ledger._receipt_path(seq)
+    if rpath.exists():
+        try:
+            raw_txt = rpath.read_text(encoding="utf-8")
+        except OSError as exc:
+            return True, f"unreadable_detached_receipt_seq_{seq}:{type(exc).__name__}"
+        try:
+            rcp = parse_json_no_duplicates(raw_txt)
+        except Exception:
+            return True, f"corrupt_detached_receipt_seq_{seq}"
+        if isinstance(rcp, dict):
+            anchor = rcp.get("anchor")
+            rec_seq = rcp.get("sequence")
+            rec_sha = rcp.get("record_sha256")
+            rec_ds = rcp.get("session_date")
+            obtained = rcp.get("obtained_at_utc")
+            date_ok = False
+            if isinstance(rec_ds, str) and _DATE_YYYY_MM_DD_RE.fullmatch(rec_ds):
+                try:
+                    date.fromisoformat(rec_ds)
+                    date_ok = True
+                except ValueError:
+                    date_ok = False
+            if (
+                anchor in ("opentimestamps", "synthetic-stub")
+                and not isinstance(rec_seq, bool)
+                and rec_seq == seq
+                and isinstance(rec_sha, str)
+                and _HEX64_RE.fullmatch(rec_sha) is not None
+                and date_ok
+                and is_utc_ms_timestamp(obtained)
+            ):
+                return True, f"committed_detached_receipt_without_record_seq_{seq}"
+
+    opath = ledger._ots_path(seq)
+    if opath.exists():
+        try:
+            raw_ots = opath.read_bytes()
+        except OSError as exc:
+            return True, f"unreadable_detached_ots_seq_{seq}:{type(exc).__name__}"
+        try:
+            parse_ots_proof(raw_ots)
+            return True, f"committed_ots_proof_without_record_seq_{seq}"
+        except OtsFormatError:
+            pass
+
+    return False, None
+
+
 class ShadowLedger:
     """Append-only file-backed SHA-256 hash-chained ledger with detached receipts."""
 
@@ -1144,9 +1195,12 @@ class ShadowLedger:
             rec_path = self._record_path(seq)
             rcp_path = self._receipt_path(seq)
             ots_path = self._ots_path(seq)
-            # seq_NNNNNN.record.json commits BEFORE detached .ots/.receipt so a valid detached receipt without .record.json unambiguously signals a missing committed record.
+            # seq_NNNNNN.record.json commits BEFORE detached .ots/.receipt so valid detached evidence without .record.json unambiguously signals a missing committed record.
             if rec_path.exists():
                 raise LedgerAppendError(f"target_sequence_already_exists: {seq}")
+            has_ev, ev_reason = has_committed_detached_evidence(self, seq)
+            if has_ev:
+                raise LedgerAppendError(f"committed_evidence_exists_without_record:{ev_reason}")
 
             post_marker_writes: list[tuple[Path, bytes]] = []
             if not allow_unanchored:
