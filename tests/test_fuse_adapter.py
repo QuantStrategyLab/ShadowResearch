@@ -815,6 +815,110 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertTrue(rows_ca["V2"]["would_have_tripped"])
         self.assertEqual(rows_ca["V2"]["reason"], "reconciliation_mismatch")
 
+    def test_split_adjusted_fund_return_and_l4_one_session_loss_derivation(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        # 1. Reconciled 2-for-1 TQQQ split (50 -> 25) with omitted fund_return keeps V1 & V2 NORMAL
+        split_in = json.loads(json.dumps(_valid_inputs()))
+        split_in["prior_closes"] = {"TQQQ": "50", "SOXL": "40", "XNDX": "20000", "SEMI": "5000"}
+        split_in["current_index_closes"] = {"XNDX": "20000", "SEMI": "5000"}
+        split_in["funds"]["TQQQ"] = {
+            "s": "1",
+            "close_price": "25",
+            "q_pre": 200,
+            "sigma_forecast": "0.24",
+            "hwm_adjusted": True,
+            "corporate_action": {
+                "type": "split",
+                "ratio": 2,
+                "adjustment_complete": True,
+                "exact_reconciliation": True,
+                "hwm_adjusted": True,
+            },
+        }
+        del split_in["funds"]["SOXL"]["fund_return"]
+        del split_in["funds"]["SOXL"]["index_return"]
+        del split_in["index_one_session_returns"]
+        vin_split = build_fuse_validated_inputs(
+            split_in,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertAlmostEqual(vin_split["funds"]["TQQQ"]["fund_return"], 0.0)
+        rows_split, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_split,
+            {},
+            None,
+        )
+        self.assertEqual(rows_split["V1"]["state"], "NORMAL")
+        self.assertEqual(rows_split["V2"]["state"], "NORMAL")
+
+        # 2. prior_E=50000 -> E=48000 (no external flow) derives one_session_loss=0.04 and trips L4
+        l4_loss_in = json.loads(json.dumps(_valid_inputs()))
+        l4_loss_in["prior_E"] = "50000"
+        l4_loss_in["E"] = "48000"
+        l4_loss_in["E_star"] = "50000"
+        l4_loss_in["L"] = "2000"
+        l4_loss_in["high_water_mark"] = "50000"
+        vin_l4 = build_fuse_validated_inputs(
+            l4_loss_in,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertAlmostEqual(vin_l4["one_session_loss"], 0.04)
+        rows_l4, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_l4,
+            {},
+            None,
+        )
+        self.assertEqual(rows_l4["L4"]["state"], "NO-NEW-RISK")
+        self.assertTrue(rows_l4["L4"]["latched"])
+
+        # 3. Omitting prior_E when L > 0 (not provably zero-loss genesis) fails closed via missing_input
+        missing_prior_in = json.loads(json.dumps(_valid_inputs()))
+        missing_prior_in["E"] = "48000"
+        missing_prior_in["E_star"] = "50000"
+        missing_prior_in["L"] = "2000"
+        vin_missing = build_fuse_validated_inputs(
+            missing_prior_in,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNone(vin_missing["one_session_loss"])
+        rows_missing, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_missing,
+            {},
+            None,
+        )
+        self.assertEqual(rows_missing["L4"]["state"], "NO-NEW-RISK")
+        self.assertEqual(rows_missing["L4"]["reason"], "missing_input")
+
 
 if __name__ == "__main__":
     unittest.main()

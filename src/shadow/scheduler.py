@@ -3132,7 +3132,7 @@ def _run_daily_drill_cycle_locked(
     tqqq_close = by_inst.get("TQQQ", {}).get("normalized_value")
     soxl_close = by_inst.get("SOXL", {}).get("normalized_value")
 
-    session_inputs = {
+    session_inputs: dict[str, object] = {
         "E": "50000",
         "E_star": "50000",
         "H": "0",
@@ -3152,6 +3152,14 @@ def _run_daily_drill_cycle_locked(
             },
         },
     }
+    if head_env is not None:
+        prev_bankroll = (
+            head_env.get("record_body", {}).get("bankroll", {})
+            if isinstance(head_env, Mapping)
+            else {}
+        )
+        if isinstance(prev_bankroll, Mapping) and prev_bankroll.get("E") is not None:
+            session_inputs["prior_E"] = str(prev_bankroll["E"])
     eval_inputs = dict(session_inputs)
     eval_inputs["market_records"] = mkt_recs
     eval_inputs["required_series"] = required_for_eval

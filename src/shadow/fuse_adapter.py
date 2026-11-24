@@ -20,6 +20,7 @@ from shadow.sizing import (
     TIER_CONFIGS,
     SizingInputError,
     canonical_decimal_str,
+    compute_raw_vs_adjusted_separation,
     compute_tier_max_loss_fraction,
 )
 
@@ -629,6 +630,81 @@ def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
     return float((cur_d - prev_d) / prev_d)
 
 
+def _compute_ca_adjusted_fund_return(
+    cur_raw: object,
+    prev_raw: object,
+    ca_obj: object,
+) -> float | None:
+    """Derive 1-session fund return from closes, adjusting prior close for splits/distributions."""
+    if ca_obj is None:
+        return _compute_return_ratio(cur_raw, prev_raw)
+    if not isinstance(ca_obj, Mapping):
+        return None
+    cur_f = _finite_number(cur_raw)
+    prev_f = _finite_number(prev_raw)
+    if cur_f is None or prev_f is None or prev_f <= 0.0:
+        return None
+    cur_d = Decimal(str(cur_raw))
+    prev_d = Decimal(str(prev_raw))
+    ca_type = ca_obj.get("type")
+    if ca_type in ("split", "reverse_split"):
+        ratio_f = _finite_number(ca_obj.get("ratio"))
+        if ratio_f is None or ratio_f <= 0.0:
+            return None
+        prev_adj = prev_d / Decimal(str(ca_obj.get("ratio")))
+        if prev_adj <= 0:
+            return None
+        return float((cur_d - prev_adj) / prev_adj)
+    if ca_type in ("distribution", "cash_distribution", "dividend"):
+        cash_f = _finite_number(ca_obj.get("cash_per_share_usd"))
+        if cash_f is None or cash_f < 0.0:
+            return None
+        cash_d = Decimal(str(ca_obj.get("cash_per_share_usd")))
+        return float((cur_d + cash_d - prev_d) / prev_d)
+    return None
+
+
+def _derive_one_session_loss(session_inputs: Mapping[str, Any]) -> float | None:
+    """Derive L4 one_session_loss from prior_E / external_flow when omitted; return None if undeterminable."""
+    if "one_session_loss" in session_inputs:
+        return _finite_number(session_inputs.get("one_session_loss"))
+    e_f = _finite_number(session_inputs.get("E"))
+    if e_f is None or e_f <= 0.0:
+        return None
+    raw_ext = session_inputs.get("external_flow", "0")
+    ext_f = _finite_number(raw_ext)
+    if ext_f is None:
+        return None
+    raw_prior_e = session_inputs.get("prior_E")
+    if raw_prior_e is not None:
+        pe_f = _finite_number(raw_prior_e)
+        if pe_f is None or pe_f <= 0.0:
+            return None
+        try:
+            rva = compute_raw_vs_adjusted_separation(
+                Decimal(str(session_inputs["E"])),
+                Decimal(str(raw_prior_e)),
+                Decimal(str(raw_ext)),
+            )
+            adj_str = rva.get("adjusted_return_pct")
+            if not isinstance(adj_str, str):
+                return None
+            return float(max(Decimal("0"), -Decimal(adj_str)))
+        except (SizingInputError, ArithmeticError, ValueError):
+            return None
+    if (
+        _finite_number(session_inputs.get("E_star")) is not None
+        and _finite_number(session_inputs.get("L")) is not None
+    ):
+        e_d = Decimal(str(session_inputs["E"]))
+        es_d = Decimal(str(session_inputs["E_star"]))
+        l_d = Decimal(str(session_inputs["L"]))
+        ext_d = Decimal(str(raw_ext))
+        if e_d == es_d and l_d == Decimal("0") and ext_d == Decimal("0"):
+            return 0.0
+    return None
+
+
 def _map_market_corporate_action(mca: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(mca, Mapping):
         return None
@@ -844,11 +920,22 @@ def build_fuse_validated_inputs(
         if long_run_vol is None:
             long_run_vol = 0.24
 
+        # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
+        ca_obj = copy.deepcopy(fdata.get("corporate_action"))
+        if ca_obj is None and symbol in by_inst:
+            ca_obj = _map_market_corporate_action(
+                by_inst[symbol].get("corporate_action")  # type: ignore[arg-type]
+            )
+
         # Derive 1-session fund and benchmark index returns from real closes when not explicitly given
         if fdata.get("fund_return") is not None:
             fund_ret_val = _finite_number(fdata.get("fund_return"))
         elif symbol in prior_closes and fdata.get("close_price") is not None:
-            fund_ret_val = _compute_return_ratio(fdata.get("close_price"), prior_closes.get(symbol))
+            fund_ret_val = _compute_ca_adjusted_fund_return(
+                fdata.get("close_price"),
+                prior_closes.get(symbol),
+                ca_obj,
+            )
         else:
             fund_ret_val = None
 
@@ -859,13 +946,6 @@ def build_fuse_validated_inputs(
             idx_ret_val = _compute_return_ratio(cur_closes.get(bench_inst), prior_closes.get(bench_inst))
         else:
             idx_ret_val = None
-
-        # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
-        ca_obj = copy.deepcopy(fdata.get("corporate_action"))
-        if ca_obj is None and symbol in by_inst:
-            ca_obj = _map_market_corporate_action(
-                by_inst[symbol].get("corporate_action")  # type: ignore[arg-type]
-            )
 
         broker_pos_val = (
             _resolve_tier_quantity(fdata.get("broker_position"), tier)
@@ -975,7 +1055,7 @@ def build_fuse_validated_inputs(
         "tier_joint_cap": tier_joint_cap,
         "max_loss_cap": max_loss_cap,
         "proposed_exposure": _finite_number(session_inputs.get("proposed_exposure")) if session_inputs.get("proposed_exposure") is not None else joint_exposure,
-        "one_session_loss": _finite_number(session_inputs.get("one_session_loss")) if session_inputs.get("one_session_loss") is not None else 0.0,
+        "one_session_loss": _derive_one_session_loss(session_inputs),
         "market_halt_level": session_inputs.get("market_halt_level", None),
         "index_one_session_returns": idx_returns,
         "funds": fuse_funds,

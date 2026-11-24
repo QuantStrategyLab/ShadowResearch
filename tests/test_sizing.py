@@ -435,6 +435,48 @@ class SizingStackTest(unittest.TestCase):
                 self.assertNotEqual(policy_config_hash(repo_root=tmp_repo), base_policy, mod)
                 target.write_text(orig, encoding="utf-8")
 
+    def test_halted_fund_holdings_reserved_against_joint_cap_and_weight_ceil(self) -> None:
+        # Codex P2 regression (PRRT_kwDOV2RNAc67oejF): balanced $50k with 500 TQQQ ($25k) under
+        # V2 fund-scoped HALT and 0 SOXL must reserve frozen TQQQ exposure so SOXL cannot buy.
+        overweight_halt = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                L="0",
+                p_tqqq="50",
+                q_pre_tqqq=500,
+                p_soxl="40",
+                q_pre_soxl=0,
+            ),
+            active_control_state="NORMAL",
+            fund_control_states={"TQQQ": "HALT", "SOXL": "NORMAL"},
+        )
+        bal_over = _tier(overweight_halt, "balanced")
+        self.assertEqual(_fund(bal_over, "TQQQ")["delta_q_exec"], 0)
+        self.assertEqual(_fund(bal_over, "SOXL")["q_ideal"], 0)
+        self.assertEqual(_fund(bal_over, "SOXL")["delta_q_exec"], 0)
+
+        # Partial frozen TQQQ ($2,500 => x_cur = 0.15) leaves x_ML - 0.15 = 0.051289... headroom
+        partial_halt = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                L="0",
+                p_tqqq="50",
+                q_pre_tqqq=50,
+                p_soxl="40",
+                q_pre_soxl=0,
+            ),
+            active_control_state="NORMAL",
+            fund_control_states={"TQQQ": "HALT", "SOXL": "NORMAL"},
+        )
+        bal_part = _tier(partial_halt, "balanced")
+        soxl_part = _fund(bal_part, "SOXL")
+        tqqq_x_cur = Decimal("3") * (Decimal("2500") / Decimal("50000"))
+        total_beta_post = tqqq_x_cur + Decimal("1.5") * Decimal(soxl_part["x_post_joint"])
+        self.assertLessEqual(total_beta_post, Decimal(bal_part["x_ML"]) + Decimal("0.000002"))
+        self.assertEqual(_fund(bal_part, "TQQQ")["delta_q_exec"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

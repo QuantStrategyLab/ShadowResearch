@@ -535,42 +535,20 @@ def compute_session_sizing(
                 denom = beta_soxl if inst == "SOXL" else Decimal("1")
                 x_pre[inst] = (s_i * cap_23 * v_i) / denom
 
-            # Step 7: Joint cap with OQ-1 resolution
-            x_eff_joint = min(x_joint, x_ml)
-            soxl_subcap_limit = x_eff_joint / Decimal("3")
-            soxl_beta_pre = beta_soxl * x_pre["SOXL"]
-            soxl_subcap_bound = soxl_beta_pre > soxl_subcap_limit
-            x_soxl_mid = min(soxl_beta_pre, soxl_subcap_limit) / beta_soxl
-            x_joint_beta = x_pre["TQQQ"] + beta_soxl * x_soxl_mid
-
-            if x_joint_beta <= x_eff_joint:
-                alpha_joint = Decimal("1")
-                x_post = {"TQQQ": x_pre["TQQQ"], "SOXL": x_soxl_mid}
-                joint_cap_bound = False
-            else:
-                alpha_joint = x_eff_joint / x_joint_beta
-                x_post = {
-                    "TQQQ": alpha_joint * x_pre["TQQQ"],
-                    "SOXL": alpha_joint * x_soxl_mid,
-                }
-                joint_cap_bound = True
-
-            # Step 8: Account fund weights & combined hard ceiling min(w_max, 1.00)
-            w_raw = {
-                inst: (x_post[inst] / Decimal("3")) * conv_scale
+            eff_states: dict[str, str] = {
+                inst: _most_restrictive_sizing_state(
+                    active_control_state,
+                    (fund_control_states or {}).get(inst),
+                )
                 for inst in INSTRUMENT_ORDER
             }
-            w_ceil = min(w_max, Decimal("1.00"))
-            w_raw_sum = w_raw["TQQQ"] + w_raw["SOXL"]
-            if w_raw_sum > w_ceil and w_raw_sum > 0:
-                w_scale = w_ceil / w_raw_sum
-                w_target = {inst: w_raw[inst] * w_scale for inst in INSTRUMENT_ORDER}
-                w_max_bound = True
-            else:
-                w_target = w_raw
-                w_max_bound = False
+            frozen_insts = {
+                inst
+                for inst in INSTRUMENT_ORDER
+                if eff_states[inst] in ("HALT", "ORDER-UNKNOWN")
+            }
 
-            # Current weights and exposures for Step 9 mandatory bypass evaluation
+            # Current weights and exposures for Step 9 mandatory bypass & frozen-holding reservation
             w_cur_map = {
                 inst: (Decimal(q_pre_map[inst]) * fund_parsed[inst]["close_price"]) / e_val  # type: ignore[operator]
                 for inst in INSTRUMENT_ORDER
@@ -580,7 +558,119 @@ def compute_session_sizing(
                 for inst in INSTRUMENT_ORDER
             }
             w_cur_sum = w_cur_map["TQQQ"] + w_cur_map["SOXL"]
+
+            # Step 7: Joint cap with OQ-1 resolution (and frozen HALT/ORDER-UNKNOWN reservation)
+            x_eff_joint = min(x_joint, x_ml)
+            soxl_subcap_limit = x_eff_joint / Decimal("3")
+            w_ceil = min(w_max, Decimal("1.00"))
             joint_cur_exceeded = (x_cur_map["TQQQ"] + beta_soxl * x_cur_map["SOXL"]) > x_eff_joint
+
+            if not frozen_insts:
+                soxl_beta_pre = beta_soxl * x_pre["SOXL"]
+                soxl_subcap_bound = soxl_beta_pre > soxl_subcap_limit
+                x_soxl_mid = min(soxl_beta_pre, soxl_subcap_limit) / beta_soxl
+                x_joint_beta = x_pre["TQQQ"] + beta_soxl * x_soxl_mid
+
+                if x_joint_beta <= x_eff_joint:
+                    alpha_joint = Decimal("1")
+                    x_post = {"TQQQ": x_pre["TQQQ"], "SOXL": x_soxl_mid}
+                    joint_cap_bound = False
+                else:
+                    alpha_joint = x_eff_joint / x_joint_beta
+                    x_post = {
+                        "TQQQ": alpha_joint * x_pre["TQQQ"],
+                        "SOXL": alpha_joint * x_soxl_mid,
+                    }
+                    joint_cap_bound = True
+
+                # Step 8: Account fund weights & combined hard ceiling min(w_max, 1.00)
+                w_raw = {
+                    inst: (x_post[inst] / Decimal("3")) * conv_scale
+                    for inst in INSTRUMENT_ORDER
+                }
+                w_raw_sum = w_raw["TQQQ"] + w_raw["SOXL"]
+                if w_raw_sum > w_ceil and w_raw_sum > 0:
+                    w_scale = w_ceil / w_raw_sum
+                    w_target = {inst: w_raw[inst] * w_scale for inst in INSTRUMENT_ORDER}
+                    w_max_bound = True
+                else:
+                    w_target = w_raw
+                    w_max_bound = False
+            else:
+                frozen_joint_beta = sum(
+                    (beta_soxl if inst == "SOXL" else Decimal("1")) * x_cur_map[inst]
+                    for inst in frozen_insts
+                )
+                rem_joint = max(Decimal("0"), x_eff_joint - frozen_joint_beta)
+                active_insts = [
+                    inst
+                    for inst in INSTRUMENT_ORDER
+                    if inst not in frozen_insts and eff_states[inst] != "DE-RISK"
+                ]
+                soxl_beta_pre = beta_soxl * x_pre["SOXL"]
+                soxl_subcap_bound = (
+                    "SOXL" in active_insts and soxl_beta_pre > soxl_subcap_limit
+                )
+                x_mid = {
+                    inst: (
+                        min(soxl_beta_pre, soxl_subcap_limit) / beta_soxl
+                        if inst == "SOXL"
+                        else x_pre[inst]
+                    )
+                    for inst in active_insts
+                }
+                active_joint_beta = sum(
+                    (beta_soxl if inst == "SOXL" else Decimal("1")) * x_mid[inst]
+                    for inst in active_insts
+                )
+                if active_joint_beta <= rem_joint:
+                    alpha_joint = Decimal("1")
+                    x_post_active = dict(x_mid)
+                    joint_cap_bound = False
+                elif rem_joint == 0 or active_joint_beta <= 0:
+                    alpha_joint = Decimal("0")
+                    x_post_active = {inst: Decimal("0") for inst in active_insts}
+                    joint_cap_bound = True
+                else:
+                    alpha_joint = rem_joint / active_joint_beta
+                    x_post_active = {inst: alpha_joint * x_mid[inst] for inst in active_insts}
+                    joint_cap_bound = True
+                x_post = {
+                    inst: (
+                        x_cur_map[inst]
+                        if inst in frozen_insts
+                        else x_post_active.get(inst, Decimal("0"))
+                    )
+                    for inst in INSTRUMENT_ORDER
+                }
+
+                frozen_w_sum = sum(w_cur_map[inst] for inst in frozen_insts)
+                rem_w_ceil = max(Decimal("0"), w_ceil - frozen_w_sum)
+                w_raw_active = {
+                    inst: (x_post[inst] / Decimal("3")) * conv_scale
+                    for inst in active_insts
+                }
+                w_raw_active_sum = sum(w_raw_active.values())
+                if w_raw_active_sum > rem_w_ceil:
+                    w_max_bound = True
+                    if rem_w_ceil == 0 or w_raw_active_sum <= 0:
+                        w_target_active = {inst: Decimal("0") for inst in active_insts}
+                    else:
+                        w_scale = rem_w_ceil / w_raw_active_sum
+                        w_target_active = {
+                            inst: w_raw_active[inst] * w_scale for inst in active_insts
+                        }
+                else:
+                    w_max_bound = False
+                    w_target_active = w_raw_active
+                w_target = {
+                    inst: (
+                        w_cur_map[inst]
+                        if inst in frozen_insts
+                        else w_target_active.get(inst, Decimal("0"))
+                    )
+                    for inst in INSTRUMENT_ORDER
+                }
 
             funds_out: list[dict] = []
             for inst in INSTRUMENT_ORDER:
@@ -597,10 +687,7 @@ def compute_session_sizing(
                 kelly_cf_x = (s_i * min(x_cap, x_ml, x_k_c) * v_i) / denom
                 kelly_would_bind = kelly_cf_x < x_p
 
-                eff_state = _most_restrictive_sizing_state(
-                    active_control_state,
-                    (fund_control_states or {}).get(inst),
-                )
+                eff_state = eff_states[inst]
                 w_tgt = w_target[inst]
                 if eff_state == "DE-RISK":
                     w_tgt_eff = Decimal("0")

@@ -2250,6 +2250,14 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertEqual(v4_dl["reason"], "volatility_below_2x_but_not_yet_cleared")
             self.assertEqual(v4_dl["outputs"]["TQQQ"]["clearing_counter"], 1)
 
+    def test_production_treasury_endpoint_uses_par_yield_dataset(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        endpoint = str(raw_cfg.get("treasury_endpoint", ""))
+        self.assertIn("type=daily_treasury_yield_curve", endpoint)
+        self.assertNotIn("daily_treasury_bill_rates", endpoint)
+
 
 if __name__ == "__main__":
     unittest.main()
