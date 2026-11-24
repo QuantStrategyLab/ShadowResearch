@@ -3140,6 +3140,35 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(a2["silent_missed_days"], ["2025-11-24"])
             self.assertIn("2025-11-24", a2["failed_days"])
 
+            # 3. R14 #1: Detecting any of the above under a tightened cutoff (16:30 / 17:00 ET) MUST still exit 2!
+            raw_tight = json.loads(DEFAULT_SCHEDULER_CONFIG_PATH.read_text(encoding="utf-8"))
+            raw_tight["decision_instant_et"] = "16:30"
+            raw_tight["decision_cutoff_et"] = "17:00"
+            raw_tight["treasury_endpoint"] = "https://treasury.example.test/yield{year}.csv"
+            tight_cfg_path = root / "tight_1700.json"
+            tight_cfg_path.write_text(json.dumps(raw_tight), encoding="utf-8")
+            for target_dir in (unanchored_crash_dir, ots_only_dir):
+                out_t = io.StringIO()
+                with contextlib.redirect_stdout(out_t):
+                    rc_t = sched_mod.main(
+                        [
+                            "detect-missed",
+                            "--config",
+                            str(tight_cfg_path),
+                            "--start-date",
+                            "2025-11-24",
+                            "--as-of-utc",
+                            "2025-11-25T05:00:00.000Z",
+                            "--data-dir",
+                            str(target_dir),
+                        ]
+                    )
+                at = json.loads(out_t.getvalue())
+                self.assertEqual(rc_t, 2)
+                self.assertTrue(at["missed_run_detected"])
+                self.assertEqual(at["silent_missed_days"], ["2025-11-24"])
+                self.assertIn("2025-11-24", at["failed_days"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2403,92 +2403,91 @@ def detect_missed_runs(
         if env is not None:
             body = env["record_body"]
             seq = body["sequence"]
-            if body["decision_timestamp_utc"] > deadline_utc:
+            if not bundle_ok or bundle_obj_validated is None:
+                status = (
+                    "incomplete_missing_replay_bundle"
+                    if bundle_err == "missing_replay_bundle_for_non_empty_ledger"
+                    else "incomplete_or_corrupt_replay_bundle"
+                )
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = str(bundle_err or "committed_record_missing_valid_replay_bundle")
+            elif (bundle_cfg_err := _bundle_deadline_config_mismatch(bundle_obj_validated, cfg)) is not None:
+                status = "incomplete_or_corrupt_replay_bundle"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = bundle_cfg_err
+            elif body["decision_timestamp_utc"] > deadline_utc:
                 status = "backfill_anomaly"
                 backfill_anomalies.append(ds)
                 failed_days.append(ds)
                 detail = "decision_timestamp_after_commitment_deadline"
-            elif body["decision_timestamp_utc"] > deadlines["decision_cutoff_utc"]:
-                status = "failed_documented"
-                failed_days.append(ds)
-                detail = "decision_timestamp_after_decision_cutoff"
             else:
-                if not bundle_ok or bundle_obj_validated is None:
-                    status = (
-                        "incomplete_missing_replay_bundle"
-                        if bundle_err == "missing_replay_bundle_for_non_empty_ledger"
-                        else "incomplete_or_corrupt_replay_bundle"
-                    )
+                b_sess = bundle_obj_validated["sessions"][seq]
+                bmkt = b_sess["market_records"]
+                expected_consecutive = _count_consecutive_trading_sessions(
+                    [r for r in records if r["record_body"]["sequence"] < seq],
+                    ds,
+                    spec,
+                    cfg.venue,
+                    current_appended=True,
+                )
+                rep_valid_vs_ledger = _is_committed_session_report_valid(
+                    reports_dir,
+                    ds,
+                    env,
+                    committed_mkt_records=bmkt,
+                    deadlines=deadlines,
+                    cfg=cfg,
+                    cal=cal,
+                    ledger=ledger,
+                    expected_consecutive_count=expected_consecutive,
+                )
+                if not rep_valid_vs_ledger:
+                    status = "incomplete_missing_completeness_report"
                     silent_missed_days.append(ds)
                     failed_days.append(ds)
-                    detail = str(bundle_err or "committed_record_missing_valid_replay_bundle")
-                elif (bundle_cfg_err := _bundle_deadline_config_mismatch(bundle_obj_validated, cfg)) is not None:
-                    status = "incomplete_or_corrupt_replay_bundle"
-                    silent_missed_days.append(ds)
+                    detail = "committed_record_missing_valid_completeness_report"
+                elif body["decision_timestamp_utc"] > deadlines["decision_cutoff_utc"]:
+                    status = "failed_documented"
                     failed_days.append(ds)
-                    detail = bundle_cfg_err
+                    detail = "decision_timestamp_after_decision_cutoff"
                 else:
-                    b_sess = bundle_obj_validated["sessions"][seq]
-                    bmkt = b_sess["market_records"]
-                    expected_consecutive = _count_consecutive_trading_sessions(
-                        [r for r in records if r["record_body"]["sequence"] < seq],
-                        ds,
-                        spec,
-                        cfg.venue,
-                        current_appended=True,
-                    )
-                    rep_valid_vs_ledger = _is_committed_session_report_valid(
-                        reports_dir,
-                        ds,
-                        env,
-                        committed_mkt_records=bmkt,
-                        deadlines=deadlines,
-                        cfg=cfg,
-                        cal=cal,
-                        ledger=ledger,
-                        expected_consecutive_count=expected_consecutive,
-                    )
-                    if not rep_valid_vs_ledger:
-                        status = "incomplete_missing_completeness_report"
-                        silent_missed_days.append(ds)
+                    rpath = ledger._receipt_path(seq)
+                    opath = ledger._ots_path(seq)
+                    if not rpath.is_file():
+                        status = "failed_documented"
                         failed_days.append(ds)
-                        detail = "committed_record_missing_valid_completeness_report"
+                        detail = "missing_detached_receipt"
                     else:
-                        rpath = ledger._receipt_path(seq)
-                        opath = ledger._ots_path(seq)
-                        if not rpath.is_file():
-                            status = "failed_documented"
+                        try:
+                            rcp = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
+                            ots_bytes = opath.read_bytes() if opath.is_file() else None
+                        except Exception as exc:
+                            status = "incomplete_or_corrupt_replay_bundle"
+                            silent_missed_days.append(ds)
                             failed_days.append(ds)
-                            detail = "missing_detached_receipt"
+                            detail = f"unreadable_or_corrupt_detached_receipt:{type(exc).__name__}"
                         else:
-                            try:
-                                rcp = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
-                                ots_bytes = opath.read_bytes() if opath.is_file() else None
-                            except Exception as exc:
-                                status = "incomplete_or_corrupt_replay_bundle"
-                                silent_missed_days.append(ds)
+                            ok_rcp, err_rcp = verify_receipt(env, rcp, ots_bytes=ots_bytes)
+                            timely, err_timely = is_receipt_timely(
+                                rcp,
+                                expected_commitment_deadline_utc=deadline_utc,
+                                decision_timestamp_utc=body.get("decision_timestamp_utc"),
+                                require_expected_deadline=True,
+                            )
+                            if not ok_rcp:
+                                status = "failed_documented"
                                 failed_days.append(ds)
-                                detail = f"unreadable_or_corrupt_detached_receipt:{type(exc).__name__}"
+                                detail = str(err_rcp)
+                            elif not timely:
+                                status = "failed_documented"
+                                failed_days.append(ds)
+                                detail = str(err_timely)
                             else:
-                                ok_rcp, err_rcp = verify_receipt(env, rcp, ots_bytes=ots_bytes)
-                                timely, err_timely = is_receipt_timely(
-                                    rcp,
-                                    expected_commitment_deadline_utc=deadline_utc,
-                                    decision_timestamp_utc=body.get("decision_timestamp_utc"),
-                                    require_expected_deadline=True,
-                                )
-                                if not ok_rcp:
-                                    status = "failed_documented"
-                                    failed_days.append(ds)
-                                    detail = str(err_rcp)
-                                elif not timely:
-                                    status = "failed_documented"
-                                    failed_days.append(ds)
-                                    detail = str(err_timely)
-                                else:
-                                    status = "ok"
-                                    ok_days.append(ds)
-                                    detail = "appended_with_timely_receipt"
+                                status = "ok"
+                                ok_days.append(ds)
+                                detail = "appended_with_timely_receipt"
         elif rep_obj is not None:
             rep_created = rep_obj.get("created_at_utc")
             rep_ledger = rep_obj.get("ledger") if isinstance(rep_obj.get("ledger"), dict) else {}
