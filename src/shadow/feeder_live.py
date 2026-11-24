@@ -16,7 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
+from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_previous_trading_date, resolve_session
 from shadow.feeder import (
     DEMO_SERIES,
     SeriesSpec,
@@ -683,12 +683,22 @@ def emit_live_market_records(
     missing_reasons: dict[str, tuple[str, dict]] = {}
     per_inst_retrieval_utc: dict[str, str] = {}
     utc_fn = utc_clock if utc_clock is not None else (lambda: datetime.now(timezone.utc))
+    prev_trading_date = resolve_previous_trading_date(spec, "XNYS", session_date)
+    tiingo_lookback_days = (
+        max(0, (date.fromisoformat(session_date) - date.fromisoformat(prev_trading_date)).days)
+        if prev_trading_date is not None
+        else 0
+    )
 
     for inst, series_id, kind in LIVE_SERIES:
         provider = LIVE_PROVIDERS[inst]
         try:
             if kind == "etf_tiingo":
-                payloads[inst] = tiingo.fetch_bytes_for_session(series_id, session_date)
+                payloads[inst] = tiingo.fetch_bytes_for_session(
+                    series_id,
+                    session_date,
+                    lookback_days=tiingo_lookback_days,
+                )
             elif kind == "idx_yahoo":
                 payloads[inst] = yahoo.fetch_bytes_for_session(series_id, session_date)
             elif kind == "rate_sofr":

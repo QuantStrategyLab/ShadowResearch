@@ -674,9 +674,10 @@ def build_fuse_validated_inputs(
         merged.setdefault("registered_policy_hash", policy_hash)
         return merged
 
-    if any(
-        k in session_inputs
-        for k in ("bankroll", "high_water_mark", "source_records", "session_calendar_status")
+    if (
+        "bankroll" in session_inputs
+        and "session_calendar_status" in session_inputs
+        and "E" not in session_inputs
     ):
         direct = copy.deepcopy(dict(session_inputs))
         direct.setdefault("tier", "balanced")

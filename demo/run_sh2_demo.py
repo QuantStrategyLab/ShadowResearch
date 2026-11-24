@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -181,6 +182,25 @@ def _build_two_day_payloads(
     return out
 
 
+def _filter_tiingo_payload_by_url(raw_bytes: bytes, url: str) -> bytes:
+    parsed = urllib.parse.urlsplit(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    start_ds = qs.get("startDate", [None])[0]
+    end_ds = qs.get("endDate", [None])[0]
+    if not start_ds and not end_ds:
+        return raw_bytes
+    rows = json.loads(raw_bytes.decode("utf-8"))
+    filtered = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("date"), str)
+        and (start_ds is None or row["date"][:10] >= start_ds)
+        and (end_ds is None or row["date"][:10] <= end_ds)
+    ]
+    return json.dumps(filtered).encode("utf-8")
+
+
 def build_live_mock_transport(
     session_date: str,
     *,
@@ -198,11 +218,11 @@ def build_live_mock_transport(
         low_url = url.lower()
         if "api.tiingo.com" in low_url:
             if "/tqqq/" in low_url:
-                return 200, payloads["TQQQ"]
+                return 200, _filter_tiingo_payload_by_url(payloads["TQQQ"], url)
             if "/soxl/" in low_url:
-                return 200, payloads["SOXL"]
+                return 200, _filter_tiingo_payload_by_url(payloads["SOXL"], url)
             if "/qqq/" in low_url:
-                return 200, payloads["QQQ"]
+                return 200, _filter_tiingo_payload_by_url(payloads["QQQ"], url)
         if "finance.yahoo.com" in low_url:
             if "xndx" in low_url:
                 return 200, payloads["XNDX"]

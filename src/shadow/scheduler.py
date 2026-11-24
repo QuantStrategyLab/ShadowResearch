@@ -2302,6 +2302,7 @@ def _reconcile_committed_state_snapshot_if_missing(
                 rec_inputs[ctx_key] = fctx[ctx_key]
 
     ev = VendoredFuseEvaluator()
+    ex_cal = cal if str(cal.get("date", "")) == ex_sess_date else resolve_session(cfg.venue, ex_sess_date, spec=spec)
     rebuilt = build_record_body(
         chain_id=cfg.chain_id,
         sequence=ex_seq,
@@ -2310,7 +2311,7 @@ def _reconcile_committed_state_snapshot_if_missing(
         session_date=str(ex_body["session_date"]),
         decision_timestamp_utc=str(ex_body["decision_timestamp_utc"]),
         session_inputs=rec_inputs,
-        calendar_session=cal,
+        calendar_session=ex_cal,
         code_version_sha=str(ex_body["code_version_sha"]),
         evaluator=ev,
         prior_row_state=prior_state,
@@ -2336,6 +2337,70 @@ def _reconcile_committed_state_snapshot_if_missing(
         committed_seq=ex_seq,
         committed_session_date=ex_sess_date,
         expected_chain_id=cfg.chain_id,
+    )
+
+
+def _reconcile_uncommitted_staged_snapshots(
+    *,
+    snapshots_dir: Path,
+    ledger: ShadowLedger,
+    bundle_obj: dict | None,
+    prior_records: list[dict],
+    cfg: DrillSchedulerConfig,
+    spec: dict,
+) -> None:
+    """Prune uncommitted staged seq snapshots and restore latest.state.json to committed head."""
+    if not snapshots_dir.is_dir():
+        return
+    committed_len = len(prior_records)
+    removed_uncommitted = False
+    for cand in sorted(snapshots_dir.iterdir()):
+        if not cand.is_file():
+            continue
+        m = re.fullmatch(r"seq_(\d{6})\.state\.json", cand.name)
+        if m is not None and int(m.group(1)) >= committed_len:
+            cand.unlink(missing_ok=True)
+            removed_uncommitted = True
+
+    latest_path = snapshots_dir / "latest.state.json"
+    if not latest_path.is_file():
+        return
+    latest_obj: dict | None = None
+    latest_unparseable = False
+    try:
+        parsed = parse_json_no_duplicates(latest_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            latest_obj = parsed
+    except Exception:
+        latest_unparseable = True
+
+    latest_is_uncommitted = bool(
+        latest_obj is not None
+        and latest_obj.get("chain_id") == cfg.chain_id
+        and isinstance(latest_obj.get("sequence"), int)
+        and not isinstance(latest_obj.get("sequence"), bool)
+        and latest_obj["sequence"] >= committed_len
+    ) or (removed_uncommitted and latest_unparseable)
+
+    if not latest_is_uncommitted:
+        return
+    if committed_len == 0:
+        latest_path.unlink(missing_ok=True)
+        return
+    head_idx = committed_len - 1
+    head_env = prior_records[head_idx]
+    head_sess = str(head_env["record_body"]["session_date"])
+    head_cal = resolve_session(cfg.venue, head_sess, spec=spec)
+    _reconcile_committed_state_snapshot_if_missing(
+        snapshots_dir=snapshots_dir,
+        ledger=ledger,
+        bundle_obj=bundle_obj,
+        prior_records=prior_records,
+        ex_seq=head_idx,
+        existing_env=head_env,
+        cfg=cfg,
+        spec=spec,
+        cal=head_cal,
     )
 
 
@@ -2390,10 +2455,16 @@ def _authenticate_production_history(
         else:
             ex_seq = existing_env["record_body"]["sequence"]
             ex_prev = existing_env["record_body"]["prev_record_sha256"]
-            if ex_seq != len(prior_records) - 1 or expected_prior_head_sha256 not in (
-                existing_env["record_sha256"],
-                ex_prev,
-            ):
+            if ex_seq != len(prior_records) - 1:
+                raise EngineIdentityError("production_trusted_head_mismatch")
+            if expected_prior_head_sha256 == existing_env["record_sha256"]:
+                pass
+            elif expected_prior_head_sha256 == ex_prev:
+                if bitcoin_merkle_roots is None:
+                    raise EngineIdentityError(
+                        "production_retry_unauthenticated_head: require current record_sha256 or bitcoin_merkle_roots"
+                    )
+            else:
                 raise EngineIdentityError("production_trusted_head_mismatch")
 
     if bitcoin_merkle_roots is not None:
@@ -2626,6 +2697,15 @@ def _run_daily_drill_cycle_locked(
                 or (reports_dir / f"completeness_{session_date}.md").exists(),
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
+
+    _reconcile_uncommitted_staged_snapshots(
+        snapshots_dir=root / "state_snapshots",
+        ledger=ledger,
+        bundle_obj=bundle_obj_validated,
+        prior_records=prior_records,
+        cfg=cfg,
+        spec=spec,
+    )
 
     # 3b. Reconcile already-committed session if completeness report is missing, invalid, or out-of-sync with ledger+bundle
     existing_env = next(

@@ -8,9 +8,10 @@
 # - One-time genesis initialization (seq=0 on empty SHADOW_DATA_DIR): set
 #   SHADOW_TRUSTED_HEAD_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
 #   (GENESIS_PREV_HASH) once, then replace or remove it after seq=0 commits.
-# - Recurring runs (seq >= 1): set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret Manager) to the
-#   latest committed head and/or SHADOW_BITCOIN_MERKLE_ROOTS_PATH outside SHADOW_DATA_DIR WITHOUT
-#   keeping the zero genesis marker, so an emptied/wiped bucket fails closed with exit 3.
+# - Recurring runs & retries (seq >= 1): set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret Manager)
+#   to the latest committed head (including for same-session retries unless external
+#   SHADOW_BITCOIN_MERKLE_ROOTS_PATH independently attests the committed record) WITHOUT keeping the
+#   zero genesis marker, so an emptied/wiped bucket or forged same-session record fails closed (exit 3).
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:

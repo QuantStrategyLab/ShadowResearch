@@ -612,6 +612,76 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertGreater(by_sym["SOXL"]["q_ideal"], 0)
         self.assertGreater(by_sym["SOXL"]["delta_q_exec"], 0)
 
+    def test_shadow_optional_hwm_and_source_records_translate_without_native_misclassification(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        shadow_opt = json.loads(json.dumps(_valid_inputs()))
+        shadow_opt["high_water_mark"] = "50000"
+        shadow_opt["source_records"] = {
+            "positions": {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0},
+            "broker_reconciliation": {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0},
+        }
+        del shadow_opt["positions_source_record"]
+        del shadow_opt["broker_reconciliation_source_record"]
+
+        vin = build_fuse_validated_inputs(
+            shadow_opt,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        rows, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NORMAL")
+        self.assertEqual(rows["O2"]["state"], "NORMAL")
+
+        built = build_record_body(
+            chain_id="prod-opt-fields",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=shadow_opt,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec,
+        )
+        self.assertTrue(built["appended"])
+
+        # Explicit native FUSE pass-through still works via fuse_inputs or native schema without E
+        vin_native = build_fuse_validated_inputs(
+            {"fuse_inputs": vin},
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_native["bankroll"], 50000.0)
+        direct_native = {k: v for k, v in vin.items() if k not in ("loaded_policy_hash", "registered_policy_hash")}
+        vin_direct = build_fuse_validated_inputs(
+            direct_native,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_direct["loaded_policy_hash"], "p")
+
 
 if __name__ == "__main__":
     unittest.main()

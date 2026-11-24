@@ -1644,8 +1644,78 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertEqual(r1["sequence"], 1)
             seq1_sha = r1["record_sha256"]
 
-            # 5. Idempotent retry of seq=1 accepts either pre-run seq0_sha or seq1_sha
-            for trusted_sha in (seq0_sha, seq1_sha):
+            # 5. Same-session retry requires current record_sha256 OR external BTC roots;
+            # ex_prev (seq0_sha) alone fails closed against forged same-session substitution
+            with self.assertRaises(EngineIdentityError) as stale_retry_ctx:
+                run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                    expected_prior_head_sha256=seq0_sha,
+                )
+            self.assertIn("production_retry_unauthenticated_head", str(stale_retry_ctx.exception))
+
+            # Reproduce forged same-session record/receipt + deleted report using unchanged seq0_sha
+            forged_root = Path(tmpdir) / "forged_retry_root"
+            shutil.copytree(root, forged_root)
+            forged_ledger = ShadowLedger(forged_root / "ledger")
+            forged_recs = forged_ledger.load_records()
+            forged_body = json.loads(json.dumps(forged_recs[1]["record_body"]))
+            forged_o8 = next(b for b in forged_body["evaluator"]["breakers"] if b["id"] == "O8")
+            forged_o8["state"] = "NO-NEW-RISK"
+            forged_o8["latched"] = True
+            forged_o8["would_have_tripped"] = True
+            forged_o8["reason"] = "forged_o8"
+            for p in (
+                forged_ledger._record_path(1),
+                forged_ledger._receipt_path(1),
+                forged_ledger._ots_path(1),
+                forged_root / "reports" / "completeness_2026-01-06.json",
+                forged_root / "reports" / "completeness_2026-01-06.md",
+            ):
+                p.unlink(missing_ok=True)
+            forged_ots, _ = build_synthetic_ots_fixture(
+                sha256_canonical(forged_body),
+                bitcoin_height=999999,
+            )
+            forged_env = forged_ledger.append_record(
+                forged_body,
+                obtained_at_utc="2026-01-06T22:30:05.000Z",
+                ots_bytes=forged_ots,
+                commitment_deadline_utc="2026-01-07T02:00:00.000Z",
+            )
+            save_row_state_snapshot(
+                forged_root / "state_snapshots",
+                chain_id=forged_body["chain_id"],
+                sequence=1,
+                session_date="2026-01-06",
+                record_sha256=forged_env["record_sha256"],
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state={},
+            )
+            for extra_btc in (None, dict(hdrs)):
+                with self.assertRaises(EngineIdentityError):
+                    run_production_cycle(
+                        session_date="2026-01-06",
+                        data_dir=forged_root,
+                        config_path=cfg_path,
+                        transport=build_live_mock_transport("2026-01-06"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token"},
+                        wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                        expected_prior_head_sha256=seq0_sha,
+                        bitcoin_merkle_roots=extra_btc,
+                    )
+                self.assertFalse((forged_root / "reports" / "completeness_2026-01-06.json").exists())
+
+            # Legitimate retries succeed with current seq1_sha OR (seq0_sha + verified BTC roots)
+            for retry_kw in (
+                {"expected_prior_head_sha256": seq1_sha},
+                {"expected_prior_head_sha256": seq0_sha, "bitcoin_merkle_roots": dict(hdrs)},
+            ):
                 r1_retry = run_production_cycle(
                     session_date="2026-01-06",
                     data_dir=root,
@@ -1653,7 +1723,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     transport=build_live_mock_transport("2026-01-06"),
                     environ={"TIINGO_API_KEY": "test-dummy-token"},
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
-                    expected_prior_head_sha256=trusted_sha,
+                    **retry_kw,
                 )
                 self.assertEqual(r1_retry["reason"], "already_committed_session_preserved")
 
@@ -1710,6 +1780,128 @@ class Sh2PipelineTest(unittest.TestCase):
                 self.assertIn(expected_msg, str(wiped_ctx.exception))
                 self.assertEqual(ShadowLedger(root / "ledger").load_records(), [])
                 self.assertFalse((root / "replay").exists())
+
+    def test_interrupted_staging_snapshot_recovers_on_retry_and_subsequent_sessions(self) -> None:
+        class _SimSigkill(BaseException):
+            pass
+
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "crash_snap_recovery"
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=None,
+                allow_unanchored_on_ots_failure=True,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                evaluator=VendoredFuseEvaluator(),
+            )
+            self.assertTrue(r0["appended"])
+            self.assertEqual(r0["sequence"], 0)
+
+            with self.assertRaises(_SimSigkill):
+                run_daily_drill_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config=drill_cfg,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=None,
+                    allow_unanchored_on_ots_failure=True,
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    evaluator=VendoredFuseEvaluator(),
+                    _post_ledger_commit_hook=lambda: (_ for _ in ()).throw(
+                        _SimSigkill("abrupt kill after snapshot staging before marker")
+                    ),
+                )
+
+            # Confirm staged seq=1 snapshot + latest.state.json survived while ledger stayed at seq=0
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 1)
+            self.assertTrue((root / "state_snapshots" / "seq_000001.state.json").is_file())
+            stale_latest = json.loads((root / "state_snapshots" / "latest.state.json").read_text(encoding="utf-8"))
+            self.assertEqual(stale_latest["sequence"], 1)
+
+            # Retry 2026-01-06 and advance 2026-01-07 both recover cleanly without mismatch
+            r1 = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=None,
+                allow_unanchored_on_ots_failure=True,
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                evaluator=VendoredFuseEvaluator(),
+            )
+            self.assertTrue(r1["appended"])
+            self.assertEqual(r1["sequence"], 1)
+
+            r2 = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config=drill_cfg,
+                transport=build_live_mock_transport("2026-01-07"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=None,
+                allow_unanchored_on_ots_failure=True,
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                evaluator=VendoredFuseEvaluator(),
+            )
+            self.assertTrue(r2["appended"])
+            self.assertEqual(r2["sequence"], 2)
+
+    def test_live_tiingo_lookback_fetches_prior_trading_close_for_fuse_genesis(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+        seen_tiingo_urls: list[str] = []
+        base_transport = build_live_mock_transport("2026-01-05")
+
+        def _window_recording_transport(url: str, headers: dict):
+            if "api.tiingo.com" in url.lower():
+                seen_tiingo_urls.append(url)
+            return base_transport(url, headers)
+
+        class _FakeOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "unlocked.json"
+            cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            root = Path(tmpdir) / "live_genesis"
+            r0 = run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=_window_recording_transport,
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+            )
+            self.assertTrue(r0["appended"])
+            self.assertEqual(r0["sequence"], 0)
+            self.assertEqual(len(seen_tiingo_urls), 3)
+            for u in seen_tiingo_urls:
+                self.assertIn("startDate=2026-01-02", u)
+                self.assertIn("endDate=2026-01-05", u)
 
 
 if __name__ == "__main__":

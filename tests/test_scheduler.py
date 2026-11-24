@@ -659,7 +659,11 @@ class SchedulerTest(unittest.TestCase):
                     ).encode("utf-8")
                 if "finance.yahoo.com" in url:
                     time.sleep(0.02)
-                    bar_ts = int(now_utc.timestamp())
+                    bar_ts = int(
+                        datetime.strptime(f"{ny_date_str} 16:00", "%Y-%m-%d %H:%M")
+                        .replace(tzinfo=ZoneInfo("America/New_York"))
+                        .timestamp()
+                    )
                     return 200, json.dumps(
                         {"chart": {"result": [{"meta": {"symbol": "^XNDX" if "%5EXNDX" in url else "XSOX", "instrumentType": "INDEX"}, "timestamp": [bar_ts], "indicators": {"quote": [{"close": [29000.0]}]}}]}}
                     ).encode("utf-8")
