@@ -257,7 +257,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
             self.assertTrue(by_inst["SOXL"]["eligibility"]["eligible"])
             self.assertTrue(by_inst["QQQ"]["eligibility"]["eligible"])
 
-    def test_yahoo_real_etf_capture_rejected_as_instrument_mismatch(self) -> None:
+    def test_yahoo_synthetic_etf_fixture_rejected_as_instrument_mismatch(self) -> None:
         self.assertEqual(YAHOO_SYMBOL_VERIFICATION, "unverified")
         etf_body = (LIVE_FIXTURES / "yahoo_xndx_etf_2026-11-21.json").read_bytes()
         seen_urls: list[str] = []
@@ -347,7 +347,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
         self.assertEqual(len(throttled_calls), 2)
         self.assertEqual(clk2.sleeps, [30.0])
 
-    def test_nyfed_real_capture_returns_effective_2026_11_19_sofr(self) -> None:
+    def test_nyfed_synthetic_fixture_returns_effective_2026_11_19_sofr(self) -> None:
         nyfed_body = (LIVE_FIXTURES / "nyfed_sofr_2026-11-21.json").read_bytes()
         seen_urls: list[str] = []
 
@@ -360,7 +360,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
         self.assertIn("startDate=2026-11-06&endDate=2026-11-21", seen_urls[0])
         self.assertIn("typeCode=fr&sort=postDt:1", seen_urls[0])
         self.assertEqual(parsed["effective_date"], "2026-11-19")
-        self.assertEqual(parsed["rate_decimal"], "0.0391")
+        self.assertEqual(parsed["rate_decimal"], "0.0405")
         self.assertEqual(parsed["revision_indicator"], "")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -377,7 +377,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
             )
             sofr = next(r for r in records if r["instrument"] == "SOFR")
             self.assertEqual(sofr["effective_session"], "2026-11-19")
-            self.assertEqual(sofr["normalized_value"], "0.0391")
+            self.assertEqual(sofr["normalized_value"], "0.0405")
             self.assertEqual(sofr["disclosures"]["sofr_effective_lag"], "T-1")
             self.assertEqual(sofr["disclosures"]["revision_indicator"], "")
             self.assertTrue(sofr["eligibility"]["eligible"])
@@ -444,7 +444,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
             self.assertEqual(tbill["eligibility"]["reason"], "source_unavailable:treasury")
             self.assertFalse(any("treasury" in u for u in calls))
 
-    def test_fred_excerpt_and_dot_missing_handling(self) -> None:
+    def test_fred_synthetic_fixture_and_dot_missing_handling(self) -> None:
         fred_bytes = (LIVE_FIXTURES / "fred_dtb3_excerpt_2026-11-21.csv").read_bytes()
 
         def transport(url: str, headers: Mapping[str, str]) -> tuple[int, bytes]:
@@ -458,7 +458,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
         adapter = FredDtb3Adapter(transport=transport)
         eff_date, rate = adapter.fetch_daily("2026-11-20")
         self.assertEqual(eff_date, "2026-11-19")
-        self.assertEqual(rate, Decimal("0.0416"))
+        self.assertEqual(rate, Decimal("0.0405"))
 
         dot_adapter = FredDtb3Adapter(
             transport=transport,
@@ -558,7 +558,7 @@ class LiveFeederAdaptersTest(unittest.TestCase):
             by_inst = {r["instrument"]: r for r in records}
 
             # Successful series archived & hash-verified
-            for inst, exp_val in (("TQQQ", "52.1"), ("SOXL", "33.4"), ("SEMI", "8123.45"), ("SOFR", "0.0391")):
+            for inst, exp_val in (("TQQQ", "52.1"), ("SOXL", "33.4"), ("SEMI", "8123.45"), ("SOFR", "0.0405")):
                 rec = by_inst[inst]
                 self.assertEqual(rec["vintage"], "live_retrieval")
                 self.assertEqual(rec["observation_class"], "live")

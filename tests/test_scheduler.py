@@ -1011,6 +1011,16 @@ class SchedulerTest(unittest.TestCase):
                             ]
                         }
                     ).encode("utf-8")
+                if "treasury.example.test" in url:
+                    return 200, (
+                        b"Date,3 Mo\n"
+                        b"2025-11-20,3.90\n"
+                        b"2025-11-21,3.90\n"
+                        b"2025-11-24,3.89\n"
+                        b"2025-11-25,3.88\n"
+                        b"2025-11-26,3.88\n"
+                        b"2025-11-28,3.87\n"
+                    )
                 return _mock_market_transport(url, headers)
 
             streak_dir = root / "streak"
@@ -3168,6 +3178,47 @@ class SchedulerTest(unittest.TestCase):
                 self.assertTrue(at["missed_run_detected"])
                 self.assertEqual(at["silent_missed_days"], ["2025-11-24"])
                 self.assertIn("2025-11-24", at["failed_days"])
+
+    def test_r16_stale_treasury_csv_fails_o1_and_missed_run_audit(self) -> None:
+        """P2 regression: stale Treasury CSV (01/04/1954,1.33) fails O1 with 0 appends and non-ok missed-run audit."""
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+
+        def stale_treasury_transport(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
+            if "treasury.example.test" in url:
+                return 200, b"Date,3 Mo\n01/04/1954,1.33\n"
+            return _mock_market_transport(url, headers)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stale_dir = Path(tmpdir) / "stale_tbill_dir"
+            res = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=stale_dir,
+                config=cfg,
+                transport=stale_treasury_transport,
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertIn("TBILL_3M", res["reason"])
+            self.assertFalse((stale_dir / "ledger" / "seq_000000.record.json").exists())
+            comp = json.loads((stale_dir / "reports" / "completeness_2025-11-21.json").read_text(encoding="utf-8"))
+            tbill_row = next(r for r in comp["required_series"] if r["instrument"] == "TBILL_3M")
+            self.assertEqual(tbill_row["status"], "missing")
+            self.assertEqual(tbill_row["reason"], "tbill_stale_effective_date")
+
+            audit = detect_missed_runs(
+                data_dir=stale_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertFalse(audit["missed_run_detected"])
+            self.assertNotIn("2025-11-21", audit["ok_days"])
+            self.assertIn("2025-11-21", audit["failed_days"])
 
 
 if __name__ == "__main__":

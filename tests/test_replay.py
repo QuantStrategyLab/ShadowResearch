@@ -15,7 +15,14 @@ if _SRC not in sys.path:
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
 from shadow.evaluator import StubEvaluator
-from shadow.feeder import DEMO_SERIES, VINTAGE_Y2, emit_market_records_from_fixtures
+from shadow.feeder import (
+    DEMO_SERIES,
+    VINTAGE_Y2,
+    emit_market_records_from_fixtures,
+    run_reconstruction_window,
+    sha256_canonical as feeder_sha256,
+)
+from shadow.sizing import policy_config_hash
 from shadow.feeder_live import LIVE_SERIES
 from shadow.ledger import (
     GENESIS_PREV_HASH,
@@ -517,6 +524,166 @@ class ReplayTest(unittest.TestCase):
             dup_err_str = "".join(res_dup_y2["archive_errors"])
             self.assertIn("duplicate_market_record_instrument:TQQQ", dup_err_str)
             self.assertIn("retrieval_after_decision_timestamp", dup_err_str)
+
+    def test_y2_reconstruction_replay_six_series_succeeds_while_drill_requires_qqq(self) -> None:
+        """P2 regression: noncreditable Y2 reconstruction replays cleanly with 6 series; drills require 7 incl. QQQ."""
+        y2_dir = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "y2overlap"
+        spec = load_spec(DEFAULT_SPEC_DIR)
+        code_sha = compute_code_manifest_hash()
+        p_hash = policy_config_hash(calendar_spec=spec, code_manifest_hash=code_sha)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            res = run_reconstruction_window(
+                y2_dir=y2_dir,
+                ledger_dir=root / "y2_ledger",
+                archive_dir=root / "y2_arch",
+            )
+            envs = res["ledger"].load_records()
+            self.assertEqual(len(envs), 10)
+            y2_bundle = {
+                "bundle_version": "shadow-replay-bundle/v1",
+                "chain_id": "y2-overlap-reconstruction",
+                "mode": "reconstruction",
+                "calendar_spec_dir": str(DEFAULT_SPEC_DIR),
+                "calendar_spec_digest": spec["spec_digest"],
+                "code_version_sha": code_sha,
+                "policy_config_hash": p_hash,
+                "archive_dir": str(root / "y2_arch"),
+                "sessions": [
+                    {
+                        "session_date": env["record_body"]["session_date"],
+                        "decision_timestamp_utc": env["record_body"]["decision_timestamp_utc"],
+                        "inputs": {
+                            "E": "50000",
+                            "E_star": "50000",
+                            "H": "0",
+                            "L": "0",
+                            "funds": {
+                                "TQQQ": {
+                                    "s": "1",
+                                    "close_price": next(
+                                        r["normalized_value"]
+                                        for r in res["market_records"][env["record_body"]["session_date"]]
+                                        if r["instrument"] == "TQQQ"
+                                    ),
+                                    "q_pre": 0,
+                                    "sigma_forecast": "0.24",
+                                },
+                                "SOXL": {
+                                    "s": "1",
+                                    "close_price": next(
+                                        r["normalized_value"]
+                                        for r in res["market_records"][env["record_body"]["session_date"]]
+                                        if r["instrument"] == "SOXL"
+                                    ),
+                                    "q_pre": 0,
+                                    "sigma_forecast": "0.24",
+                                },
+                            },
+                        },
+                        "discipline_labels": env["record_body"]["discipline_labels"],
+                        "market_records": res["market_records"][env["record_body"]["session_date"]],
+                        "market_records_digest": feeder_sha256(res["market_records"][env["record_body"]["session_date"]]),
+                    }
+                    for env in envs
+                ],
+            }
+            (root / "replay_bundle.json").write_text(json.dumps(y2_bundle), encoding="utf-8")
+            replayed = replay_window(root, root / "y2_ledger")
+            self.assertTrue(replayed["chain_ok"], replayed)
+            self.assertTrue(replayed["archived_inputs_ok"], replayed)
+            self.assertTrue(replayed["bit_for_bit_match"], replayed)
+            self.assertEqual(replayed["replayed_count"], 10)
+            self.assertEqual(replayed["archive_errors"], [])
+
+            # Non-Y2 drill session missing QQQ MUST still fail closed with missing_required_market_series:['QQQ']
+            drill_ledger = ShadowLedger(root / "drill_ledger")
+            cal0 = resolve_session("XNYS", "2025-11-21", spec=spec)
+            recs_full = emit_market_records_from_fixtures(
+                FEEDER_FIXTURES,
+                "2025-11-21",
+                "2025-11-21T21:20:00.000Z",
+                root / "drill_arch",
+                calendar_spec=spec,
+            )
+            recs_no_qqq = [copy.deepcopy(r) for r in recs_full if r["instrument"] != "QQQ"]
+            sess0_in = {
+                "E": "50000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "0",
+                "funds": {
+                    "TQQQ": {
+                        "s": "1",
+                        "close_price": next(r["normalized_value"] for r in recs_no_qqq if r["instrument"] == "TQQQ"),
+                        "q_pre": 0,
+                        "sigma_forecast": "0.24",
+                    },
+                    "SOXL": {
+                        "s": "1",
+                        "close_price": next(r["normalized_value"] for r in recs_no_qqq if r["instrument"] == "SOXL"),
+                        "q_pre": 0,
+                        "sigma_forecast": "0.24",
+                    },
+                },
+            }
+            built = build_record_body(
+                chain_id="drill-missing-qqq",
+                sequence=0,
+                prev_record_sha256=GENESIS_PREV_HASH,
+                mode="drill",
+                session_date="2025-11-21",
+                decision_timestamp_utc="2025-11-21T21:20:00.000Z",
+                session_inputs=sess0_in,
+                calendar_session=cal0,
+                code_version_sha=code_sha,
+                evaluator=StubEvaluator(),
+                discipline_labels={"drill_chain": True, "forward_clock_credit_eligible": False},
+                market_records_digest=feeder_sha256(recs_no_qqq),
+            )
+            rec_hash = sha256_canonical(built["record_body"])
+            ots_bytes, b_root = build_synthetic_ots_fixture(rec_hash, bitcoin_height=870907)
+            assert b_root is not None
+            drill_ledger.append_record(
+                built["record_body"],
+                obtained_at_utc="2025-11-21T21:22:00.000Z",
+                ots_bytes=ots_bytes,
+                commitment_deadline_utc="2025-11-22T04:30:00.000Z",
+                bitcoin_merkle_roots={870907: {"merkle_root": b_root, "timestamp": "2025-11-21T22:00:00.000Z"}},
+            )
+            drill_bundle = {
+                "bundle_version": "shadow-replay-bundle/v1",
+                "chain_id": "drill-missing-qqq",
+                "mode": "drill",
+                "calendar_spec_dir": str(DEFAULT_SPEC_DIR),
+                "calendar_spec_digest": spec["spec_digest"],
+                "code_version_sha": code_sha,
+                "policy_config_hash": p_hash,
+                "archive_dir": str(root / "drill_arch"),
+                "sessions": [
+                    {
+                        "session_date": "2025-11-21",
+                        "decision_timestamp_utc": "2025-11-21T21:20:00.000Z",
+                        "inputs": sess0_in,
+                        "discipline_labels": {"drill_chain": True, "forward_clock_credit_eligible": False},
+                        "market_records": recs_no_qqq,
+                        "market_records_digest": feeder_sha256(recs_no_qqq),
+                    }
+                ],
+            }
+            (root / "drill_bundle").mkdir()
+            import shutil
+            shutil.copytree(root / "drill_arch", root / "drill_bundle" / "drill_arch")
+            (root / "drill_bundle" / "replay_bundle.json").write_text(json.dumps(drill_bundle), encoding="utf-8")
+            drill_res = replay_window(
+                root / "drill_bundle",
+                root / "drill_ledger",
+                bitcoin_merkle_roots={870907: {"merkle_root": b_root, "timestamp": "2025-11-21T22:00:00.000Z"}},
+            )
+            self.assertFalse(drill_res["archived_inputs_ok"])
+            self.assertFalse(drill_res["bit_for_bit_match"])
+            self.assertIn("missing_required_market_series:['QQQ']", "".join(drill_res["archive_errors"]))
 
 
 if __name__ == "__main__":

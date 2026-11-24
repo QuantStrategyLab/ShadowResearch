@@ -499,6 +499,10 @@ def _record_from_verified_bytes(
 
     if kind == "rate_tbill":
         eff_date, rate_dec = select_treasury_tbill_row(verified_bytes, session_date)
+        expected_prior = expected_prior_sofr_business_day(session_date, calendar_spec=calendar_spec)
+        is_fresh_tbill = eff_date in (session_date, expected_prior)
+        tbill_lag = "T-0" if eff_date == session_date else ("T-1" if eff_date == expected_prior else "stale")
+        tbill_reason = None if is_fresh_tbill else "tbill_stale_effective_date"
         return _build_mkt_record(
             instrument=inst,
             provider=provider,
@@ -515,8 +519,15 @@ def _record_from_verified_bytes(
             raw_bytes_sha256=digest,
             normalized_value=canonical_decimal_str(rate_dec),
             is_modelled=False,
-            disclosures={"accrual_basis": "days/365"},
+            disclosures={
+                "accrual_basis": "days/365",
+                "tbill_effective_lag": tbill_lag,
+                "vintage_lag": tbill_lag,
+                "actual_effective_date": eff_date,
+                "expected_prior_business_day": expected_prior,
+            },
             revision_seq=revision_seq,
+            missing_reason=tbill_reason,
             decision_cutoff_utc=decision_cutoff_utc,
             session_close_utc=session_close_utc,
         )

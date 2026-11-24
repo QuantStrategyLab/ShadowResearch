@@ -11,7 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
-from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator
+from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, Y2_REQUIRED_MARKET_SERIES
 from shadow.feeder import VINTAGE_Y2, default_eod_decision_cutoff_utc, verify_market_record_raw_integrity
 from shadow.ledger import (
     GENESIS_PREV_HASH,
@@ -221,6 +221,9 @@ def replay_window(
                         else None
                     )
 
+                expected_required_series = (
+                    Y2_REQUIRED_MARKET_SERIES if is_noncreditable_y2_session else REQUIRED_MARKET_SERIES
+                )
                 by_inst: dict[str, dict] = {}
                 seen_instruments: set[str] = set()
                 for idx, mrec in enumerate(mkt_records):
@@ -246,7 +249,7 @@ def replay_window(
                         if not ok_raw:
                             archive_errors.append(f"seq_{seq}:{raw_err}")
 
-                    if m_inst in REQUIRED_MARKET_SERIES:
+                    if m_inst in expected_required_series:
                         elig = mrec.get("eligibility")
                         if mrec.get("normalized_value") is None or not (
                             isinstance(elig, dict) and elig.get("eligible") is True
@@ -294,7 +297,7 @@ def replay_window(
                         f"computed={computed_mkt_digest}, declared={declared_digest})"
                     )
 
-                missing_required = [inst for inst in REQUIRED_MARKET_SERIES if inst not in by_inst]
+                missing_required = [inst for inst in expected_required_series if inst not in by_inst]
                 if missing_required:
                     archive_errors.append(
                         f"seq_{seq}:missing_required_market_series:{missing_required}"

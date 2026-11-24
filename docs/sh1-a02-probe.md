@@ -47,6 +47,6 @@
 ## 4. W6 Carry-Overs
 
 1. **Yahoo index-symbol verification:** Re-probe `^XNDX`, `XSOX`, and `^SOX` on a weekday under spaced/throttled timing (`>= 20 s` spacing, 429 backoff), verifying `meta.instrumentType == "INDEX"` and `meta.symbol` match; invoke the disclosed-reconstruction fallback (`BRIEF-SH-1.md` §4.2, `OA-SH1-3`) if index TR symbols remain unreachable or throttled.
-2. **U.S. Treasury endpoint resolution:** Verify the active Treasury daily par-yield CSV/XML URL (and ~30–40 s egress timeout budget) from the Mac mini environment, or escalate primary-vs-FRED fallback disposition if `home.treasury.gov` remains unreachable through the tunnel.
+2. **U.S. Treasury endpoint resolution:** Verify the active Treasury daily par-yield CSV/XML URL (and ~30–40 s egress timeout budget) from a verified weekday egress environment, or escalate primary-vs-FRED fallback disposition if `home.treasury.gov` remains unreachable through the tunnel.
 3. **Weekday post-close finalization measurement:** Measure actual post-`16:00` ET availability lag across verified primary and fallback feeds to pin the scheduler decision instant and commitment deadline (`BRIEF-SH-1.md` §11).
 4. **Tiingo live probe:** Run the first live Tiingo probe for `TQQQ`, `SOXL`, and `QQQ` once the owner provides the free Starter `TIINGO_API_KEY` (`OA-SH1-2`).

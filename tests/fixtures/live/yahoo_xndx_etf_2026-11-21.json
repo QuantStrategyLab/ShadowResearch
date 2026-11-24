@@ -1,1 +1,44 @@
-{"chart":{"result":[{"meta":{"currency":"USD","symbol":"XNDX","exchangeName":"BTS","fullExchangeName":"Cboe US","instrumentType":"ETF","firstTradeDate":1778160600,"regularMarketTime":1795208400,"hasPrePostMarketData":true,"gmtoffset":-18000,"timezone":"EST","exchangeTimezoneName":"America/New_York","regularMarketPrice":0.1479,"regularMarketChangePercent":-18.1516,"fulldayPrice":0.1479,"fulldayChange":-0.0088,"fulldayChangePercent":-4.87,"fiftyTwoWeekHigh":40.99,"fiftyTwoWeekLow":0.1479,"regularMarketDayHigh":0.1812,"regularMarketDayLow":0.1479,"regularMarketVolume":459993,"longName":"Tradr 2X Long XNDU Daily ETF","shortName":"Tradr 2X Long XNDU Daily ETF","chartPreviousClose":0.29,"priceHint":4,"currentTradingPeriod":{"pre":{"timezone":"EST","start":1795165200,"end":1795185000,"gmtoffset":-18000},"regular":{"timezone":"EST","start":1795185000,"end":1795208400,"gmtoffset":-18000},"post":{"timezone":"EST","start":1795208400,"end":1795222800,"gmtoffset":-18000}},"dataGranularity":"1d","range":"5d","validRanges":["1d","5d","1mo","3mo","6mo","1y","ytd","max"]},"timestamp":[1794839400,1794925800,1795012200,1795098600,1795185000],"indicators":{"quote":[{"volume":[786700,420900,375100,485300,460000],"low":[0.2199999988079071,0.1899999976158142,0.1899999976158142,0.18000000715255737,0.15000000596046448],"high":[0.27000001072883606,0.2199999988079071,0.20999999344348907,0.2199999988079071,0.18000000715255737],"open":[0.27000001072883606,0.2199999988079071,0.20000000298023224,0.20999999344348907,0.17000000178813934],"close":[0.2199999988079071,0.20000000298023224,0.1899999976158142,0.18000000715255737,0.15000000596046448]}],"adjclose":[{"adjclose":[0.2199999988079071,0.20000000298023224,0.1899999976158142,0.18000000715255737,0.15000000596046448]}]}}],"error":null}}
+{
+  "chart": {
+    "result": [
+      {
+        "meta": {
+          "currency": "USD",
+          "symbol": "XNDX",
+          "exchangeName": "SYNTH",
+          "fullExchangeName": "Synthetic Exchange",
+          "instrumentType": "ETF",
+          "firstTradeDate": 1700000000,
+          "regularMarketTime": 1795208400,
+          "hasPrePostMarketData": true,
+          "gmtoffset": -18000,
+          "timezone": "EST",
+          "exchangeTimezoneName": "America/New_York",
+          "regularMarketPrice": 12.34,
+          "longName": "Synthetic Leveraged XNDX ETF",
+          "shortName": "Synthetic XNDX ETF",
+          "chartPreviousClose": 12.0,
+          "priceHint": 2,
+          "dataGranularity": "1d",
+          "range": "5d"
+        },
+        "timestamp": [1794839400, 1794925800, 1795012200, 1795098600, 1795185000],
+        "indicators": {
+          "quote": [
+            {
+              "volume": [1000, 1100, 1200, 1300, 1400],
+              "low": [10.0, 10.5, 11.0, 11.5, 12.0],
+              "high": [10.5, 11.0, 11.5, 12.0, 12.5],
+              "open": [10.1, 10.6, 11.1, 11.6, 12.1],
+              "close": [10.2, 10.7, 11.2, 11.7, 12.34]
+            }
+          ],
+          "adjclose": [
+            {"adjclose": [10.2, 10.7, 11.2, 11.7, 12.34]}
+          ]
+        }
+      }
+    ],
+    "error": null
+  }
+}

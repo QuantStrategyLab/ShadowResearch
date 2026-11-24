@@ -55,6 +55,15 @@ REQUIRED_MARKET_SERIES: tuple[str, ...] = (
     "TBILL_3M",
 )
 
+Y2_REQUIRED_MARKET_SERIES: tuple[str, ...] = (
+    "TQQQ",
+    "SOXL",
+    "XNDX",
+    "SEMI",
+    "SOFR",
+    "TBILL_3M",
+)
+
 
 class StubProductionForbiddenError(RuntimeError):
     """Raised when the SH-1 stub evaluator is invoked for production forward-clock mode."""

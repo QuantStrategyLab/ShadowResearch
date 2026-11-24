@@ -241,7 +241,7 @@ def run_acceptance_pack() -> dict[str, object]:
         rows["SH1-A01"] = {"status": "PASS_OFFLINE", "detail": "3 sessions x 7 required series complete without silent gaps"}
         rows["SH1-A02"] = {
             "status": "PARTIAL_MINI_PROBE_RECORDED",
-            "detail": "2026-11-21 Mac mini probe recorded in docs/SH1-A02-PROBE.md; weekday post-close finalization lag + Tiingo key + Treasury URL pending Mac mini live weekday window",
+            "detail": "2026-11-21 probe recorded in docs/sh1-a02-probe.md; weekday post-close finalization lag + Tiingo key + Treasury URL pending live weekday window",
         }
         rows["SH1-A03"] = {"status": "PASS_OFFLINE", "detail": "retrieval_time <= decision_cutoff, prior-close session & csa22-v1 digest verified"}
         rows["SH1-A04"] = {"status": "PASS_OFFLINE", "detail": "21/21 archived payloads SHA-256 verified and normalized values re-derived byte-for-byte"}

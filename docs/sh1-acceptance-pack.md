@@ -9,8 +9,8 @@
 | Artifact | Value |
 | --- | --- |
 | `policy_id` | `policy_v0_pre` |
-| `policy_config_hash` | `ce90eb24eaa7bdc173aabcf91e9d47a9516a11138ce934049362a0efdc7db48c` |
-| `code_version_sha` | `56e423cb4da5c58e1900501888b226a0be6c88798c6b506330a504a5de93be1a` |
+| `policy_config_hash` | `d3bd1cca32ee66aa78d88f389a70c9d336a4abb24f155a43d64e0acc6980b83c` |
+| `code_version_sha` | `3dc07d2076db13973c56438fb35ad500729600cf2dc7fac818b3ce433e701923` |
 | `csa22-v1` `spec_digest` | `6601c01f2907119c25a2687d4b67210285d3c13ebf2d86a2953745dbd1f6f2af` |
 | `StubEvaluator` `engine_hash` | `stub-d4dd72fbcf2f8d86` (synthetic drill only; `production_clock_capable = false`) |
 | Drill config | [`config/drill-scheduler.json`](../config/drill-scheduler.json) (`chain_id = "drill-sh1-v1"`, `mode = "drill"`, `clk01_active = false`) |
@@ -22,7 +22,7 @@ Reproduced offline via `PYTHONPATH=src python3 -m shadow.acceptance` and `python
 | Row | Status | Verified Evidence & Scope |
 | --- | --- | --- |
 | `SH1-A01` | `PASS_OFFLINE` | 3 sessions × 7 required series (`TQQQ`, `SOXL`, `QQQ`, `XNDX`, `SEMI`, `SOFR`, `TBILL_3M`) + 10-session Y2 reconstruction complete without silent gaps. |
-| `SH1-A02` | `PARTIAL_MINI_PROBE_RECORDED` | Initial Mac mini probe recorded in [`docs/SH1-A02-PROBE.md`](SH1-A02-PROBE.md) (`2026-11-21`). NY Fed SOFR + FRED DTB3 live-verified; Stooq JS challenge (`OA-SH1-7`), Yahoo ETF mismatch / HTTP 429, Treasury timeout/404, Tiingo (`OA-SH1-2` pending owner key), and weekday post-`16:00` ET finalization lag remain **pending Mac mini live weekday market window**. |
+| `SH1-A02` | `PARTIAL_MINI_PROBE_RECORDED` | Initial connectivity probe recorded in [`docs/sh1-a02-probe.md`](sh1-a02-probe.md) (`2026-11-21`). NY Fed SOFR + FRED DTB3 schema-verified; Stooq JS challenge (`OA-SH1-7`), Yahoo ETF mismatch / HTTP 429, Treasury timeout/404, Tiingo (`OA-SH1-2` pending owner key), and weekday post-`16:00` ET finalization lag remain **pending live weekday market window**. |
 | `SH1-A03` | `PASS_OFFLINE` | Per-provider live wall-clock post-response `retrieval_time_utc` inside `[session_close_utc, decision_cutoff_utc]` (`[16:00, 18:00]` ET regular / `[13:00, 15:00]` ET half-day), exact prior-business-day SOFR `T-1` check (skipping weekends, US federal bond holidays, and scheduled NYSE holidays without skipping unscheduled equity closures), `resolve_prior_close_session`, and `csa22-v1` `spec_digest` verified. |
 | `SH1-A04` | `PASS_OFFLINE` | 21/21 archived raw payloads SHA-256 verified and `normalized_value` re-derived byte-for-byte via `verify_market_record_raw_integrity` (with strict `T-1` SOFR and Tiingo `divCash`/`splitFactor` enforcement). |
 | `SH1-A05` | `PASS_OFFLINE` | Same-day SOFR revision (`revisionIndicator="R"`) advances automatically to `rev1` with a distinct SHA-256 while preserving `rev0` archived bytes untouched. |
@@ -57,6 +57,6 @@ Reproduced offline via `PYTHONPATH=src python3 -m shadow.acceptance` and `python
 | `R-2` | Enrolled | `PrGovernance` workflows (`risk-gate.yml`, `pr-review-signal.yml`, `codex-nudge.yml`) active. |
 | `R-3` | Published | `csa22-v1` published in `specs/csa22-v1/`; `csa22-v2` published on `origin/feat/csa22-v2`. |
 | `R-4` | Pending Mini Activation | Unit templates + footprint budget (`<= 2 GiB`) verified; mini systemd linger & runner check upon deployment. |
-| `R-5` | Pinned | `policy_v0_pre` canonical digest `ce90eb24eaa7bdc173aabcf91e9d47a9516a11138ce934049362a0efdc7db48c` (covering policy params, effective run config including `half_day_run_time_et`, `decision_cutoff_et`, `treasury_endpoint`, and `yahoo_symbol_map`, calendar digest, and executable manifest). |
-| `R-6` | Partial | `docs/SH1-A02-PROBE.md` recorded; weekday post-close EOD timing carry-over pending live weekday window. |
+| `R-5` | Pinned | `policy_v0_pre` canonical digest `d3bd1cca32ee66aa78d88f389a70c9d336a4abb24f155a43d64e0acc6980b83c` (covering policy params, effective run config including `half_day_run_time_et`, `decision_cutoff_et`, `treasury_endpoint`, and `yahoo_symbol_map`, calendar digest, and executable manifest). |
+| `R-6` | Partial | `docs/sh1-a02-probe.md` recorded; weekday post-close EOD timing carry-over pending live weekday window. |
 | `R-7` | Pinned | OpenTimestamps calendars + `23:30` ET commitment deadline pinned in `config/drill-scheduler.json`. |
