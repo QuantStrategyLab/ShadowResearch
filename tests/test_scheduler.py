@@ -3220,6 +3220,136 @@ class SchedulerTest(unittest.TestCase):
             self.assertNotIn("2025-11-21", audit["ok_days"])
             self.assertIn("2025-11-21", audit["failed_days"])
 
+    def test_r17_rotate_logs_preserves_active_log_inodes_while_truncating(self) -> None:
+        """rotate_logs truncates active daemon logs in place so open file descriptors keep their inode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = Path(tmpdir) / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            drill_log = logs_dir / "shadow-drill.log"
+            missed_log = logs_dir / "shadow-missed-run.log"
+            extra_log = logs_dir / "old-worker.log"
+            with drill_log.open("a", encoding="utf-8") as df, missed_log.open("a", encoding="utf-8") as mf:
+                df.write("D" * 120 + "\n")
+                df.flush()
+                mf.write("M" * 80 + "\n")
+                mf.flush()
+                extra_log.write_text("E" * 100 + "\n", encoding="utf-8")
+                os.utime(drill_log, (1000, 1000))
+                os.utime(missed_log, (1001, 1001))
+                os.utime(extra_log, (900, 900))
+                inode_drill = os.stat(drill_log).st_ino
+                inode_missed = os.stat(missed_log).st_ino
+
+                rot = rotate_logs(logs_dir, max_age_days=30, max_total_bytes=60, now_ts=1000 + 35 * 86400)
+                self.assertEqual(os.stat(drill_log).st_ino, inode_drill)
+                self.assertEqual(os.stat(missed_log).st_ino, inode_missed)
+                self.assertFalse(extra_log.exists())
+                self.assertEqual(drill_log.stat().st_size, 0)
+                self.assertEqual(missed_log.stat().st_size, 0)
+                self.assertGreaterEqual(rot["truncated_active"], 2)
+
+                df.write("after-trunc\n")
+                df.flush()
+                mf.write("missed-after\n")
+                mf.flush()
+            self.assertIn("after-trunc", drill_log.read_text(encoding="utf-8"))
+            self.assertIn("missed-after", missed_log.read_text(encoding="utf-8"))
+
+    def test_r17_tampered_existing_chain_fails_closed_before_appending(self) -> None:
+        """Corrupting seq_000000 fails closed with existing_chain_verification_failed and appends 0 records."""
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tamper_dir = Path(tmpdir) / "chain_tamper_dir"
+            r0 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=tamper_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(r0["appended"])
+
+            rec_path = tamper_dir / "ledger" / "seq_000000.record.json"
+            rec_obj = json.loads(rec_path.read_text(encoding="utf-8"))
+            rec_obj["record_body"]["assertions"]["B0"] = "99999"
+            rec_path.write_text(json.dumps(rec_obj), encoding="utf-8")
+
+            r1 = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=tamper_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(r1["appended"])
+            self.assertTrue(r1["fail_closed"])
+            self.assertEqual(r1["reason"], "ledger_integrity")
+            fc_comp = json.loads(
+                (tamper_dir / "reports" / "completeness_2025-11-24.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("existing_chain_verification_failed", fc_comp["ledger"]["fail_closed_reason"])
+            self.assertFalse((tamper_dir / "ledger" / "seq_000001.record.json").exists())
+
+    def test_r17_partial_or_mismatched_fail_closed_report_flagged_silent_missed(self) -> None:
+        """detect_missed_runs treats partial fail-closed JSON or mismatched .md/.receipt as silent_missed."""
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            partial_dir = root / "partial_fc"
+            (partial_dir / "reports").mkdir(parents=True, exist_ok=True)
+            (partial_dir / "reports" / "completeness_2025-11-21.json").write_text(
+                json.dumps(
+                    {
+                        "created_at_utc": "2025-11-21T22:30:00.000Z",
+                        "ledger": {"appended": False, "fail_closed_reason": "o1_missing"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            audit_partial = detect_missed_runs(
+                data_dir=partial_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_partial["missed_run_detected"])
+            self.assertEqual(audit_partial["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_partial["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
+            mismatch_dir = root / "mismatch_fc"
+            res = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=mismatch_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h, withhold_inst="TBILL_3M"),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            md_path = mismatch_dir / "reports" / "completeness_2025-11-21.md"
+            md_path.write_text("# tampered markdown\n", encoding="utf-8")
+            audit_md = detect_missed_runs(
+                data_dir=mismatch_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_md["missed_run_detected"])
+            self.assertEqual(audit_md["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_md["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
 
 if __name__ == "__main__":
     unittest.main()

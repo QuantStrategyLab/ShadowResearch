@@ -335,43 +335,70 @@ def check_footprint_budget(data_dir: str | Path, max_bytes: int = 2 * 1024 * 102
     }
 
 
+_ACTIVE_LOG_NAMES: frozenset[str] = frozenset({"shadow-drill.log", "shadow-missed-run.log"})
+
+
+def _truncate_log_in_place(path: Path) -> int:
+    """Truncate an active log file in place to preserve its open inode; return bytes reclaimed."""
+    sz = path.stat().st_size
+    with path.open("r+b") as fh:
+        fh.truncate(0)
+    return sz
+
+
 def rotate_logs(
     logs_dir: str | Path,
     *,
     max_age_days: int = 30,
     max_total_bytes: int = 50 * 1024 * 1024,
     now_ts: float | None = None,
-) -> dict[str, int]:
-    """Enforce 30-day retention and size cap on logs_dir."""
+) -> dict:
+    """Enforce 30-day retention and size cap on logs_dir while keeping active runner inodes intact."""
     root = Path(logs_dir)
     if not root.exists():
-        return {"removed_old": 0, "removed_oversize": 0, "remaining_bytes": 0}
+        return {"removed_old": 0, "removed_oversize": 0, "truncated_active": 0, "remaining_bytes": 0}
     ref_ts = now_ts if now_ts is not None else time.time()
     cutoff = ref_ts - max_age_days * 86400
     removed_old = 0
-    kept: list[tuple[float, int, Path]] = []
+    truncated_active = 0
+    kept: list[tuple[float, int, bool, Path]] = []
     for p in root.glob("*.log"):
         if not p.is_file():
             continue
         st = p.stat()
+        is_active = p.name in _ACTIVE_LOG_NAMES
         if st.st_mtime < cutoff:
-            p.unlink()
-            removed_old += 1
+            if is_active:
+                reclaimed = _truncate_log_in_place(p)
+                if reclaimed > 0:
+                    truncated_active += 1
+                kept.append((st.st_mtime, 0, True, p))
+            else:
+                p.unlink()
+                removed_old += 1
         else:
-            kept.append((st.st_mtime, st.st_size, p))
+            kept.append((st.st_mtime, st.st_size, is_active, p))
 
-    kept.sort(key=lambda item: item[0])
+    # Prefer unlinking non-active rotated logs before truncating active inodes under total size cap
+    kept.sort(key=lambda item: (1 if item[2] else 0, item[0]))
     total = sum(item[1] for item in kept)
     removed_oversize = 0
     while total > max_total_bytes and kept:
-        _, sz, oldest = kept.pop(0)
-        oldest.unlink()
-        total -= sz
-        removed_oversize += 1
+        _, sz, is_active, oldest = kept.pop(0)
+        if is_active:
+            reclaimed = _truncate_log_in_place(oldest)
+            total -= reclaimed
+            if reclaimed > 0:
+                truncated_active += 1
+        else:
+            oldest.unlink()
+            total -= sz
+            removed_oversize += 1
 
     return {
         "removed_old": removed_old,
         "removed_oversize": removed_oversize,
+        "truncated_active": truncated_active,
         "remaining_bytes": total,
     }
 
@@ -940,6 +967,100 @@ def _is_committed_session_report_valid(
         ):
             return False
     elif rep_reasons != expected_rcp.get("non_creditable_reasons"):
+        return False
+
+    try:
+        md_text = md_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    return md_text == _render_completeness_markdown(rep_obj)
+
+
+_NON_FAIL_CLOSED_PRE_OR_LATE_REASONS = (
+    "late_after_commitment_deadline_backfill_rejected",
+    "late_after_decision_cutoff",
+    "session_not_yet_closed",
+)
+
+
+def _is_fail_closed_session_report_valid(
+    *,
+    rep_path: Path,
+    md_path: Path,
+    rep_obj: dict,
+    session_date: str,
+    cfg: DrillSchedulerConfig,
+    cal: dict,
+    deadlines: dict[str, str],
+) -> bool:
+    if not rep_path.is_file() or not md_path.is_file() or not isinstance(rep_obj, dict):
+        return False
+    if rep_obj.get("session_date") != session_date:
+        return False
+    if rep_obj.get("chain_id") != cfg.chain_id:
+        return False
+    if rep_obj.get("mode") != cfg.mode:
+        return False
+    if rep_obj.get("calendar_version") != cal.get("calendar_version"):
+        return False
+    if rep_obj.get("calendar_spec_digest") != cal.get("spec_digest"):
+        return False
+    if rep_obj.get("session_state") != cal.get("session_state"):
+        return False
+    if rep_obj.get("session_close_utc") != deadlines.get("session_close_utc"):
+        return False
+    if rep_obj.get("decision_cutoff_utc") != deadlines.get("decision_cutoff_utc"):
+        return False
+    if rep_obj.get("commitment_deadline_utc") != deadlines.get("commitment_deadline_utc"):
+        return False
+    if rep_obj.get("observation_class") != "synthetic":
+        return False
+    if rep_obj.get("notifications_sent") != 0:
+        return False
+    if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
+        return False
+    consec = rep_obj.get("consecutive_session_count")
+    if isinstance(consec, bool) or not isinstance(consec, int) or consec < 0:
+        return False
+
+    rep_decision = rep_obj.get("decision_timestamp_utc")
+    rep_created = rep_obj.get("created_at_utc")
+    if not is_utc_ms_timestamp(rep_decision) or not is_utc_ms_timestamp(rep_created):
+        return False
+    if (
+        rep_decision < deadlines["session_close_utc"]
+        or rep_decision > deadlines["decision_cutoff_utc"]
+        or rep_decision > deadlines["commitment_deadline_utc"]
+    ):
+        return False
+    if (
+        rep_created < deadlines["session_close_utc"]
+        or rep_created > deadlines["commitment_deadline_utc"]
+    ):
+        return False
+
+    ledger_meta = rep_obj.get("ledger")
+    if not isinstance(ledger_meta, dict) or ledger_meta.get("appended") is not False:
+        return False
+    fc_reason = ledger_meta.get("fail_closed_reason")
+    if not isinstance(fc_reason, str) or not fc_reason.strip():
+        return False
+    if any(tok in fc_reason for tok in _NON_FAIL_CLOSED_PRE_OR_LATE_REASONS):
+        return False
+
+    standing = rep_obj.get("standing_assertions")
+    if not isinstance(standing, dict) or any(k not in standing for k in _STANDING_ASSERTION_KEYS):
+        return False
+
+    rep_rcp = rep_obj.get("receipt")
+    if not isinstance(rep_rcp, dict):
+        return False
+    if rep_rcp.get("commitment_deadline_utc") != deadlines.get("commitment_deadline_utc"):
+        return False
+    rcp_status = rep_rcp.get("status")
+    if not isinstance(rcp_status, str) or not rcp_status.strip():
+        return False
+    if rep_rcp.get("creditable") is not False:
         return False
 
     try:
@@ -1595,6 +1716,27 @@ def _run_daily_drill_cycle_locked(
             "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists(),
             "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
         }
+
+    if prior_records:
+        ok_chain, _bad_seq, chain_err = ledger.verify_chain()
+        if not ok_chain:
+            return _build_fail_closed_result(
+                t_start=t_start,
+                root=root,
+                reports_dir=reports_dir,
+                cfg=cfg,
+                cal=cal,
+                session_date=session_date,
+                decision_utc=now_utc_ms,
+                deadlines=deadlines,
+                head_hash=head_hash,
+                consecutive_count=prior_streak,
+                created_at_utc=now_utc_ms,
+                reason_key="ledger_integrity",
+                fail_reason=f"existing_chain_verification_failed:{chain_err}",
+                required_series=[],
+                receipt_reasons=["existing_chain_verification_failed", "drill_mode"],
+            )
 
     # 3a. Enforce ledger <-> replay_bundle consistency and committed-receipt integrity before any retry or append
     bundle_obj_validated: dict | None = None
@@ -2507,20 +2649,14 @@ def detect_missed_runs(
                 silent_missed_days.append(ds)
                 failed_days.append(ds)
                 detail = orphan_err
-            elif (
-                not is_utc_ms_timestamp(rep_created)
-                or rep_created < deadlines["session_close_utc"]
-                or rep_created > deadline_utc
-                or rep_reason in (
-                    "late_after_commitment_deadline_backfill_rejected",
-                    "late_after_decision_cutoff",
-                    "session_not_yet_closed",
-                )
-                or "late_after_decision_cutoff" in rep_reason
-                or (
-                    is_utc_ms_timestamp(rep_decision)
-                    and rep_decision > deadlines["decision_cutoff_utc"]
-                )
+            elif not _is_fail_closed_session_report_valid(
+                rep_path=rep_path,
+                md_path=md_path,
+                rep_obj=rep_obj,
+                session_date=ds,
+                cfg=cfg,
+                cal=cal,
+                deadlines=deadlines,
             ):
                 status = "missed_run_silent_failure"
                 silent_missed_days.append(ds)
