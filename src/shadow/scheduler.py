@@ -1574,12 +1574,8 @@ def _run_daily_drill_cycle_locked(
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
     else:
-        prior_committed_artifacts = (
-            (bundle_dir / "replay_bundle.json").exists()
-            or ledger._ots_path(0).exists()
-            or ledger._receipt_path(0).exists()
-        )
-        if not prior_committed_artifacts and reports_dir.is_dir():
+        prior_committed_artifacts = False
+        if reports_dir.is_dir():
             for rep_candidate in sorted(reports_dir.glob("completeness_*.json")):
                 stem_ds = rep_candidate.stem.removeprefix("completeness_")
                 has_ev, _ = _report_has_committed_evidence(reports_dir, stem_ds, expected_seq=0)
@@ -1593,13 +1589,28 @@ def _run_daily_drill_cycle_locked(
                     if has_ev:
                         prior_committed_artifacts = True
                         break
+        bundle_path = bundle_dir / "replay_bundle.json"
+        if not prior_committed_artifacts and bundle_path.is_file():
+            try:
+                b0 = parse_json_no_duplicates(bundle_path.read_text(encoding="utf-8"))
+                b0_sessions = b0.get("sessions") if isinstance(b0, dict) else None
+                if not isinstance(b0_sessions, list):
+                    prior_committed_artifacts = True
+                elif len(b0_sessions) > 1:
+                    prior_committed_artifacts = True
+                elif len(b0_sessions) == 1:
+                    s0 = b0_sessions[0]
+                    if not isinstance(s0, dict) or s0.get("session_date") != session_date:
+                        prior_committed_artifacts = True
+            except Exception:
+                prior_committed_artifacts = True
         if prior_committed_artifacts:
             return {
                 "appended": False,
                 "recovered_missing_report": False,
                 "fail_closed": True,
                 "reason": "committed_evidence_without_ledger_records",
-                "detail": "Existing replay_bundle/OTS/receipt or committed report found when ledger has 0 records; refusing seq=0 overwrite",
+                "detail": "Existing replay_bundle or committed report found when ledger has 0 records; refusing seq=0 overwrite",
                 "session_date": session_date,
                 "report": None,
                 "report_paths": [],
