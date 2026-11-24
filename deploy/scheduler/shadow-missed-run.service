@@ -1,0 +1,19 @@
+[Unit]
+Description=SHADOW-N SH-1 Independent Missed-Run Detector (drill chain only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=15
+CPUQuota=25%
+MemoryMax=512M
+TasksMax=32
+OOMScoreAdjust=500
+WorkingDirectory=%h/shadow-research
+Environment=PYTHONPATH=%h/shadow-research/src
+ExecStart=/usr/bin/env bash -lc 'set -euo pipefail; source "%h/dev-env-mini/env.sh"; START_DATE="${SHADOW_WINDOW_START:-2026-11-24}"; exec python3 -m shadow.scheduler detect-missed --start-date "$START_DATE" --data-dir "%h/shadow-research/data/drill" --config "%h/shadow-research/config/drill-scheduler.json"'
+StandardOutput=append:%h/shadow-research/data/drill/logs/shadow-missed-run.log
+StandardError=append:%h/shadow-research/data/drill/logs/shadow-missed-run.log
+
+[Install]
+WantedBy=default.target

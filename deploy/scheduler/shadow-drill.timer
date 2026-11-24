@@ -1,0 +1,13 @@
+[Unit]
+Description=SHADOW-N SH-1 Daily Drill Timer (OA-SH1-6 gated; drill chain only)
+
+[Timer]
+# Pinned strictly to America/New_York across EST/EDT DST transitions, covering both half-day (14:30) and regular (17:30) XNYS sessions.
+OnCalendar=Mon..Fri *-*-* 14:30:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 17:30:00 America/New_York
+Persistent=false
+AccuracySec=30s
+Unit=shadow-drill.service
+
+[Install]
+WantedBy=timers.target

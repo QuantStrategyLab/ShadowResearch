@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quantstrategylab.shadow-missed-run</string>
+  <key>Disabled</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>15</integer>
+  <key>WorkingDirectory</key>
+  <string>&lt;dev-home&gt;/shadow-research</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key>
+    <string>Asia/Singapore</string>
+    <key>LANG</key>
+    <string>en_SG.UTF-8</string>
+    <key>LC_ALL</key>
+    <string>en_SG.UTF-8</string>
+    <key>HTTP_PROXY</key>
+    <string>http://127.0.0.1:18080</string>
+    <key>HTTPS_PROXY</key>
+    <string>http://127.0.0.1:18080</string>
+    <key>PYTHONPATH</key>
+    <string>&lt;dev-home&gt;/shadow-research/src</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>-m</string>
+    <string>shadow.scheduler</string>
+    <string>detect-missed</string>
+    <string>--start-date</string>
+    <string>2026-11-24</string>
+    <string>--require-ny-hhmm</string>
+    <string>23:45</string>
+    <string>--data-dir</string>
+    <string>&lt;dev-home&gt;/shadow-research/data/drill</string>
+    <string>--config</string>
+    <string>&lt;dev-home&gt;/shadow-research/config/drill-scheduler.json</string>
+  </array>
+  <!-- Dual SGT schedules cover 23:45 America/New_York across EDT (11:45 SGT) and EST (12:45 SGT); off-season firing exits 0 via require-ny-hhmm guard. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>&lt;dev-home&gt;/shadow-research/data/drill/logs/shadow-missed-run.log</string>
+  <key>StandardErrorPath</key>
+  <string>&lt;dev-home&gt;/shadow-research/data/drill/logs/shadow-missed-run.log</string>
+</dict>
+</plist>

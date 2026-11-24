@@ -1,0 +1,10 @@
+{
+  "refRates": [
+    {
+      "effectiveDate": "2025-11-20",
+      "type": "SOFR",
+      "percentRate": 3.93,
+      "revisionIndicator": "R"
+    }
+  ]
+}
