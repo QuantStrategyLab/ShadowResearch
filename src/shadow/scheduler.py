@@ -775,6 +775,7 @@ def _detect_orphaned_committed_evidence_for_session(
         and isinstance(r["record_body"].get("sequence"), int)
         and not isinstance(r["record_body"].get("sequence"), bool)
     }
+    receipt_session_by_seq: dict[int, object] = {}
     if ledger.root_dir.is_dir():
         for rpath in sorted(ledger.root_dir.glob("seq_*.receipt.json")):
             stem = rpath.name[len("seq_") : -len(".receipt.json")]
@@ -787,8 +788,10 @@ def _detect_orphaned_committed_evidence_for_session(
                 rcp_obj = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
             except Exception:
                 return f"corrupt_orphaned_receipt_seq_{seq_num}"
-            if isinstance(rcp_obj, dict) and rcp_obj.get("session_date") == session_date:
-                return f"orphaned_receipt_without_ledger_record_seq_{seq_num}"
+            if isinstance(rcp_obj, dict):
+                receipt_session_by_seq[seq_num] = rcp_obj.get("session_date")
+                if rcp_obj.get("session_date") == session_date:
+                    return f"orphaned_receipt_without_ledger_record_seq_{seq_num}"
         for opath in sorted(ledger.root_dir.glob("seq_*.ots")):
             ostem = opath.name[len("seq_") : -len(".ots")]
             if not ostem.isdigit():
@@ -796,11 +799,13 @@ def _detect_orphaned_committed_evidence_for_session(
             oseq = int(ostem)
             if oseq in committed_seqs:
                 continue
+            if oseq in receipt_session_by_seq and receipt_session_by_seq[oseq] not in (None, session_date):
+                continue
             has_o_ev, o_reason = has_committed_detached_evidence(ledger, oseq)
             if has_o_ev:
                 return str(o_reason or f"orphaned_ots_without_ledger_record_seq_{oseq}")
-        if not records and (ledger._ots_path(0).is_file() or ledger._receipt_path(0).is_file()):
-            # Empty ledger with seq_0 detached OTS/receipt and any existing bundle/report evidence indicates orphaned/missing seq_0
+        if not records and not ledger._record_files() and (ledger._ots_path(0).is_file() or ledger._receipt_path(0).is_file()):
+            # Missing seq_0 record file with seq_0 detached OTS/receipt and any existing bundle/report evidence indicates orphaned/missing seq_0
             if bundle_sessions or (reports_dir / f"completeness_{session_date}.json").is_file():
                 return "orphaned_seq0_proof_without_ledger_record"
 
@@ -2559,23 +2564,36 @@ def detect_missed_runs(
     ledger = ShadowLedger(root / "ledger")
     reports_dir = root / "reports"
 
-    records = ledger.load_records()
-    by_session: dict[str, dict] = {
-        env["record_body"]["session_date"]: env for env in records
-    }
-    bundle_ok = True
-    bundle_err: str | None = None
-    bundle_obj_validated: dict | None = None
-    if records:
-        bundle_ok, bundle_err, bundle_obj_validated = _validate_replay_bundle_matches_ledger(
-            root / "replay",
-            records,
-            cfg=cfg,
-            spec=spec,
-            allow_trailing_uncommitted_tail=True,
-            prune_uncommitted_tail=False,
-            reports_dir=reports_dir,
+    chain_ok, bad_seq, chain_err = ledger.verify_chain()
+    chain_integrity_err: str | None = None
+    if chain_ok:
+        records = ledger.load_records()
+        by_session: dict[str, dict] = {
+            env["record_body"]["session_date"]: env for env in records
+        }
+        bundle_ok = True
+        bundle_err: str | None = None
+        bundle_obj_validated: dict | None = None
+        if records:
+            bundle_ok, bundle_err, bundle_obj_validated = _validate_replay_bundle_matches_ledger(
+                root / "replay",
+                records,
+                cfg=cfg,
+                spec=spec,
+                allow_trailing_uncommitted_tail=True,
+                prune_uncommitted_tail=False,
+                reports_dir=reports_dir,
+            )
+    else:
+        records = []
+        by_session = {}
+        bundle_ok = False
+        chain_integrity_err = (
+            f"existing_chain_verification_failed:{chain_err}"
+            + (f":seq={bad_seq}" if bad_seq is not None else "")
         )
+        bundle_err = chain_integrity_err
+        bundle_obj_validated = None
 
     as_of_dt = _parse_utc_iso(as_of_utc)
     as_of_ms = _format_utc_ms(as_of_dt)
@@ -2752,6 +2770,11 @@ def detect_missed_runs(
                 silent_missed_days.append(ds)
                 failed_days.append(ds)
                 detail = "completeness_report_outside_session_window_or_unverified"
+            elif not chain_ok and not rep_reason.startswith("existing_chain_verification_failed:"):
+                status = "incomplete_or_corrupt_replay_bundle"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = chain_integrity_err or "existing_chain_verification_failed"
             else:
                 status = "failed_documented"
                 failed_days.append(ds)
@@ -2765,6 +2788,11 @@ def detect_missed_runs(
                 silent_missed_days.append(ds)
                 failed_days.append(ds)
                 detail = orphan_err
+            elif not chain_ok:
+                status = "incomplete_or_corrupt_replay_bundle"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = chain_integrity_err or "existing_chain_verification_failed"
             else:
                 status = "missed_run_silent_failure"
                 silent_missed_days.append(ds)
@@ -2786,6 +2814,8 @@ def detect_missed_runs(
         "as_of_utc": as_of_ms,
         "chain_id": cfg.chain_id,
         "mode": cfg.mode,
+        "chain_ok": chain_ok,
+        "chain_error": chain_integrity_err,
         "ai_session_independent": True,
         "zero_backfill_enforced": True,
         "evaluated_trading_days": evaluated_days,

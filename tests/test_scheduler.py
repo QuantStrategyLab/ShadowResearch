@@ -3582,6 +3582,73 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(nt1["reason"], "ledger_integrity")
             self.assertFalse((null_tier_dir / "ledger" / "seq_000001.record.json").exists())
 
+    def test_r20_detect_missed_runs_handles_truncated_record_without_crash(self) -> None:
+        """Close R20 P1: detect_missed_runs verifies chain safely on truncated seq_000000 and integrates with run-drill."""
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # Scenario A: bare truncated seq_000000.record.json ("{") with no report must not raise JSONDecodeError
+            bare_dir = root / "bare_trunc"
+            (bare_dir / "ledger").mkdir(parents=True, exist_ok=True)
+            (bare_dir / "ledger" / "seq_000000.record.json").write_text("{", encoding="utf-8")
+            audit_bare = detect_missed_runs(
+                data_dir=bare_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertFalse(audit_bare["chain_ok"])
+            self.assertIn("existing_chain_verification_failed", str(audit_bare["chain_error"]))
+            self.assertTrue(audit_bare["missed_run_detected"])
+            self.assertEqual(audit_bare["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_bare["evaluated_trading_days"][0]["status"], "incomplete_or_corrupt_replay_bundle")
+
+            # Scenario B: Day 1 committed -> truncate seq_0 -> Day 2 run_daily_drill_cycle fail-closed -> detect_missed_runs
+            e2e_dir = root / "e2e_trunc"
+            d1 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=e2e_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(d1["appended"])
+            (e2e_dir / "ledger" / "seq_000000.record.json").write_text("{", encoding="utf-8")
+
+            d2 = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=e2e_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(d2["appended"])
+            self.assertTrue(d2["fail_closed"])
+            self.assertEqual(d2["reason"], "ledger_integrity")
+
+            audit_e2e = detect_missed_runs(
+                data_dir=e2e_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-25T05:00:00.000Z",
+            )
+            self.assertFalse(audit_e2e["chain_ok"])
+            self.assertTrue(audit_e2e["missed_run_detected"])
+            self.assertEqual(audit_e2e["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_e2e["failed_days"], ["2025-11-21", "2025-11-24"])
+            by_day = {e["session_date"]: e["status"] for e in audit_e2e["evaluated_trading_days"]}
+            self.assertEqual(by_day["2025-11-21"], "incomplete_or_corrupt_replay_bundle")
+            self.assertEqual(by_day["2025-11-24"], "failed_documented")
+
 
 if __name__ == "__main__":
     unittest.main()
