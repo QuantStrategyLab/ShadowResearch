@@ -166,6 +166,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
                 evaluator=ev,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
             )
             self.assertTrue(r1["appended"])
             self.assertEqual(r1["report"]["observation_class"], "decision_time_market")
@@ -417,6 +418,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
             )
             self.assertTrue(res_crash["appended"])
             recs_c = ShadowLedger(d_crash / "ledger").load_records()
@@ -436,6 +438,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
             )
             self.assertTrue(res_split["appended"])
             recs_s = ShadowLedger(d_split / "ledger").load_records()
@@ -853,6 +856,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
             )
             ledger = ShadowLedger(root / "ledger")
             spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
@@ -1541,7 +1545,29 @@ class Sh2PipelineTest(unittest.TestCase):
 
                 return _Ots()
 
-            # 1. seq=0 (empty ledger) commits without prior head authentication
+            # 0. Empty production bucket without GENESIS_PREV_HASH MUST fail closed (with or without BTC roots)
+            for btc_arg in (
+                None,
+                {880100: {"merkle_root": "0" * 64, "timestamp": "2026-01-06T03:00:00.000Z"}},
+            ):
+                with self.assertRaises(EngineIdentityError) as gen_ctx:
+                    run_production_cycle(
+                        session_date="2026-01-05",
+                        data_dir=root,
+                        config_path=cfg_path,
+                        transport=build_live_mock_transport("2026-01-05"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token"},
+                        ots_client=_make_ots("2026-01-06T03:00:00.000Z", "2026-01-05"),
+                        wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                        clock=_fast_clock(),
+                        sleeper=lambda _s: None,
+                        bitcoin_merkle_roots=btc_arg,
+                    )
+                self.assertIn("production_genesis_unauthenticated", str(gen_ctx.exception))
+                self.assertEqual(ShadowLedger(root / "ledger").load_records(), [])
+                self.assertFalse((root / "replay").exists())
+
+            # 1. Explicit GENESIS_PREV_HASH initializes seq=0 cleanly on empty ledger
             r0 = run_production_cycle(
                 session_date="2026-01-05",
                 data_dir=root,
@@ -1552,6 +1578,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
             )
             self.assertTrue(r0["appended"])
             seq0_sha = r0["record_sha256"]
@@ -1658,6 +1685,31 @@ class Sh2PipelineTest(unittest.TestCase):
             )
             self.assertTrue(r2["appended"])
             self.assertEqual(r2["sequence"], 2)
+
+            # 7. Codex wiped-bucket regression: wiping data_dir after commit fails closed (0 appends)
+            # whether recurring run uses BTC roots alone or a prior committed head digest
+            shutil.rmtree(root)
+            for wiped_head, expected_msg in (
+                (None, "production_genesis_unauthenticated"),
+                (seq1_sha, "production_trusted_head_mismatch:empty_ledger"),
+            ):
+                with self.assertRaises(EngineIdentityError) as wiped_ctx:
+                    run_production_cycle(
+                        session_date="2026-01-08",
+                        data_dir=root,
+                        config_path=cfg_path,
+                        transport=build_live_mock_transport("2026-01-08"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token"},
+                        ots_client=_make_ots("2026-01-09T03:00:00.000Z", "2026-01-07"),
+                        wall_clock=lambda: datetime(2026, 1, 8, 22, 30, tzinfo=timezone.utc),
+                        clock=_fast_clock(),
+                        sleeper=lambda _s: None,
+                        expected_prior_head_sha256=wiped_head,
+                        bitcoin_merkle_roots=dict(hdrs),
+                    )
+                self.assertIn(expected_msg, str(wiped_ctx.exception))
+                self.assertEqual(ShadowLedger(root / "ledger").load_records(), [])
+                self.assertFalse((root / "replay").exists())
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ if _DEMO not in sys.path:
 from run_sh2_demo import _build_session_fixture_files, build_live_mock_transport  # noqa: E402
 from shadow.cloudrun_job import run_cloudrun_job  # noqa: E402
 from shadow.fuse_adapter import EngineIdentityError, PINNED_FUSE_ENGINE_HASH, ProductionChainLockedError  # noqa: E402
-from shadow.ledger import ChainConcurrencyConflictError, ShadowLedger  # noqa: E402
+from shadow.ledger import ChainConcurrencyConflictError, GENESIS_PREV_HASH, ShadowLedger  # noqa: E402
 from shadow.ots import OpenTimestampsClient, build_synthetic_ots_fixture  # noqa: E402
 
 
@@ -216,7 +217,10 @@ class CloudRunJobTest(unittest.TestCase):
                 mode="production",
                 session_date="2026-01-05",
                 transport=build_live_mock_transport("2026-01-05"),
-                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                },
                 ots_client=_FakeOts(),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clk,
@@ -361,13 +365,76 @@ class CloudRunJobTest(unittest.TestCase):
                 tick[0] += 25.0
                 return tick[0]
 
+            # Empty bucket without SHADOW_TRUSTED_HEAD_SHA256=GENESIS_PREV_HASH MUST fail (with or without BTC roots)
+            dummy_roots_file = Path(tmpdir) / "pre-genesis-roots.json"
+            dummy_roots_file.write_text(
+                json.dumps({"880100": {"merkle_root": "0" * 64, "timestamp": "2026-01-06T03:00:00.000Z"}}),
+                encoding="utf-8",
+            )
+            for empty_env in (
+                {"TIINGO_API_KEY": "test-dummy-token"},
+                {
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(dummy_roots_file),
+                },
+            ):
+                with self.assertRaises(EngineIdentityError) as gen_err:
+                    run_cloudrun_job(
+                        data_dir=ddir,
+                        config_path=unlocked_cfg,
+                        mode="production",
+                        session_date="2026-01-05",
+                        transport=build_live_mock_transport("2026-01-05"),
+                        environ=empty_env,
+                        ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
+                        wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                        clock=_fast_clk,
+                        sleeper=lambda _s: None,
+                    )
+                self.assertIn("production_genesis_unauthenticated", str(gen_err.exception))
+                self.assertEqual(ShadowLedger(ddir / "ledger").load_records(), [])
+                self.assertFalse((ddir / "replay").exists())
+
+            proc_gen3 = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(ddir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-05",
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(dummy_roots_file),
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_gen3.returncode, 3)
+            pg_out = json.loads(proc_gen3.stdout)
+            self.assertEqual(pg_out["status"], "engine_identity_error")
+            self.assertFalse(pg_out["appended"])
+            self.assertIn("production_genesis_unauthenticated", pg_out["reason"])
+
             r0 = run_cloudrun_job(
                 data_dir=ddir,
                 config_path=unlocked_cfg,
                 mode="production",
                 session_date="2026-01-05",
                 transport=build_live_mock_transport("2026-01-05"),
-                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                },
                 ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clk,
@@ -455,6 +522,60 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(r1["status"], "committed")
             self.assertEqual(r1["sequence"], 1)
             self.assertEqual(len(ShadowLedger(ddir / "ledger").load_records()), 2)
+
+            # Codex exploit guard: wiping SHADOW_DATA_DIR fails closed (exit 3) even with trusted BTC roots or old head
+            shutil.rmtree(ddir)
+            for wiped_env, expected_err in (
+                (
+                    {"SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file)},
+                    "production_genesis_unauthenticated",
+                ),
+                (
+                    {
+                        "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
+                        "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                    },
+                    "production_trusted_head_mismatch:empty_ledger",
+                ),
+            ):
+                with self.assertRaises(EngineIdentityError) as wiped_ctx:
+                    run_cloudrun_job(
+                        data_dir=ddir,
+                        config_path=unlocked_cfg,
+                        mode="production",
+                        session_date="2026-01-07",
+                        transport=build_live_mock_transport("2026-01-07"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token", **wiped_env},
+                        wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    )
+                self.assertIn(expected_err, str(wiped_ctx.exception))
+                proc_wiped = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-m",
+                        "shadow.cloudrun_job",
+                        "--data-dir",
+                        str(ddir),
+                        "--config",
+                        str(unlocked_cfg),
+                        "--mode",
+                        "production",
+                        "--session-date",
+                        "2026-01-07",
+                    ],
+                    cwd=_REPO_ROOT,
+                    env={"PYTHONPATH": _SRC, "PATH": "/usr/local/bin:/usr/bin:/bin", **wiped_env},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc_wiped.returncode, 3)
+                pw_out = json.loads(proc_wiped.stdout)
+                self.assertEqual(pw_out["status"], "engine_identity_error")
+                self.assertFalse(pw_out["appended"])
+                self.assertIn(expected_err, pw_out["reason"])
+                self.assertEqual(ShadowLedger(ddir / "ledger").load_records(), [])
+                self.assertFalse((ddir / "replay").exists())
 
 
 if __name__ == "__main__":

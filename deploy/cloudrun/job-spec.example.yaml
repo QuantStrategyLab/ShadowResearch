@@ -4,9 +4,13 @@
 # Single-writer concurrency discipline: maxRetries: 0 with parallelism: 1 and taskCount: 1
 # prevents concurrent overlapping Cloud Run tasks; cross-instance writes are additionally fenced by
 # ledger/.chain.lease.json (GCS exclusive create ifGenerationMatch=0 semantics).
-# Production history authentication (non-empty production ledger): set SHADOW_TRUSTED_HEAD_SHA256
-# (e.g., via Secret Manager) and/or SHADOW_BITCOIN_MERKLE_ROOTS_PATH pointing outside SHADOW_DATA_DIR
-# so compromised bucket history fails closed with exit 3 before reuse.
+# Production history authentication:
+# - One-time genesis initialization (seq=0 on empty SHADOW_DATA_DIR): set
+#   SHADOW_TRUSTED_HEAD_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+#   (GENESIS_PREV_HASH) once, then replace or remove it after seq=0 commits.
+# - Recurring runs (seq >= 1): set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret Manager) to the
+#   latest committed head and/or SHADOW_BITCOIN_MERKLE_ROOTS_PATH outside SHADOW_DATA_DIR WITHOUT
+#   keeping the zero genesis marker, so an emptied/wiped bucket fails closed with exit 3.
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
@@ -37,7 +41,7 @@ spec:
                   value: /app/config/production-scheduler.json
                 - name: SHADOW_CHAIN_MODE
                   value: production
-                # Non-empty production chains require external history authentication:
+                # Genesis requires GENESIS_PREV_HASH (0*64); recurring chains require latest head and/or BTC roots:
                 # - name: SHADOW_TRUSTED_HEAD_SHA256
                 #   valueFrom:
                 #     secretKeyRef:

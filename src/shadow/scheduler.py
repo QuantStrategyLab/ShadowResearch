@@ -2359,7 +2359,11 @@ def _authenticate_production_history(
                 f"invalid_expected_prior_head_sha256:{expected_prior_head_sha256!r}"
             )
     if not prior_records:
-        if expected_prior_head_sha256 is not None and expected_prior_head_sha256 != GENESIS_PREV_HASH:
+        if expected_prior_head_sha256 is None:
+            raise EngineIdentityError(
+                "production_genesis_unauthenticated: require expected_prior_head_sha256=GENESIS_PREV_HASH"
+            )
+        if expected_prior_head_sha256 != GENESIS_PREV_HASH:
             raise EngineIdentityError("production_trusted_head_mismatch:empty_ledger")
         return
 
