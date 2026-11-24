@@ -1283,8 +1283,8 @@ class ShadowLedger:
             if file_seq != expected_seq:
                 return False, expected_seq, f"sequence_gap: expected {expected_seq}, got {file_seq}"
 
-            raw_bytes = path.read_bytes()
             try:
+                raw_bytes = path.read_bytes()
                 raw_text = raw_bytes.decode("utf-8")
                 envelope = parse_json_no_duplicates(raw_text)
             except Exception as exc:

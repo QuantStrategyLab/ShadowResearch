@@ -3298,6 +3298,28 @@ class SchedulerTest(unittest.TestCase):
             self.assertIn("existing_chain_verification_failed", fc_comp["ledger"]["fail_closed_reason"])
             self.assertFalse((tamper_dir / "ledger" / "seq_000001.record.json").exists())
 
+            # Truncated/unreadable JSON head record also fails closed cleanly without JSONDecodeError
+            rec_path.write_text("{", encoding="utf-8")
+            r2 = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=tamper_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(r2["appended"])
+            self.assertTrue(r2["fail_closed"])
+            self.assertEqual(r2["reason"], "ledger_integrity")
+            fc_trunc = json.loads(
+                (tamper_dir / "reports" / "completeness_2025-11-24.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("existing_chain_verification_failed", fc_trunc["ledger"]["fail_closed_reason"])
+            self.assertFalse((tamper_dir / "ledger" / "seq_000001.record.json").exists())
+
     def test_r17_partial_or_mismatched_fail_closed_report_flagged_silent_missed(self) -> None:
         """detect_missed_runs treats partial fail-closed JSON or mismatched .md/.receipt as silent_missed."""
         cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
@@ -3349,6 +3371,39 @@ class SchedulerTest(unittest.TestCase):
             self.assertTrue(audit_md["missed_run_detected"])
             self.assertEqual(audit_md["silent_missed_days"], ["2025-11-21"])
             self.assertEqual(audit_md["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
+            # Mutated standing_assertions or missing required_series must classify silent failure without KeyError
+            rep_path = mismatch_dir / "reports" / "completeness_2025-11-21.json"
+            orig_rep = json.loads(rep_path.read_text(encoding="utf-8"))
+            from shadow.scheduler import _render_completeness_markdown as _rcm
+
+            bad_assert_rep = json.loads(json.dumps(orig_rep))
+            bad_assert_rep["standing_assertions"]["loss_controls_armed"] = True
+            rep_path.write_text(json.dumps(bad_assert_rep), encoding="utf-8")
+            md_path.write_text(_rcm(bad_assert_rep), encoding="utf-8")
+            audit_assert = detect_missed_runs(
+                data_dir=mismatch_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_assert["missed_run_detected"])
+            self.assertEqual(audit_assert["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_assert["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
+            missing_series_rep = json.loads(json.dumps(orig_rep))
+            del missing_series_rep["required_series"]
+            rep_path.write_text(json.dumps(missing_series_rep), encoding="utf-8")
+            md_path.write_text(_rcm(orig_rep), encoding="utf-8")
+            audit_missing = detect_missed_runs(
+                data_dir=mismatch_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_missing["missed_run_detected"])
+            self.assertEqual(audit_missing["silent_missed_days"], ["2025-11-21"])
+            self.assertEqual(audit_missing["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
 
 
 if __name__ == "__main__":

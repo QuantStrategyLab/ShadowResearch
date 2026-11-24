@@ -971,9 +971,10 @@ def _is_committed_session_report_valid(
 
     try:
         md_text = md_path.read_text(encoding="utf-8")
+        expected_md = _render_completeness_markdown(rep_obj)
     except Exception:
         return False
-    return md_text == _render_completeness_markdown(rep_obj)
+    return md_text == expected_md
 
 
 _NON_FAIL_CLOSED_PRE_OR_LATE_REASONS = (
@@ -981,6 +982,20 @@ _NON_FAIL_CLOSED_PRE_OR_LATE_REASONS = (
     "late_after_decision_cutoff",
     "session_not_yet_closed",
 )
+
+
+def _standing_assertions_valid(standing: object) -> bool:
+    if not isinstance(standing, dict) or set(standing.keys()) != set(_STANDING_ASSERTION_KEYS):
+        return False
+    return (
+        standing.get("kelly_applied") is False
+        and type(standing.get("orders_placed")) is int
+        and standing.get("orders_placed") == 0
+        and standing.get("B0") == "50000"
+        and standing.get("H") == "0"
+        and standing.get("stop_loss_return_rule") == "OFF"
+        and standing.get("loss_controls_armed") is False
+    )
 
 
 def _is_fail_closed_session_report_valid(
@@ -1015,12 +1030,13 @@ def _is_fail_closed_session_report_valid(
         return False
     if rep_obj.get("observation_class") != "synthetic":
         return False
-    if rep_obj.get("notifications_sent") != 0:
+    notif = rep_obj.get("notifications_sent")
+    if type(notif) is not int or notif != 0:
         return False
     if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
         return False
     consec = rep_obj.get("consecutive_session_count")
-    if isinstance(consec, bool) or not isinstance(consec, int) or consec < 0:
+    if type(consec) is not int or consec < 0:
         return False
 
     rep_decision = rep_obj.get("decision_timestamp_utc")
@@ -1042,15 +1058,35 @@ def _is_fail_closed_session_report_valid(
     ledger_meta = rep_obj.get("ledger")
     if not isinstance(ledger_meta, dict) or ledger_meta.get("appended") is not False:
         return False
+    head_dig = ledger_meta.get("chain_head_digest")
+    if not isinstance(head_dig, str) or len(head_dig) != 64:
+        return False
     fc_reason = ledger_meta.get("fail_closed_reason")
     if not isinstance(fc_reason, str) or not fc_reason.strip():
         return False
     if any(tok in fc_reason for tok in _NON_FAIL_CLOSED_PRE_OR_LATE_REASONS):
         return False
 
-    standing = rep_obj.get("standing_assertions")
-    if not isinstance(standing, dict) or any(k not in standing for k in _STANDING_ASSERTION_KEYS):
+    if not _standing_assertions_valid(rep_obj.get("standing_assertions")):
         return False
+
+    req_series = rep_obj.get("required_series")
+    if not isinstance(req_series, list):
+        return False
+    for row in req_series:
+        if not isinstance(row, dict):
+            return False
+        if (
+            not isinstance(row.get("instrument"), str)
+            or not row.get("instrument")
+            or not isinstance(row.get("provider"), str)
+            or not isinstance(row.get("status"), str)
+            or "raw_bytes_sha256" not in row
+            or "normalized_value" not in row
+            or "reason" not in row
+            or "disclosures" not in row
+        ):
+            return False
 
     rep_rcp = rep_obj.get("receipt")
     if not isinstance(rep_rcp, dict):
@@ -1062,12 +1098,18 @@ def _is_fail_closed_session_report_valid(
         return False
     if rep_rcp.get("creditable") is not False:
         return False
+    if "anchor" not in rep_rcp:
+        return False
+    rcp_reasons = rep_rcp.get("non_creditable_reasons")
+    if not isinstance(rcp_reasons, list) or not rcp_reasons or not all(isinstance(r, str) and r for r in rcp_reasons):
+        return False
 
     try:
         md_text = md_path.read_text(encoding="utf-8")
+        expected_md = _render_completeness_markdown(rep_obj)
     except Exception:
         return False
-    return md_text == _render_completeness_markdown(rep_obj)
+    return md_text == expected_md
 
 
 def _is_immutable_late_or_preclose_report(existing_rep: dict | None) -> bool:
@@ -1667,6 +1709,48 @@ def _run_daily_drill_cycle_locked(
     deadline_utc = deadlines["commitment_deadline_utc"]
     now_utc_ms = _format_utc_ms(clock_fn())
 
+    # 1. Pre-close guard (trading sessions only) MUST run before writing completeness reports
+    if cal.get("is_trading_day") and not cal.get("blocks_eligibility") and now_utc_ms < session_close_utc:
+        fail_reason = "session_not_yet_closed"
+        return {
+            "appended": False,
+            "fail_closed": True,
+            "reason": fail_reason,
+            "detail": f"{fail_reason}: now_utc={now_utc_ms} < session_close_utc={session_close_utc}",
+            "session_date": session_date,
+            "session_close_utc": session_close_utc,
+            "decision_utc": now_utc_ms,
+            "report": None,
+            "report_paths": [],
+            "report_written": False,
+            "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists(),
+            "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+        }
+
+    # 2. Verify raw existing ledger BEFORE parsing head()/load_records() or counting streak
+    ok_chain, bad_seq, chain_err = ledger.verify_chain()
+    if not ok_chain:
+        return _build_fail_closed_result(
+            t_start=t_start,
+            root=root,
+            reports_dir=reports_dir,
+            cfg=cfg,
+            cal=cal,
+            session_date=session_date,
+            decision_utc=now_utc_ms,
+            deadlines=deadlines,
+            head_hash=GENESIS_PREV_HASH,
+            consecutive_count=0,
+            created_at_utc=now_utc_ms,
+            reason_key="ledger_integrity",
+            fail_reason=(
+                f"existing_chain_verification_failed:{chain_err}"
+                + (f":seq={bad_seq}" if bad_seq is not None else "")
+            ),
+            required_series=[],
+            receipt_reasons=["existing_chain_verification_failed", "drill_mode"],
+        )
+
     head_env = ledger.head()
     head_hash = head_env["record_sha256"] if head_env is not None else GENESIS_PREV_HASH
     prior_records = ledger.load_records()
@@ -1678,7 +1762,7 @@ def _run_daily_drill_cycle_locked(
         current_appended=False,
     )
 
-    # 1. Non-trading day or calendar blocks eligibility -> O2 fail-closed, 0 appends
+    # 3. Non-trading day or calendar blocks eligibility -> O2 fail-closed, 0 appends
     if not cal.get("is_trading_day") or cal.get("blocks_eligibility"):
         return _build_fail_closed_result(
             t_start=t_start,
@@ -1698,45 +1782,6 @@ def _run_daily_drill_cycle_locked(
             receipt_status="not_applicable_closed_session",
             receipt_reasons=["non_trading_session", "drill_mode"],
         )
-
-    # 2. Pre-close guard -> NEVER allow unclosed trading session inputs or pre-close completeness reports
-    if now_utc_ms < session_close_utc:
-        fail_reason = "session_not_yet_closed"
-        return {
-            "appended": False,
-            "fail_closed": True,
-            "reason": fail_reason,
-            "detail": f"{fail_reason}: now_utc={now_utc_ms} < session_close_utc={session_close_utc}",
-            "session_date": session_date,
-            "session_close_utc": session_close_utc,
-            "decision_utc": now_utc_ms,
-            "report": None,
-            "report_paths": [],
-            "report_written": False,
-            "existing_report_preserved": (reports_dir / f"completeness_{session_date}.json").exists(),
-            "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
-        }
-
-    if prior_records:
-        ok_chain, _bad_seq, chain_err = ledger.verify_chain()
-        if not ok_chain:
-            return _build_fail_closed_result(
-                t_start=t_start,
-                root=root,
-                reports_dir=reports_dir,
-                cfg=cfg,
-                cal=cal,
-                session_date=session_date,
-                decision_utc=now_utc_ms,
-                deadlines=deadlines,
-                head_hash=head_hash,
-                consecutive_count=prior_streak,
-                created_at_utc=now_utc_ms,
-                reason_key="ledger_integrity",
-                fail_reason=f"existing_chain_verification_failed:{chain_err}",
-                required_series=[],
-                receipt_reasons=["existing_chain_verification_failed", "drill_mode"],
-            )
 
     # 3a. Enforce ledger <-> replay_bundle consistency and committed-receipt integrity before any retry or append
     bundle_obj_validated: dict | None = None
