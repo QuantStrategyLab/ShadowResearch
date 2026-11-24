@@ -2258,6 +2258,204 @@ class Sh2PipelineTest(unittest.TestCase):
         self.assertIn("type=daily_treasury_yield_curve", endpoint)
         self.assertNotIn("daily_treasury_bill_rates", endpoint)
 
+    def test_v2_pending_adjustment_auto_clears_while_latched_mismatch_protected(self) -> None:
+        from shadow.fuse_adapter import build_fuse_validated_inputs
+        from shadow.ledger import sha256_canonical
+
+        drill_cfg = _sh2_drill_cfg()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        ev = VendoredFuseEvaluator()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "v2_pend"
+            f5 = Path(tmpdir) / "fix_05"
+            _build_session_fixture_files(f5, "2026-01-05", tqqq_split=2.0)
+
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r0["appended"])
+            recs0 = ShadowLedger(root / "ledger").load_records()
+            s0_rec_sha = sha256_canonical(recs0[0]["record_body"])
+            s0_state, _ = load_row_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id=drill_cfg.chain_id,
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_sequence=0,
+                expected_record_sha256=s0_rec_sha,
+            )
+            self.assertIn("TQQQ", s0_state["V2"]["pending_adjustments"])
+            s0_sha = _sha256_canonical_state_dict(s0_state)
+
+            cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+            recon_inputs = {
+                "E": "50000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "0",
+                "hwm_adjusted": True,
+                "funds": {
+                    "TQQQ": {
+                        "s": "1",
+                        "close_price": "25",
+                        "fund_return": "0.0",
+                        "q_pre": 200,
+                        "sigma_forecast": "0.24",
+                        "exact_reconciliation": True,
+                        "hwm_adjusted": True,
+                        "corporate_action": {
+                            "type": "split",
+                            "ratio": 2.0,
+                            "ex_date": "2026-01-05",
+                            "adjustment_complete": True,
+                            "exact_reconciliation": True,
+                            "hwm_adjusted": True,
+                        },
+                    },
+                    "SOXL": {
+                        "s": "1",
+                        "close_price": "40",
+                        "fund_return": "0.0",
+                        "q_pre": 100,
+                        "sigma_forecast": "0.22",
+                    },
+                },
+                "sources": {
+                    "TQQQ": "tiingo",
+                    "SOXL": "tiingo",
+                    "QQQ": "tiingo",
+                    "XNDX": "yahoo",
+                    "SEMI": "yahoo",
+                    "SOFR": "nyfed",
+                    "TBILL_3M": "treasury",
+                },
+                "sofr_bps": 430,
+                "tbill_bps": 420,
+                "qqq_close": "500",
+                "xndx_return": "0.0",
+                "semi_return": "0.0",
+                "index_return": "0.0",
+            }
+            rows6, _, pend_next = ev.evaluate(
+                ev.spec_version,
+                ev.engine_hash,
+                "p",
+                "2026-01-06",
+                "2026-01-06T22:00:00.000Z",
+                "shadow",
+                build_fuse_validated_inputs(
+                    recon_inputs,
+                    cal6,
+                    policy_hash="p",
+                    session_date="2026-01-06",
+                    as_of="2026-01-06T22:00:00.000Z",
+                ),
+                s0_state,
+                None,
+            )
+            self.assertEqual(rows6["V2"]["state"], "NORMAL")
+            self.assertEqual(rows6["V2"]["reason"], "exact_reconciliation_auto_clear")
+            self.assertFalse(pend_next.get("V2", {}).get("pending_adjustments"))
+
+            save_pending_rejected_state_snapshot(
+                root / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=s0_rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=pend_next,
+                base_prior_row_state=s0_state,
+            )
+            loaded_state, _ = load_pending_rejected_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id=drill_cfg.chain_id,
+                expected_base_sequence=0,
+                expected_base_record_sha256=s0_rec_sha,
+                current_session_date="2026-01-06",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_base_prior_state_sha256=s0_sha,
+                committed_base_prior_row_state=s0_state,
+                expected_base_session_date="2026-01-05",
+            )
+            self.assertFalse(loaded_state.get("V2", {}).get("pending_adjustments"))
+
+            # Negative control 1 & 2: latched mismatch protects BOTH latched_mismatches and pending_adjustments
+            latched_base = json.loads(json.dumps(s0_state))
+            latched_base["V2"]["latched_mismatches"] = {"TQQQ": True}
+            latched_base_sha = _sha256_canonical_state_dict(latched_base)
+            latched_dir = Path(tmpdir) / "v2_latched"
+            save_row_state_snapshot(
+                latched_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                sequence=0,
+                session_date="2026-01-05",
+                record_sha256=s0_rec_sha,
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=latched_base,
+            )
+
+            clear_latched = json.loads(json.dumps(latched_base))
+            clear_latched["V2"]["latched_mismatches"] = {}
+            save_pending_rejected_state_snapshot(
+                latched_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=s0_rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=clear_latched,
+                base_prior_row_state=latched_base,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    latched_dir / "state_snapshots",
+                    expected_chain_id=drill_cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=s0_rec_sha,
+                    current_session_date="2026-01-06",
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                    expected_base_prior_state_sha256=latched_base_sha,
+                    committed_base_prior_row_state=latched_base,
+                    expected_base_session_date="2026-01-05",
+                )
+
+            clear_pend_while_latched = json.loads(json.dumps(latched_base))
+            clear_pend_while_latched["V2"]["pending_adjustments"] = {}
+            save_pending_rejected_state_snapshot(
+                latched_dir / "state_snapshots",
+                chain_id=drill_cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=s0_rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=clear_pend_while_latched,
+                base_prior_row_state=latched_base,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    latched_dir / "state_snapshots",
+                    expected_chain_id=drill_cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=s0_rec_sha,
+                    current_session_date="2026-01-06",
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                    expected_base_prior_state_sha256=latched_base_sha,
+                    committed_base_prior_row_state=latched_base,
+                    expected_base_session_date="2026-01-05",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

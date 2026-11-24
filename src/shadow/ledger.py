@@ -2076,15 +2076,27 @@ def _assert_pending_state_preserves_committed_breakers(
     c_v2 = committed_state.get("V2")
     if isinstance(c_v2, Mapping):
         p_v2 = pending_state.get("V2")
-        for subkey in ("latched_mismatches", "pending_adjustments"):
-            c_sub = c_v2.get(subkey)
-            if isinstance(c_sub, Mapping):
-                p_sub = p_v2.get(subkey) if isinstance(p_v2, Mapping) else None
-                for fund, val in c_sub.items():
-                    if val and (not isinstance(p_sub, Mapping) or not p_sub.get(fund)):
-                        raise EngineIdentityError(
-                            f"Pending state cleared committed V2.{subkey}.{fund}"
-                        )
+        if p_v2 is not None and not isinstance(p_v2, Mapping):
+            raise EngineIdentityError("Pending state invalid V2 section")
+        c_latched = c_v2.get("latched_mismatches")
+        if isinstance(c_latched, Mapping):
+            p_latched = p_v2.get("latched_mismatches") if isinstance(p_v2, Mapping) else None
+            for fund, val in c_latched.items():
+                if val and (not isinstance(p_latched, Mapping) or not p_latched.get(fund)):
+                    raise EngineIdentityError(
+                        f"Pending state cleared committed V2.latched_mismatches.{fund}"
+                    )
+        c_pending = c_v2.get("pending_adjustments")
+        if isinstance(c_pending, Mapping):
+            p_pending = p_v2.get("pending_adjustments") if isinstance(p_v2, Mapping) else None
+            latched_map = c_latched if isinstance(c_latched, Mapping) else {}
+            for fund, val in c_pending.items():
+                if val and latched_map.get(fund) and (
+                    not isinstance(p_pending, Mapping) or not p_pending.get(fund)
+                ):
+                    raise EngineIdentityError(
+                        f"Pending state cleared committed V2.pending_adjustments.{fund}"
+                    )
 
     c_v4 = committed_state.get("V4")
     if isinstance(c_v4, Mapping):

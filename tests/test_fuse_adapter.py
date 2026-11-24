@@ -919,6 +919,119 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(rows_missing["L4"]["state"], "NO-NEW-RISK")
         self.assertEqual(rows_missing["L4"]["reason"], "missing_input")
 
+    def test_o9_change_signals_forwarded_and_list_authorized_events_preserved(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        si_tier = _valid_inputs()
+        si_tier["tier"] = "GUARD"
+        si_tier["tier_change_event"] = {"from": "CORE", "to": "GUARD"}
+        rows_tier, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_tier,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            {},
+            None,
+        )
+        self.assertEqual(rows_tier["O9"]["state"], "HALT")
+        self.assertTrue(rows_tier["O9"]["would_have_tripped"])
+        self.assertEqual(rows_tier["O9"]["reason"], "unauthorized_change")
+
+        si_desc = _valid_inputs()
+        si_desc["o9_change_descriptors"] = [
+            {"param": "single_fund_cap", "to": 0.45, "scope": "fund:TQQQ"}
+        ]
+        rows_desc, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_desc,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            {},
+            None,
+        )
+        self.assertEqual(rows_desc["O9"]["state"], "HALT")
+        self.assertTrue(rows_desc["O9"]["would_have_tripped"])
+        self.assertEqual(rows_desc["O9"]["reason"], "unauthorized_change")
+
+        si_clean = _valid_inputs()
+        prior_v1_latched = {
+            "V1": {
+                "TQQQ": {
+                    "latched": True,
+                    "trip_session": "2026-01-05",
+                    "deviation": 0.08,
+                    "session_returns": [],
+                }
+            }
+        }
+        rows_no_rearm, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_clean,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            prior_v1_latched,
+            [],
+        )
+        self.assertEqual(rows_no_rearm["V1"]["state"], "NO-NEW-RISK")
+        self.assertEqual(rows_no_rearm["V1"]["reason"], "latched_prior_trip")
+
+        rows_list_rearm, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_clean,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            prior_v1_latched,
+            [
+                {
+                    "type": "rearm",
+                    "row": "V1",
+                    "fund": "TQQQ",
+                    "scope": "fund:TQQQ",
+                    "session": "2026-01-06",
+                }
+            ],
+        )
+        self.assertEqual(rows_list_rearm["V1"]["state"], "NORMAL")
+        self.assertFalse(rows_list_rearm["V1"]["would_have_tripped"])
+
 
 if __name__ == "__main__":
     unittest.main()

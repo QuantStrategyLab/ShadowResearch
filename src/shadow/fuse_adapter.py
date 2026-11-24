@@ -1084,6 +1084,9 @@ def build_fuse_validated_inputs(
         out["hwm_adjusted"] = session_inputs["hwm_adjusted"]
     if session_inputs.get("kill_switch_tripped") is True:
         out["kill_switch_tripped"] = True
+    for key in ("tier_change_event", "o9_change_descriptors"):
+        if key in session_inputs:
+            out[key] = copy.deepcopy(session_inputs[key])
     return out
 
 
@@ -1156,11 +1159,11 @@ class VendoredFuseEvaluator:
 
         validate_v2_reconciliation_payload(validated_inputs)
 
-        auth_events_arg: dict | None
-        if isinstance(authorized_events, dict) or authorized_events is None:
+        auth_events_arg: dict | list | None
+        if isinstance(authorized_events, (dict, list)) or authorized_events is None:
             auth_events_arg = authorized_events
         else:
-            auth_events_arg = {"events": list(authorized_events)}
+            auth_events_arg = list(authorized_events)
 
         return self._pkg.evaluator.evaluate(
             spec_version,
