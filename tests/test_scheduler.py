@@ -3031,6 +3031,115 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(direct_led._receipt_path(1).read_bytes(), orig_direct_rcp)
             self.assertTrue(ledger_mod.has_committed_detached_evidence(direct_led, 1)[0])
 
+    def test_r13_post_commit_crash_before_receipt_or_report_unanchored_flags_silent_missed(self) -> None:
+        import contextlib
+        import io
+        from shadow import scheduler as sched_mod
+
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. R13 #1a: OTS outage (allow_unanchored_on_ots_failure=True) + crash before completeness report write
+            unanchored_crash_dir = root / "unanchored_post_commit_crash"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=unanchored_crash_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["appended"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "crash_after_unanchored_commit"):
+                run_daily_drill_cycle(
+                    session_date="2025-11-24",
+                    data_dir=unanchored_crash_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=lambda *a: (503, b"ots offline"),
+                    wall_clock=_tick_clock("2025-11-24"),
+                    sleeper=lambda _: None,
+                    _post_record_commit_hook=lambda: (_ for _ in ()).throw(
+                        RuntimeError("crash_after_unanchored_commit")
+                    ),
+                )
+            self.assertTrue((unanchored_crash_dir / "ledger" / "seq_000001.record.json").is_file())
+            self.assertFalse((unanchored_crash_dir / "ledger" / "seq_000001.receipt.json").exists())
+            self.assertFalse((unanchored_crash_dir / "reports" / "completeness_2025-11-24.json").exists())
+
+            out1 = io.StringIO()
+            with contextlib.redirect_stdout(out1):
+                rc1 = sched_mod.main(
+                    [
+                        "detect-missed",
+                        "--start-date",
+                        "2025-11-21",
+                        "--as-of-utc",
+                        "2025-11-25T05:00:00.000Z",
+                        "--data-dir",
+                        str(unanchored_crash_dir),
+                    ]
+                )
+            a1 = json.loads(out1.getvalue())
+            self.assertEqual(rc1, 2)
+            self.assertTrue(a1["missed_run_detected"])
+            self.assertEqual(a1["silent_missed_days"], ["2025-11-24"])
+            self.assertIn("2025-11-24", a1["failed_days"])
+
+            # 2. R13 #1b: Record + .ots committed, crash before .receipt.json & report write -> CLI exits 2 cleanly
+            ots_only_dir = root / "record_ots_no_receipt_no_report"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=ots_only_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["appended"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "crash_before_report"):
+                run_daily_drill_cycle(
+                    session_date="2025-11-24",
+                    data_dir=ots_only_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-24"),
+                    sleeper=lambda _: None,
+                    _post_record_commit_hook=lambda: (_ for _ in ()).throw(RuntimeError("crash_before_report")),
+                )
+            (ots_only_dir / "ledger" / "seq_000001.receipt.json").unlink()
+            out2 = io.StringIO()
+            with contextlib.redirect_stdout(out2):
+                rc2 = sched_mod.main(
+                    [
+                        "detect-missed",
+                        "--start-date",
+                        "2025-11-21",
+                        "--as-of-utc",
+                        "2025-11-25T05:00:00.000Z",
+                        "--data-dir",
+                        str(ots_only_dir),
+                    ]
+                )
+            a2 = json.loads(out2.getvalue())
+            self.assertEqual(rc2, 2)
+            self.assertTrue(a2["missed_run_detected"])
+            self.assertEqual(a2["silent_missed_days"], ["2025-11-24"])
+            self.assertIn("2025-11-24", a2["failed_days"])
+
 
 if __name__ == "__main__":
     unittest.main()
