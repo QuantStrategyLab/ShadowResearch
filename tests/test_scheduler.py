@@ -3405,6 +3405,150 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(audit_missing["silent_missed_days"], ["2025-11-21"])
             self.assertEqual(audit_missing["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
 
+    def test_r18_type_safe_assertions_required_series_fields_half_day_auto_and_null_tier(self) -> None:
+        """Close R18 P1s: int/bool standing assertion confusion, missing retrieval_time_utc/series_id, half-day auto truncated chain, and null tier entry."""
+        import contextlib
+        import io
+        from shadow import scheduler as sched_mod
+        from shadow.ledger import canonical_json_bytes
+
+        cfg = load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. Committed report with loss_controls_armed: 0 (False == 0 in Python) must be flagged silent_missed
+            committed_dir = root / "committed_int_bool"
+            c0 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=committed_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(c0["appended"])
+            c_rep_path = committed_dir / "reports" / "completeness_2025-11-21.json"
+            c_rep = json.loads(c_rep_path.read_text(encoding="utf-8"))
+            c_rep["standing_assertions"]["loss_controls_armed"] = 0
+            c_rep_path.write_text(json.dumps(c_rep), encoding="utf-8")
+            audit_c = detect_missed_runs(
+                data_dir=committed_dir,
+                config=cfg,
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+            )
+            self.assertTrue(audit_c["missed_run_detected"])
+            self.assertEqual(audit_c["silent_missed_days"], ["2025-11-21"])
+
+            # 2. Fail-closed report missing retrieval_time_utc or series_id must be flagged silent_missed
+            fc_dir = root / "fc_missing_field"
+            fc0 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=fc_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h, withhold_inst="TBILL_3M"),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(fc0["appended"])
+            fc_rep_path = fc_dir / "reports" / "completeness_2025-11-21.json"
+            orig_fc_rep = json.loads(fc_rep_path.read_text(encoding="utf-8"))
+            for omitted_key in ("retrieval_time_utc", "series_id"):
+                mut_rep = json.loads(json.dumps(orig_fc_rep))
+                del mut_rep["required_series"][0][omitted_key]
+                fc_rep_path.write_text(json.dumps(mut_rep), encoding="utf-8")
+                audit_fc = detect_missed_runs(
+                    data_dir=fc_dir,
+                    config=cfg,
+                    window_start_date="2025-11-21",
+                    as_of_utc="2025-11-22T05:00:00.000Z",
+                )
+                self.assertTrue(audit_fc["missed_run_detected"])
+                self.assertEqual(audit_fc["silent_missed_days"], ["2025-11-21"])
+                self.assertEqual(audit_fc["evaluated_trading_days"][0]["status"], "missed_run_silent_failure")
+
+            # 3. Half-day (2025-11-28) run-drill --session auto with truncated seq_000000 fails closed cleanly (ledger_integrity)
+            half_dir = root / "halfday_auto_trunc"
+            (half_dir / "ledger").mkdir(parents=True, exist_ok=True)
+            (half_dir / "ledger" / "seq_000000.record.json").write_text("{", encoding="utf-8")
+            half_cfg_path = root / "halfday_cfg.json"
+            raw_cfg = json.loads(DEFAULT_SCHEDULER_CONFIG_PATH.read_text(encoding="utf-8"))
+            raw_cfg["treasury_endpoint"] = "https://treasury.example.test/yield{year}.csv"
+            half_cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            class _HalfDayPostCloseDatetime(datetime):
+                @classmethod
+                def now(cls, tz=None):  # type: ignore[override]
+                    base = datetime(2025, 11, 28, 19, 30, 0, tzinfo=timezone.utc)
+                    return base.astimezone(tz) if tz is not None else base
+
+            out_auto = io.StringIO()
+            with patch.object(sched_mod, "datetime", _HalfDayPostCloseDatetime), contextlib.redirect_stdout(out_auto):
+                rc_auto = sched_mod.main(
+                    [
+                        "run-drill",
+                        "--session",
+                        "auto",
+                        "--config",
+                        str(half_cfg_path),
+                        "--data-dir",
+                        str(half_dir),
+                    ]
+                )
+            self.assertEqual(rc_auto, 0)
+            auto_payload = json.loads(out_auto.getvalue())
+            self.assertFalse(auto_payload["appended"])
+            self.assertTrue(auto_payload["fail_closed"])
+            self.assertEqual(auto_payload["reason"], "ledger_integrity")
+            self.assertTrue((half_dir / "reports" / "completeness_2025-11-28.json").is_file())
+            self.assertFalse((half_dir / "ledger" / "seq_000001.record.json").exists())
+
+            # 4. Canonical tiers[0] = null with recomputed matching record_sha256 fails verify_chain cleanly without AttributeError
+            null_tier_dir = root / "null_tier_dir"
+            nt0 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=null_tier_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(nt0["appended"])
+            nt_rec_path = null_tier_dir / "ledger" / "seq_000000.record.json"
+            nt_env = json.loads(nt_rec_path.read_text(encoding="utf-8"))
+            nt_env["record_body"]["tiers"][0] = None
+            nt_env["record_sha256"] = sha256_canonical(nt_env["record_body"])
+            nt_rec_path.write_bytes(canonical_json_bytes(nt_env))
+            nt_ledger = ShadowLedger(null_tier_dir / "ledger")
+            ok_nt, bad_seq_nt, err_nt = nt_ledger.verify_chain()
+            self.assertFalse(ok_nt)
+            self.assertEqual(bad_seq_nt, 0)
+            self.assertIn("invalid_record_body", str(err_nt))
+            nt1 = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=null_tier_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24"),
+                treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(nt1["appended"])
+            self.assertTrue(nt1["fail_closed"])
+            self.assertEqual(nt1["reason"], "ledger_integrity")
+            self.assertFalse((null_tier_dir / "ledger" / "seq_000001.record.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

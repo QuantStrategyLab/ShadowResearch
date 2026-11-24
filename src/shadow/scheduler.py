@@ -923,7 +923,8 @@ def _is_committed_session_report_valid(
     if not isinstance(body_assert, dict):
         return False
     expected_standing = {k: body_assert.get(k) for k in _STANDING_ASSERTION_KEYS}
-    if rep_obj.get("standing_assertions") != expected_standing:
+    rep_standing = rep_obj.get("standing_assertions")
+    if not _standing_assertions_valid(rep_standing) or rep_standing != expected_standing:
         return False
 
     expected_series = _summarize_required_series(committed_mkt_records)
@@ -996,6 +997,22 @@ def _standing_assertions_valid(standing: object) -> bool:
         and standing.get("stop_loss_return_rule") == "OFF"
         and standing.get("loss_controls_armed") is False
     )
+
+
+_REQUIRED_SERIES_ROW_KEYS = frozenset(
+    {
+        "instrument",
+        "provider",
+        "series_id",
+        "status",
+        "retrieval_time_utc",
+        "normalized_value",
+        "raw_bytes_sha256",
+        "reason",
+        "disclosures",
+    }
+)
+_VALID_REQUIRED_SERIES_STATUSES = frozenset({"arrived", "revised", "missing", "late", "pre_close"})
 
 
 def _is_fail_closed_session_report_valid(
@@ -1074,18 +1091,23 @@ def _is_fail_closed_session_report_valid(
     if not isinstance(req_series, list):
         return False
     for row in req_series:
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or set(row.keys()) != _REQUIRED_SERIES_ROW_KEYS:
             return False
         if (
             not isinstance(row.get("instrument"), str)
             or not row.get("instrument")
             or not isinstance(row.get("provider"), str)
-            or not isinstance(row.get("status"), str)
-            or "raw_bytes_sha256" not in row
-            or "normalized_value" not in row
-            or "reason" not in row
-            or "disclosures" not in row
+            or not row.get("provider")
+            or not isinstance(row.get("series_id"), str)
+            or not row.get("series_id")
+            or row.get("status") not in _VALID_REQUIRED_SERIES_STATUSES
         ):
+            return False
+        ret_utc = row.get("retrieval_time_utc")
+        if row.get("status") in ("arrived", "revised"):
+            if not is_utc_ms_timestamp(ret_utc):
+                return False
+        elif ret_utc is not None and not is_utc_ms_timestamp(ret_utc):
             return False
 
     rep_rcp = rep_obj.get("receipt")
@@ -3029,7 +3051,8 @@ def _resolve_auto_run_target(
         if ledger_dir.is_dir():
             ledger = ShadowLedger(ledger_dir)
             with ledger.chain_lock():
-                prior_records = ledger.load_records()
+                ok_chain, _, _ = ledger.verify_chain()
+                prior_records = ledger.load_records() if ok_chain else []
             committed_env = next(
                 (
                     env

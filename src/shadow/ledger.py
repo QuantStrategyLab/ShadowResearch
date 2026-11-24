@@ -231,7 +231,11 @@ def validate_record_body(body: dict) -> None:
             raise CanonicalizationError(f"bankroll.{bk} invalid canonical decimal: {bankroll.get(bk)!r}")
 
     tiers = body["tiers"]
-    if not isinstance(tiers, list) or [t.get("tier_id") for t in tiers] != list(TIER_ORDER):
+    if (
+        not isinstance(tiers, list)
+        or not all(isinstance(t, dict) for t in tiers)
+        or [t.get("tier_id") for t in tiers] != list(TIER_ORDER)
+    ):
         raise CanonicalizationError(f"tiers must appear once in stable ID order {TIER_ORDER}")
     for tier in tiers:
         for tk in ("D", "k", "x_cap", "x_joint", "w_max", "sigma_target", "c", "x_ML", "x_eff_joint", "alpha_joint"):
@@ -241,7 +245,11 @@ def validate_record_body(body: dict) -> None:
         if isinstance(tier_orders, bool) or not isinstance(tier_orders, int) or tier_orders != 0:
             raise CanonicalizationError("tier orders_placed must be integer 0 in Stage N")
         funds = tier.get("funds")
-        if not isinstance(funds, list) or [f.get("instrument") for f in funds] != list(INSTRUMENT_ORDER):
+        if (
+            not isinstance(funds, list)
+            or not all(isinstance(f, dict) for f in funds)
+            or [f.get("instrument") for f in funds] != list(INSTRUMENT_ORDER)
+        ):
             raise CanonicalizationError(f"funds must appear once in stable ID order {INSTRUMENT_ORDER}")
         for fund in funds:
             for fk in (
@@ -1305,7 +1313,7 @@ class ShadowLedger:
             body = envelope["record_body"]
             try:
                 validate_record_body(body)
-            except CanonicalizationError as exc:
+            except Exception as exc:
                 return False, expected_seq, f"invalid_record_body: {exc}"
 
             if body["sequence"] != expected_seq:
