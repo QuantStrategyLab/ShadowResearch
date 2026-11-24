@@ -346,7 +346,7 @@ class CloudRunJobTest(unittest.TestCase):
             unlocked_cfg.write_text(json.dumps(raw_cfg), encoding="utf-8")
 
             hdrs: dict[int, dict[str, str]] = {}
-            heights = {"2026-01-05": 880100, "2026-01-06": 880101}
+            heights = {"2026-01-05": 880100, "2026-01-06": 880101, "2026-01-07": 880102}
 
             def _make_ots(session_date: str, block_ts: str):
                 class _Ots(OpenTimestampsClient):
@@ -576,6 +576,112 @@ class CloudRunJobTest(unittest.TestCase):
                 self.assertIn(expected_err, pw_out["reason"])
                 self.assertEqual(ShadowLedger(ddir / "ledger").load_records(), [])
                 self.assertFalse((ddir / "replay").exists())
+
+            # BTC roots without SHADOW_TRUSTED_HEAD_SHA256 must fail closed with exit 3 on fresh copy
+            reauth_dir = Path(tmpdir) / "reauth_prod_data"
+            r_init = run_cloudrun_job(
+                data_dir=reauth_dir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                },
+                ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+            )
+            init_sha = str(r_init["record_sha256"])
+
+            with self.assertRaises(EngineIdentityError) as roots_only_err:
+                run_cloudrun_job(
+                    data_dir=reauth_dir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-06",
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                    },
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                )
+            self.assertIn("production_history_unauthenticated", str(roots_only_err.exception))
+
+            # O1 rejection in Cloud Run emits pending_rejected_state_sha256; consumption requires SHADOW_TRUSTED_PENDING_STATE_SHA256
+            base_rej_t = build_live_mock_transport("2026-01-06")
+
+            def _missing_tbill_cr(url: str, headers: dict):
+                if "treasury.gov" in url.lower():
+                    return 404, b"missing"
+                return base_rej_t(url, headers)
+
+            rej_cr = run_cloudrun_job(
+                data_dir=reauth_dir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-06",
+                transport=_missing_tbill_cr,
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                },
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+            )
+            self.assertEqual(rej_cr["status"], "fail_closed")
+            pend_digest = str(rej_cr["pending_rejected_state_sha256"])
+            self.assertEqual(len(pend_digest), 64)
+
+            proc_pend_unauth = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(reauth_dir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-07",
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_pend_unauth.returncode, 3)
+            self.assertIn("production_pending_rejected_state_unauthenticated", proc_pend_unauth.stdout)
+
+            ok_after_pend = run_cloudrun_job(
+                data_dir=reauth_dir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-07",
+                transport=build_live_mock_transport("2026-01-07"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": pend_digest,
+                },
+                ots_client=_make_ots("2026-01-07", "2026-01-08T03:00:00.000Z"),
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+            )
+            self.assertEqual(ok_after_pend["status"], "committed")
+            self.assertEqual(ok_after_pend["sequence"], 1)
 
 
 if __name__ == "__main__":

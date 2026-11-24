@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -1913,6 +1914,11 @@ def save_pending_rejected_state_snapshot(
     return target
 
 
+def compute_pending_rejected_state_sha256(payload: Mapping[str, Any]) -> str:
+    """Return canonical SHA-256 over a pending rejected state snapshot payload (allows FUSE floats)."""
+    return _sha256_canonical_state_dict(payload)
+
+
 def _max_elapsed_session_steps(
     ref_dates: tuple[object, ...],
     rej_ds: str,
@@ -2201,6 +2207,45 @@ def _assert_pending_state_preserves_committed_breakers(
                     raise EngineIdentityError(f"Pending state altered committed O4.{sym}")
 
 
+def authenticate_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    expected_pending_state_sha256: str | None = None,
+    require_external_pending_auth: bool = False,
+) -> dict | None:
+    """Validate optional/required external digest authentication for pending_rejected_state.json."""
+    if expected_pending_state_sha256 is not None:
+        if not isinstance(expected_pending_state_sha256, str) or not _HEX64_RE.fullmatch(
+            expected_pending_state_sha256
+        ):
+            raise EngineIdentityError(
+                f"invalid_expected_pending_state_sha256:{expected_pending_state_sha256!r}"
+            )
+    s_dir = Path(snapshots_dir)
+    target = s_dir / "pending_rejected_state.json"
+    if not target.is_file():
+        if expected_pending_state_sha256 is not None:
+            raise EngineIdentityError("production_pending_rejected_state_missing")
+        return None
+    if require_external_pending_auth and expected_pending_state_sha256 is None:
+        raise EngineIdentityError(
+            "production_pending_rejected_state_unauthenticated: require expected_pending_state_sha256"
+        )
+    try:
+        payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt pending rejected state snapshot {target}: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-pending-rejected-state-v1":
+        raise EngineIdentityError(f"Invalid pending rejected state snapshot schema in {target}")
+    if expected_pending_state_sha256 is not None and not hmac.compare_digest(
+        compute_pending_rejected_state_sha256(payload),
+        expected_pending_state_sha256,
+    ):
+        raise EngineIdentityError("production_pending_rejected_state_mismatch")
+    return payload
+
+
 def load_pending_rejected_state_snapshot(
     snapshots_dir: str | Path,
     *,
@@ -2213,19 +2258,17 @@ def load_pending_rejected_state_snapshot(
     expected_base_prior_state_sha256: str | None = None,
     committed_base_prior_row_state: Mapping[str, Any] | None = None,
     expected_base_session_date: str | None = None,
+    expected_pending_state_sha256: str | None = None,
+    require_external_pending_auth: bool = False,
 ) -> tuple[dict, dict] | None:
     """Load and verify pending O1/O2 rejected-day row state if present (fail closed on tamper/drift)."""
-    s_dir = Path(snapshots_dir)
-    target = s_dir / "pending_rejected_state.json"
-    if not target.is_file():
+    payload = authenticate_pending_rejected_state_snapshot(
+        snapshots_dir,
+        expected_pending_state_sha256=expected_pending_state_sha256,
+        require_external_pending_auth=require_external_pending_auth,
+    )
+    if payload is None:
         return None
-    try:
-        payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise EngineIdentityError(f"Corrupt pending rejected state snapshot {target}: {exc}") from exc
-
-    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-pending-rejected-state-v1":
-        raise EngineIdentityError(f"Invalid pending rejected state snapshot schema in {target}")
     if payload.get("chain_id") != expected_chain_id:
         raise EngineIdentityError(
             f"Pending state chain_id mismatch: expected {expected_chain_id!r}, got {payload.get('chain_id')!r}"

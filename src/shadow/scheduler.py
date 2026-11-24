@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hmac
 import json
 import os
 import re
@@ -56,10 +57,12 @@ from shadow.ledger import (
     _HEX64_RE,
     _atomic_write_bytes,
     _sha256_canonical_state_dict,
+    authenticate_pending_rejected_state_snapshot,
     build_record_body,
     canonical_json_bytes,
     compute_code_manifest_hash,
     compute_inputs_digest,
+    compute_pending_rejected_state_sha256,
     compute_session_commitment_deadline_utc,
     has_committed_detached_evidence,
     is_receipt_timely,
@@ -1896,6 +1899,7 @@ def run_production_cycle(
     allow_unanchored_on_ots_failure: bool = False,
     evaluator: object | None = None,
     expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
 ) -> dict:
     """Execute one CLK-01 production cycle ONLY when OA-SH2-2 lock is explicitly unlocked."""
@@ -1943,6 +1947,7 @@ def run_production_cycle(
         allow_unanchored_on_ots_failure=False,
         evaluator=ev,
         expected_prior_head_sha256=expected_prior_head_sha256,
+        expected_pending_state_sha256=expected_pending_state_sha256,
         bitcoin_merkle_roots=bitcoin_merkle_roots,
         _post_ledger_commit_hook=None,
         _post_record_commit_hook=None,
@@ -1973,6 +1978,7 @@ def _execute_cycle_with_config(
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
     expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
@@ -2049,6 +2055,7 @@ def _execute_cycle_with_config(
             allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
             evaluator=evaluator,
             expected_prior_head_sha256=expected_prior_head_sha256,
+            expected_pending_state_sha256=expected_pending_state_sha256,
             bitcoin_merkle_roots=bitcoin_merkle_roots,
             _post_ledger_commit_hook=_post_ledger_commit_hook,
             _post_record_commit_hook=_post_record_commit_hook,
@@ -2411,9 +2418,11 @@ def _authenticate_production_history(
     prior_records: list[dict],
     session_date: str,
     expected_prior_head_sha256: str | None,
+    expected_pending_state_sha256: str | None = None,
+    snapshots_dir: Path | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None,
 ) -> None:
-    """Fail closed if persisted production history is unauthenticated before reuse."""
+    """Fail closed if persisted production history or pending state is unauthenticated before reuse."""
     if cfg.mode != "production":
         return
     if expected_prior_head_sha256 is not None:
@@ -2428,44 +2437,46 @@ def _authenticate_production_history(
             raise EngineIdentityError(
                 "production_genesis_unauthenticated: require expected_prior_head_sha256=GENESIS_PREV_HASH"
             )
-        if expected_prior_head_sha256 != GENESIS_PREV_HASH:
+        if not hmac.compare_digest(expected_prior_head_sha256, GENESIS_PREV_HASH):
             raise EngineIdentityError("production_trusted_head_mismatch:empty_ledger")
+        if snapshots_dir is not None:
+            authenticate_pending_rejected_state_snapshot(
+                snapshots_dir,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                require_external_pending_auth=True,
+            )
         return
 
-    if expected_prior_head_sha256 is None and bitcoin_merkle_roots is None:
+    if expected_prior_head_sha256 is None:
         raise EngineIdentityError(
-            "production_history_unauthenticated: require expected_prior_head_sha256 or bitcoin_merkle_roots"
+            "production_history_unauthenticated: require expected_prior_head_sha256"
         )
 
-    if expected_prior_head_sha256 is not None:
-        existing_env = next(
-            (
-                r
-                for r in prior_records
-                if isinstance(r, dict)
-                and isinstance(r.get("record_body"), dict)
-                and r["record_body"].get("session_date") == session_date
-            ),
-            None,
+    existing_env = next(
+        (
+            r
+            for r in prior_records
+            if isinstance(r, dict)
+            and isinstance(r.get("record_body"), dict)
+            and r["record_body"].get("session_date") == session_date
+        ),
+        None,
+    )
+    head_rec_sha = prior_records[-1]["record_sha256"]
+    if existing_env is not None and existing_env["record_body"]["sequence"] != len(prior_records) - 1:
+        raise EngineIdentityError("production_trusted_head_mismatch")
+    if not isinstance(head_rec_sha, str) or not hmac.compare_digest(
+        head_rec_sha,
+        expected_prior_head_sha256,
+    ):
+        raise EngineIdentityError("production_trusted_head_mismatch")
+
+    if existing_env is None and snapshots_dir is not None:
+        authenticate_pending_rejected_state_snapshot(
+            snapshots_dir,
+            expected_pending_state_sha256=expected_pending_state_sha256,
+            require_external_pending_auth=True,
         )
-        head_rec_sha = prior_records[-1]["record_sha256"]
-        if existing_env is None:
-            if head_rec_sha != expected_prior_head_sha256:
-                raise EngineIdentityError("production_trusted_head_mismatch")
-        else:
-            ex_seq = existing_env["record_body"]["sequence"]
-            ex_prev = existing_env["record_body"]["prev_record_sha256"]
-            if ex_seq != len(prior_records) - 1:
-                raise EngineIdentityError("production_trusted_head_mismatch")
-            if expected_prior_head_sha256 == existing_env["record_sha256"]:
-                pass
-            elif expected_prior_head_sha256 == ex_prev:
-                if bitcoin_merkle_roots is None:
-                    raise EngineIdentityError(
-                        "production_retry_unauthenticated_head: require current record_sha256 or bitcoin_merkle_roots"
-                    )
-            else:
-                raise EngineIdentityError("production_trusted_head_mismatch")
 
     if bitcoin_merkle_roots is not None:
         ok_credit, credit_issues = ledger.assess_receipt_creditability(
@@ -2507,6 +2518,7 @@ def _run_daily_drill_cycle_locked(
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
     expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
@@ -2568,6 +2580,8 @@ def _run_daily_drill_cycle_locked(
         prior_records=prior_records,
         session_date=session_date,
         expected_prior_head_sha256=expected_prior_head_sha256,
+        expected_pending_state_sha256=expected_pending_state_sha256,
+        snapshots_dir=root / "state_snapshots",
         bitcoin_merkle_roots=bitcoin_merkle_roots,
     )
     prior_streak = _count_consecutive_trading_sessions(
@@ -3159,6 +3173,8 @@ def _run_daily_drill_cycle_locked(
             expected_base_prior_state_sha256=expected_base_prior_sha,
             committed_base_prior_row_state=committed_base_state,
             expected_base_session_date=expected_base_sess_date,
+            expected_pending_state_sha256=expected_pending_state_sha256,
+            require_external_pending_auth=(cfg.mode == "production"),
         )
         if pending_rej is not None:
             prior_state = pending_rej[0]
@@ -3298,8 +3314,9 @@ def _run_daily_drill_cycle_locked(
             )
 
     if not built["appended"]:
+        pending_sha: str | None = None
         if not is_stub_evaluator(ev) and isinstance(built.get("next_row_state"), dict):
-            save_pending_rejected_state_snapshot(
+            pending_path = save_pending_rejected_state_snapshot(
                 snapshots_dir,
                 chain_id=cfg.chain_id,
                 base_sequence=seq - 1,
@@ -3310,8 +3327,11 @@ def _run_daily_drill_cycle_locked(
                 next_row_state=built["next_row_state"],
                 base_prior_row_state=session_base_prior_state,
             )
+            pending_sha = compute_pending_rejected_state_sha256(
+                parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
+            )
         fail_reason = built["o1_output"].get("reason") or built.get("o2_output", {}).get("reason")
-        return _build_fail_closed_result(
+        fail_res = _build_fail_closed_result(
             t_start=t_start,
             root=root,
             reports_dir=reports_dir,
@@ -3329,6 +3349,9 @@ def _run_daily_drill_cycle_locked(
             receipt_status="not_applicable_fail_closed",
             receipt_reasons=["fail_closed_no_append", f"{cfg.mode}_mode"],
         )
+        if pending_sha is not None:
+            fail_res["pending_rejected_state_sha256"] = pending_sha
+        return fail_res
 
     # Step 4: Obtain detached OTS receipt, check real post-stamp wall-clock, commit atomically
     body = built["record_body"]

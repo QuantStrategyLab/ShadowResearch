@@ -8,10 +8,11 @@
 # - One-time genesis initialization (seq=0 on empty SHADOW_DATA_DIR): set
 #   SHADOW_TRUSTED_HEAD_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
 #   (GENESIS_PREV_HASH) once, then replace or remove it after seq=0 commits.
-# - Recurring runs & retries (seq >= 1): set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret Manager)
-#   to the latest committed head (including for same-session retries unless external
-#   SHADOW_BITCOIN_MERKLE_ROOTS_PATH independently attests the committed record) WITHOUT keeping the
-#   zero genesis marker, so an emptied/wiped bucket or forged same-session record fails closed (exit 3).
+# - Recurring runs & retries (seq >= 1): ALWAYS set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret
+#   Manager) to the externally authorized committed head digest (for both advancing runs and
+#   same-session retries) WITHOUT keeping the zero genesis marker; optional SHADOW_BITCOIN_MERKLE_ROOTS_PATH
+#   adds corroborating OTS verification, and SHADOW_TRUSTED_PENDING_STATE_SHA256 pins any pending
+#   rejected_state snapshot emitted after an O1/O2 failure.
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
@@ -42,11 +43,16 @@ spec:
                   value: /app/config/production-scheduler.json
                 - name: SHADOW_CHAIN_MODE
                   value: production
-                # Genesis requires GENESIS_PREV_HASH (0*64); recurring chains require latest head and/or BTC roots:
+                # Genesis requires GENESIS_PREV_HASH (0*64); recurring chains always require authorized head SHA-256:
                 # - name: SHADOW_TRUSTED_HEAD_SHA256
                 #   valueFrom:
                 #     secretKeyRef:
                 #       name: shadow-trusted-head-sha256
+                #       key: latest
+                # - name: SHADOW_TRUSTED_PENDING_STATE_SHA256
+                #   valueFrom:
+                #     secretKeyRef:
+                #       name: shadow-trusted-pending-state-sha256
                 #       key: latest
                 # - name: SHADOW_BITCOIN_MERKLE_ROOTS_PATH
                 #   value: /var/run/shadow/trusted/bitcoin-merkle-roots.json

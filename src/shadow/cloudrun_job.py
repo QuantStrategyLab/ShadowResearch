@@ -84,6 +84,7 @@ def run_cloudrun_job(
     environ: Mapping[str, str] | None = None,
     allow_unanchored_on_ots_failure: bool | None = None,
     expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
     bitcoin_merkle_roots_path: str | Path | None = None,
 ) -> dict[str, object]:
@@ -149,6 +150,11 @@ def run_cloudrun_job(
             if expected_prior_head_sha256 is not None
             else (env.get("SHADOW_TRUSTED_HEAD_SHA256", "").strip() or None)
         )
+        eff_expected_pending_state = (
+            expected_pending_state_sha256
+            if expected_pending_state_sha256 is not None
+            else (env.get("SHADOW_TRUSTED_PENDING_STATE_SHA256", "").strip() or None)
+        )
         eff_roots: Mapping[int, object] | None = bitcoin_merkle_roots
         if eff_roots is None:
             roots_path_raw = (
@@ -174,6 +180,7 @@ def run_cloudrun_job(
             allow_unanchored_on_ots_failure=False,
             evaluator=ev,
             expected_prior_head_sha256=eff_expected_prior_head,
+            expected_pending_state_sha256=eff_expected_pending_state,
             bitcoin_merkle_roots=eff_roots,
         )
     else:
@@ -210,7 +217,7 @@ def run_cloudrun_job(
         status = "completed"
         idempotent_noop = False
 
-    return {
+    out_payload: dict[str, object] = {
         "schema_version": "sh2-cloudrun-job-result-v1",
         "status": status,
         "idempotent_noop": idempotent_noop,
@@ -242,6 +249,9 @@ def run_cloudrun_job(
             "production_chain_locked": bool(cfg.production_chain_locked is not False),
         },
     }
+    if result.get("pending_rejected_state_sha256") is not None:
+        out_payload["pending_rejected_state_sha256"] = result.get("pending_rejected_state_sha256")
+    return out_payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,6 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Expected prior production ledger head SHA-256 (overrides SHADOW_TRUSTED_HEAD_SHA256)",
     )
     parser.add_argument(
+        "--expected-pending-state-sha256",
+        help="Expected pending_rejected_state.json SHA-256 (overrides SHADOW_TRUSTED_PENDING_STATE_SHA256)",
+    )
+    parser.add_argument(
         "--bitcoin-merkle-roots-path",
         help="Path to trusted Bitcoin merkle roots JSON (overrides SHADOW_BITCOIN_MERKLE_ROOTS_PATH)",
     )
@@ -274,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
             fixtures_dir=args.fixtures_dir,
             spec_dir=args.spec_dir,
             expected_prior_head_sha256=args.expected_prior_head_sha256,
+            expected_pending_state_sha256=args.expected_pending_state_sha256,
             bitcoin_merkle_roots_path=args.bitcoin_merkle_roots_path,
         )
     except ProductionChainLockedError as exc:

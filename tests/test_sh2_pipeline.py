@@ -1583,23 +1583,29 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertTrue(r0["appended"])
             seq0_sha = r0["record_sha256"]
 
-            # 2. Unauthenticated non-empty production ledger fails closed (0 appends)
-            with self.assertRaises(EngineIdentityError) as unauth_ctx:
-                run_production_cycle(
-                    session_date="2026-01-06",
-                    data_dir=root,
-                    config_path=cfg_path,
-                    transport=build_live_mock_transport("2026-01-06"),
-                    environ={"TIINGO_API_KEY": "test-dummy-token"},
-                    ots_client=_make_ots("2026-01-07T03:00:00.000Z", "2026-01-06"),
-                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
-                    clock=_fast_clock(),
-                    sleeper=lambda _s: None,
-                )
-            self.assertIn("production_history_unauthenticated", str(unauth_ctx.exception))
+            # 2. Unauthenticated non-empty production ledger fails closed (0 appends),
+            # including when bitcoin_merkle_roots is passed WITHOUT expected_prior_head_sha256
+            for unauth_kw in (
+                {},
+                {"bitcoin_merkle_roots": dict(hdrs)},
+            ):
+                with self.assertRaises(EngineIdentityError) as unauth_ctx:
+                    run_production_cycle(
+                        session_date="2026-01-06",
+                        data_dir=root,
+                        config_path=cfg_path,
+                        transport=build_live_mock_transport("2026-01-06"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token"},
+                        ots_client=_make_ots("2026-01-07T03:00:00.000Z", "2026-01-06"),
+                        wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                        clock=_fast_clock(),
+                        sleeper=lambda _s: None,
+                        **unauth_kw,
+                    )
+                self.assertIn("production_history_unauthenticated", str(unauth_ctx.exception))
             self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 1)
 
-            # 3. Mismatched trusted head or non-creditable Bitcoin roots fail closed (0 appends)
+            # 3. Mismatched trusted head fails closed (0 appends)
             with self.assertRaises(EngineIdentityError):
                 run_production_cycle(
                     session_date="2026-01-06",
@@ -1624,10 +1630,11 @@ class Sh2PipelineTest(unittest.TestCase):
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                     clock=_fast_clock(),
                     sleeper=lambda _s: None,
+                    expected_prior_head_sha256=seq0_sha,
                     bitcoin_merkle_roots={880100: {"merkle_root": "a" * 64, "timestamp": "2026-01-06T03:00:00.000Z"}},
                 )
 
-            # 4. Authenticated with valid bitcoin_merkle_roots -> seq=1 commits cleanly
+            # 4. Authenticated with authorized head seq0_sha (+ corroborating BTC roots) -> seq=1 commits
             r1 = run_production_cycle(
                 session_date="2026-01-06",
                 data_dir=root,
@@ -1638,25 +1645,28 @@ class Sh2PipelineTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
+                expected_prior_head_sha256=seq0_sha,
                 bitcoin_merkle_roots=dict(hdrs),
             )
             self.assertTrue(r1["appended"])
             self.assertEqual(r1["sequence"], 1)
             seq1_sha = r1["record_sha256"]
 
-            # 5. Same-session retry requires current record_sha256 OR external BTC roots;
-            # ex_prev (seq0_sha) alone fails closed against forged same-session substitution
-            with self.assertRaises(EngineIdentityError) as stale_retry_ctx:
-                run_production_cycle(
-                    session_date="2026-01-06",
-                    data_dir=root,
-                    config_path=cfg_path,
-                    transport=build_live_mock_transport("2026-01-06"),
-                    environ={"TIINGO_API_KEY": "test-dummy-token"},
-                    wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
-                    expected_prior_head_sha256=seq0_sha,
-                )
-            self.assertIn("production_retry_unauthenticated_head", str(stale_retry_ctx.exception))
+            # 5. Same-session retry requires exact committed record_sha256 (seq1_sha);
+            # seq0_sha fails closed even when bitcoin_merkle_roots is provided
+            for extra_btc in (None, dict(hdrs)):
+                with self.assertRaises(EngineIdentityError) as stale_retry_ctx:
+                    run_production_cycle(
+                        session_date="2026-01-06",
+                        data_dir=root,
+                        config_path=cfg_path,
+                        transport=build_live_mock_transport("2026-01-06"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token"},
+                        wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                        expected_prior_head_sha256=seq0_sha,
+                        bitcoin_merkle_roots=extra_btc,
+                    )
+                self.assertIn("production_trusted_head_mismatch", str(stale_retry_ctx.exception))
 
             # Reproduce forged same-session record/receipt + deleted report using unchanged seq0_sha
             forged_root = Path(tmpdir) / "forged_retry_root"
@@ -1677,9 +1687,9 @@ class Sh2PipelineTest(unittest.TestCase):
                 forged_root / "reports" / "completeness_2026-01-06.md",
             ):
                 p.unlink(missing_ok=True)
-            forged_ots, _ = build_synthetic_ots_fixture(
+            forged_ots, forged_merkle = build_synthetic_ots_fixture(
                 sha256_canonical(forged_body),
-                bitcoin_height=999999,
+                bitcoin_height=880199,
             )
             forged_env = forged_ledger.append_record(
                 forged_body,
@@ -1697,7 +1707,13 @@ class Sh2PipelineTest(unittest.TestCase):
                 spec_version=PINNED_FUSE_SPEC_VERSION,
                 next_row_state={},
             )
-            for extra_btc in (None, dict(hdrs)):
+            # Even with a valid creditable BTC root for the forged height, omitted or old trusted head fails closed
+            alt_hdrs = {**hdrs, 880199: {"merkle_root": forged_merkle, "timestamp": "2026-01-07T03:00:00.000Z"}}
+            for head_arg, btc_arg in (
+                (seq0_sha, None),
+                (seq0_sha, dict(hdrs)),
+                (None, alt_hdrs),
+            ):
                 with self.assertRaises(EngineIdentityError):
                     run_production_cycle(
                         session_date="2026-01-06",
@@ -1706,15 +1722,15 @@ class Sh2PipelineTest(unittest.TestCase):
                         transport=build_live_mock_transport("2026-01-06"),
                         environ={"TIINGO_API_KEY": "test-dummy-token"},
                         wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
-                        expected_prior_head_sha256=seq0_sha,
-                        bitcoin_merkle_roots=extra_btc,
+                        expected_prior_head_sha256=head_arg,
+                        bitcoin_merkle_roots=btc_arg,
                     )
                 self.assertFalse((forged_root / "reports" / "completeness_2026-01-06.json").exists())
 
-            # Legitimate retries succeed with current seq1_sha OR (seq0_sha + verified BTC roots)
+            # Legitimate retries succeed with exact committed seq1_sha
             for retry_kw in (
                 {"expected_prior_head_sha256": seq1_sha},
-                {"expected_prior_head_sha256": seq0_sha, "bitcoin_merkle_roots": dict(hdrs)},
+                {"expected_prior_head_sha256": seq1_sha, "bitcoin_merkle_roots": dict(hdrs)},
             ):
                 r1_retry = run_production_cycle(
                     session_date="2026-01-06",
@@ -1902,6 +1918,144 @@ class Sh2PipelineTest(unittest.TestCase):
             for u in seen_tiingo_urls:
                 self.assertIn("startDate=2026-01-02", u)
                 self.assertIn("endDate=2026-01-05", u)
+
+    def test_production_pending_rejected_state_requires_external_authentication(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+
+        class _FakeOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "unlocked.json"
+            cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            root = Path(tmpdir) / "prod_pending_auth"
+
+            r0 = run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+            )
+            self.assertTrue(r0["appended"])
+            seq0_sha = str(r0["record_sha256"])
+
+            base_rej_transport = build_live_mock_transport("2026-01-06")
+
+            def _missing_tbill_transport(url: str, headers: dict):
+                if "treasury.gov" in url.lower():
+                    return 404, b"missing"
+                return base_rej_transport(url, headers)
+
+            r_rej = run_production_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=_missing_tbill_transport,
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                expected_prior_head_sha256=seq0_sha,
+            )
+            self.assertFalse(r_rej["appended"])
+            self.assertTrue(r_rej["fail_closed"])
+            pending_sha = str(r_rej["pending_rejected_state_sha256"])
+            pend_path = root / "state_snapshots" / "pending_rejected_state.json"
+            self.assertTrue(pend_path.is_file())
+            orig_pend_bytes = pend_path.read_bytes()
+
+            # 1. Omitting expected_pending_state_sha256 fails closed when pending_rejected_state.json exists
+            with self.assertRaises(EngineIdentityError) as ctx_unauth:
+                run_production_cycle(
+                    session_date="2026-01-07",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_FakeOts(),
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    expected_prior_head_sha256=seq0_sha,
+                )
+            self.assertIn("production_pending_rejected_state_unauthenticated", str(ctx_unauth.exception))
+
+            # 2. Tampering pending_rejected_state.json (with recomputed colocated state_sha256) fails closed
+            tampered_obj = json.loads(orig_pend_bytes.decode("utf-8"))
+            tampered_obj["next_row_state"] = {}
+            tampered_obj["state_sha256"] = _sha256_canonical_state_dict({})
+            pend_path.write_text(json.dumps(tampered_obj), encoding="utf-8")
+            with self.assertRaises(EngineIdentityError) as ctx_tamper:
+                run_production_cycle(
+                    session_date="2026-01-07",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_FakeOts(),
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    expected_prior_head_sha256=seq0_sha,
+                    expected_pending_state_sha256=pending_sha,
+                )
+            self.assertIn("production_pending_rejected_state_mismatch", str(ctx_tamper.exception))
+
+            # 3. Deleting pending_rejected_state.json while expected_pending_state_sha256 is pinned fails closed
+            pend_path.unlink()
+            with self.assertRaises(EngineIdentityError) as ctx_missing:
+                run_production_cycle(
+                    session_date="2026-01-07",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_FakeOts(),
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    expected_prior_head_sha256=seq0_sha,
+                    expected_pending_state_sha256=pending_sha,
+                )
+            self.assertIn("production_pending_rejected_state_missing", str(ctx_missing.exception))
+
+            # 4. Restoring intact pending_rejected_state.json + matching pending_sha preserves V4 latch & commits
+            pend_path.write_bytes(orig_pend_bytes)
+            r_ok = run_production_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-07"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                expected_prior_head_sha256=seq0_sha,
+                expected_pending_state_sha256=pending_sha,
+            )
+            self.assertTrue(r_ok["appended"])
+            self.assertEqual(r_ok["sequence"], 1)
+            self.assertFalse(pend_path.exists())
+            recs = ShadowLedger(root / "ledger").load_records()
+            v4_row = next(b for b in recs[1]["record_body"]["evaluator"]["breakers"] if b["id"] == "V4")
+            self.assertEqual(v4_row["state"], "NO-NEW-RISK")
+            self.assertEqual(v4_row["reason"], "volatility_below_2x_but_not_yet_cleared")
+            self.assertEqual(v4_row["outputs"]["TQQQ"]["clearing_counter"], 1)
 
 
 if __name__ == "__main__":
