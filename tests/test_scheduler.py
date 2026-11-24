@@ -2388,6 +2388,118 @@ class SchedulerTest(unittest.TestCase):
                 0,
             )
 
+    def test_r8_committed_tail_not_pruned_and_config_change_no_overwrite(self) -> None:
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. R8 #1: Deleting committed Day 2 record.json while completeness_2025-11-24.json still shows
+            #    appended=True MUST fail closed and MUST NOT prune Day 2 bundle/OTS/receipt on Day 3!
+            missing_rec_dir = root / "committed_missing_record"
+            for ds in ("2025-11-21", "2025-11-24"):
+                res = run_daily_drill_cycle(
+                    session_date=ds,
+                    data_dir=missing_rec_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock(ds),
+                    sleeper=lambda _: None,
+                )
+                self.assertTrue(res["appended"])
+
+            rec1 = missing_rec_dir / "ledger" / "seq_000001.record.json"
+            ots1 = missing_rec_dir / "ledger" / "seq_000001.ots"
+            rcp1 = missing_rec_dir / "ledger" / "seq_000001.receipt.json"
+            self.assertTrue(rec1.is_file() and ots1.is_file() and rcp1.is_file())
+            rec1.unlink()
+
+            day3_res = run_daily_drill_cycle(
+                session_date="2025-11-25",
+                data_dir=missing_rec_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-25"),
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(day3_res["appended"])
+            self.assertTrue(day3_res["fail_closed"])
+            self.assertEqual(day3_res["reason"], "incomplete_or_corrupt_replay_bundle")
+            self.assertIn("committed_session_missing_ledger_record:2025-11-24:seq=1", day3_res["detail"])
+            # Crucially, Day 2 evidence was NOT destroyed
+            self.assertTrue(ots1.is_file())
+            self.assertTrue(rcp1.is_file())
+            bundle_after = json.loads((missing_rec_dir / "replay" / "replay_bundle.json").read_text(encoding="utf-8"))
+            self.assertEqual([s.get("session_date") for s in bundle_after["sessions"]], ["2025-11-21", "2025-11-24"])
+
+            missed = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-25T05:00:00.000Z",
+                data_dir=missing_rec_dir,
+                config=cfg,
+            )
+            self.assertTrue(missed["missed_run_detected"])
+            self.assertEqual(missed["ok_days"], [])
+            self.assertIn("2025-11-24", missed["silent_missed_days"])
+            self.assertIn("2025-11-24", missed["failed_days"])
+
+            # 2. R8 #2: Tightening scheduler cutoff/deadline after commit MUST NOT rewrite report or count ok_days
+            cfg_dir = root / "config_conflict"
+            commit_res = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=cfg_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(commit_res["appended"])
+            rep_path = cfg_dir / "reports" / "completeness_2025-11-21.json"
+            orig_rep_bytes = rep_path.read_bytes()
+
+            tighter_cfg = replace(
+                cfg,
+                decision_instant_et="16:30",
+                decision_cutoff_et="17:00",
+                commitment_deadline_et="17:01",
+            )
+            # Retry inside tighter window (16:40 ET = 21:40 UTC) MUST fail closed & keep original report intact
+            retry_tight = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=cfg_dir,
+                config=tighter_cfg,
+                wall_clock=_tick_clock("2025-11-21", "21:40:00"),
+            )
+            self.assertFalse(retry_tight["appended"])
+            self.assertTrue(retry_tight["fail_closed"])
+            self.assertFalse(retry_tight["recovered_missing_report"])
+            self.assertFalse(retry_tight["report_written"])
+            self.assertTrue(retry_tight["existing_report_preserved"])
+            self.assertEqual(rep_path.read_bytes(), orig_rep_bytes)
+
+            # Tightening cutoff alone (keeping 23:30 deadline) MUST also refuse ok_days in detect_missed_runs
+            tighter_cutoff_only = replace(
+                cfg,
+                decision_instant_et="16:30",
+                decision_cutoff_et="17:00",
+            )
+            missed_tight = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+                data_dir=cfg_dir,
+                config=tighter_cutoff_only,
+            )
+            self.assertEqual(missed_tight["ok_days"], [])
+            self.assertIn("2025-11-21", missed_tight["failed_days"])
+
 
 if __name__ == "__main__":
     unittest.main()

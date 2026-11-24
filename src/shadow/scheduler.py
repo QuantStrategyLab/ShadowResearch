@@ -560,6 +560,7 @@ def _validate_replay_bundle_matches_ledger(
     allow_trailing_uncommitted_tail: bool = False,
     prune_uncommitted_tail: bool = False,
     ledger: ShadowLedger | None = None,
+    reports_dir: Path | None = None,
 ) -> tuple[bool, str | None, dict | None]:
     """Require replay_bundle.json to match all committed prior_records when ledger is non-empty."""
     if not prior_records:
@@ -640,6 +641,41 @@ def _validate_replay_bundle_matches_ledger(
             date.fromisoformat(tail_ds)
         except ValueError:
             return False, f"invalid_trailing_bundle_session_date:{tail_ds!r}", None
+        if reports_dir is not None:
+            tail_json = reports_dir / f"completeness_{tail_ds}.json"
+            tail_md = reports_dir / f"completeness_{tail_ds}.md"
+            if tail_json.is_file():
+                try:
+                    tail_rep = parse_json_no_duplicates(tail_json.read_text(encoding="utf-8"))
+                except Exception:
+                    return False, f"committed_tail_report_unreadable:{tail_ds}", None
+                if isinstance(tail_rep, dict):
+                    tail_lmeta = tail_rep.get("ledger")
+                    if isinstance(tail_lmeta, dict) and (
+                        tail_lmeta.get("appended") is True
+                        or tail_lmeta.get("sequence") == n
+                        or (
+                            isinstance(tail_lmeta.get("chain_head_digest"), str)
+                            and len(tail_lmeta.get("chain_head_digest")) == 64
+                            and tail_lmeta.get("fail_closed_reason") is None
+                        )
+                    ):
+                        return (
+                            False,
+                            f"committed_session_missing_ledger_record:{tail_ds}:seq={n}",
+                            None,
+                        )
+            elif tail_md.is_file():
+                try:
+                    md_txt = tail_md.read_text(encoding="utf-8")
+                except Exception:
+                    return False, f"committed_tail_report_unreadable:{tail_ds}", None
+                if "- **Appended:** `True`" in md_txt or f"- **Sequence:** `{n}`" in md_txt:
+                    return (
+                        False,
+                        f"committed_session_missing_ledger_record:{tail_ds}:seq={n}",
+                        None,
+                    )
         if prune_uncommitted_tail:
             bundle_obj["sessions"] = list(sessions[:n])
             _atomic_write_text(bundle_path, json.dumps(bundle_obj, indent=2, sort_keys=True) + "\n")
@@ -705,6 +741,14 @@ def _is_committed_session_report_valid(
     if rep_obj.get("commitment_deadline_utc") != deadlines.get("commitment_deadline_utc"):
         return False
     if rep_obj.get("decision_timestamp_utc") != body.get("decision_timestamp_utc"):
+        return False
+    decision_ts = body.get("decision_timestamp_utc")
+    if (
+        not is_utc_ms_timestamp(decision_ts)
+        or decision_ts < deadlines["session_close_utc"]
+        or decision_ts > deadlines["decision_cutoff_utc"]
+        or decision_ts > deadlines["commitment_deadline_utc"]
+    ):
         return False
     if rep_obj.get("observation_class") != body.get("observation_class"):
         return False
@@ -1471,6 +1515,7 @@ def _run_daily_drill_cycle_locked(
             allow_trailing_uncommitted_tail=True,
             prune_uncommitted_tail=True,
             ledger=ledger,
+            reports_dir=reports_dir,
         )
         if not bundle_ok:
             bundle_reason = (
@@ -1567,6 +1612,68 @@ def _run_daily_drill_cycle_locked(
                 "existing_report_preserved": True,
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
+
+        ex_decision_utc = ex_body.get("decision_timestamp_utc")
+        if (
+            not is_utc_ms_timestamp(ex_decision_utc)
+            or ex_decision_utc < session_close_utc
+            or ex_decision_utc > decision_cutoff_utc
+            or ex_decision_utc > deadline_utc
+        ):
+            return {
+                "appended": False,
+                "recovered_missing_report": False,
+                "fail_closed": True,
+                "reason": "committed_session_deadline_config_conflict",
+                "detail": (
+                    f"Committed session {session_date} decision {ex_decision_utc} falls outside "
+                    f"configured window [{session_close_utc}, cutoff={decision_cutoff_utc}, deadline={deadline_utc}]"
+                ),
+                "sequence": ex_seq,
+                "record_sha256": existing_env["record_sha256"],
+                "report": None,
+                "report_paths": [],
+                "report_written": False,
+                "existing_report_preserved": json_path.exists() or md_path.exists(),
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
+
+        if json_path.is_file():
+            try:
+                prior_rep_obj = parse_json_no_duplicates(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                prior_rep_obj = None
+            if isinstance(prior_rep_obj, dict):
+                prior_lmeta = prior_rep_obj.get("ledger")
+                prior_cutoff = prior_rep_obj.get("decision_cutoff_utc")
+                prior_deadline = prior_rep_obj.get("commitment_deadline_utc")
+                if (
+                    isinstance(prior_lmeta, dict)
+                    and prior_lmeta.get("appended") is True
+                    and prior_lmeta.get("chain_head_digest") == existing_env["record_sha256"]
+                    and (
+                        (is_utc_ms_timestamp(prior_cutoff) and prior_cutoff != decision_cutoff_utc)
+                        or (is_utc_ms_timestamp(prior_deadline) and prior_deadline != deadline_utc)
+                    )
+                ):
+                    return {
+                        "appended": False,
+                        "recovered_missing_report": False,
+                        "fail_closed": True,
+                        "reason": "committed_report_config_mismatch",
+                        "detail": (
+                            f"Committed report for {session_date} was written under cutoff={prior_cutoff} "
+                            f"deadline={prior_deadline}, conflicting with current config cutoff={decision_cutoff_utc} "
+                            f"deadline={deadline_utc}"
+                        ),
+                        "sequence": ex_seq,
+                        "record_sha256": existing_env["record_sha256"],
+                        "report": prior_rep_obj,
+                        "report_paths": [str(json_path), str(md_path)] if md_path.is_file() else [str(json_path)],
+                        "report_written": False,
+                        "existing_report_preserved": True,
+                        "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+                    }
 
         recovered_series = _summarize_required_series(recovered_mkt_records)
         receipt_summary = _summarize_committed_receipt(
@@ -2020,6 +2127,7 @@ def detect_missed_runs(
             spec=spec,
             allow_trailing_uncommitted_tail=True,
             prune_uncommitted_tail=False,
+            reports_dir=reports_dir,
         )
 
     as_of_dt = _parse_utc_iso(as_of_utc)
@@ -2085,6 +2193,10 @@ def detect_missed_runs(
                 backfill_anomalies.append(ds)
                 failed_days.append(ds)
                 detail = "decision_timestamp_after_commitment_deadline"
+            elif body["decision_timestamp_utc"] > deadlines["decision_cutoff_utc"]:
+                status = "failed_documented"
+                failed_days.append(ds)
+                detail = "decision_timestamp_after_decision_cutoff"
             else:
                 rpath = ledger._receipt_path(seq)
                 opath = ledger._ots_path(seq)
@@ -2152,13 +2264,16 @@ def detect_missed_runs(
                                 detail = "appended_with_timely_receipt"
         elif rep_obj is not None:
             rep_created = rep_obj.get("created_at_utc")
-            rep_reason = str(
-                rep_obj.get("ledger", {}).get("fail_closed_reason")
-                if isinstance(rep_obj.get("ledger"), dict)
-                else ""
-            )
+            rep_ledger = rep_obj.get("ledger") if isinstance(rep_obj.get("ledger"), dict) else {}
+            rep_appended = rep_ledger.get("appended") is True
+            rep_reason = str(rep_ledger.get("fail_closed_reason", ""))
             rep_decision = rep_obj.get("decision_timestamp_utc")
-            if (
+            if rep_appended:
+                status = "incomplete_or_corrupt_replay_bundle"
+                silent_missed_days.append(ds)
+                failed_days.append(ds)
+                detail = "committed_report_present_without_ledger_record"
+            elif (
                 not is_utc_ms_timestamp(rep_created)
                 or rep_created < deadlines["session_close_utc"]
                 or rep_created > deadline_utc
