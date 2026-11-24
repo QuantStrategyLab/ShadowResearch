@@ -1118,6 +1118,126 @@ class Sh2PipelineTest(unittest.TestCase):
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                 )
 
+    def test_consecutive_rejected_sessions_preserve_committed_base_and_v4_clearing_progress(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "multi_day_rej"
+            f5 = Path(tmpdir) / "fix_05"
+            f6_bad = Path(tmpdir) / "fix_06_bad"
+            f7_bad = Path(tmpdir) / "fix_07_bad"
+            f7_good = Path(tmpdir) / "fix_07_good"
+            _build_session_fixture_files(f5, "2026-01-05")
+            _build_session_fixture_files(f6_bad, "2026-01-06")
+            (f6_bad / "treasury_tbill_2026-01-06.csv").unlink()
+            _build_session_fixture_files(f7_bad, "2026-01-07")
+            (f7_bad / "treasury_tbill_2026-01-07.csv").unlink()
+            _build_session_fixture_files(f7_good, "2026-01-07")
+
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r0["appended"])
+            d0_hash = r0["record_sha256"]
+            recs0 = ShadowLedger(root / "ledger").load_records()
+            s0_expected_sha = recs0[-1]["record_body"]["evaluator"]["next_row_state_sha256"]
+            committed_s0, _ = load_row_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id="drill-v0",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_sequence=0,
+                expected_record_sha256=d0_hash,
+                expected_state_sha256=s0_expected_sha,
+                allow_missing_at_genesis=False,
+            )
+
+            # Day 1 (2026-01-06) fails O1 while calm -> V4 clearing_counter steps 0 -> 1
+            r1_rej = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f6_bad,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 20, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r1_rej["appended"])
+
+            # Day 2 (2026-01-07) ALSO fails O1 while calm -> V4 clearing_counter steps 1 -> 2
+            # base_prior_row_state MUST stay pinned to committed seq=0 state (counter=0)
+            r2_rej = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f7_bad,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 20, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r2_rej["appended"])
+            pend_state, pend_meta = load_pending_rejected_state_snapshot(  # type: ignore[misc]
+                root / "state_snapshots",
+                expected_chain_id="drill-v0",
+                expected_base_sequence=0,
+                expected_base_record_sha256=d0_hash,
+                current_session_date="2026-01-07",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                expected_base_prior_state_sha256=s0_expected_sha,
+                committed_base_prior_row_state=committed_s0,
+                expected_base_session_date="2026-01-05",
+            )
+            self.assertEqual(pend_meta["rejected_session_date"], "2026-01-07")
+            self.assertEqual(
+                _sha256_canonical_state_dict(pend_meta["base_prior_row_state"]),
+                s0_expected_sha,
+            )
+            self.assertEqual(pend_meta["base_prior_row_state"]["V4"]["TQQQ"]["clearing_counter"], 0)
+            self.assertEqual(pend_state["V4"]["TQQQ"]["clearing_counter"], 2)
+
+            # Negative boundary: counter jump beyond elapsed days (2 -> 5 on 2026-01-07) fails closed
+            pend_path = root / "state_snapshots" / "pending_rejected_state.json"
+            orig_pend_bytes = pend_path.read_bytes()
+            forged_jump = json.loads(orig_pend_bytes.decode("utf-8"))
+            forged_jump["next_row_state"]["V4"]["TQQQ"]["clearing_counter"] = 5
+            forged_jump["state_sha256"] = _sha256_canonical_state_dict(forged_jump["next_row_state"])
+            pend_path.write_text(json.dumps(forged_jump), encoding="utf-8")
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    root / "state_snapshots",
+                    expected_chain_id="drill-v0",
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=d0_hash,
+                    current_session_date="2026-01-07",
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                    expected_base_prior_state_sha256=s0_expected_sha,
+                    committed_base_prior_row_state=committed_s0,
+                    expected_base_session_date="2026-01-05",
+                )
+            pend_path.write_bytes(orig_pend_bytes)
+
+            # Same-day retry on 2026-01-07 restores Treasury -> commits seq=1 cleanly (clearing_counter=2)
+            r2_ok = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f7_good,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 35, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r2_ok["appended"])
+            self.assertEqual(r2_ok["sequence"], 1)
+            self.assertFalse(pend_path.exists())
+            recs = ShadowLedger(root / "ledger").load_records()
+            b_v4 = {b["id"]: b for b in recs[-1]["record_body"]["evaluator"]["breakers"]}["V4"]
+            self.assertEqual(b_v4["outputs"]["TQQQ"]["clearing_counter"], 2)
+            rep = replay_window(root / "replay", root / "ledger")
+            self.assertTrue(rep["bit_for_bit_match"])
+
 
 if __name__ == "__main__":
     unittest.main()

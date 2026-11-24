@@ -1905,6 +1905,26 @@ def save_pending_rejected_state_snapshot(
     return target
 
 
+def _max_elapsed_session_steps(
+    ref_dates: tuple[object, ...],
+    rej_ds: str,
+    *,
+    default_when_unknown: int = 1,
+) -> int:
+    """Return max calendar-day steps from the latest valid reference date to rej_ds."""
+    rej_date = date.fromisoformat(rej_ds)
+    parsed_refs: list[date] = []
+    for raw in ref_dates:
+        if isinstance(raw, str) and _DATE_YYYY_MM_DD_RE.fullmatch(raw):
+            try:
+                parsed_refs.append(date.fromisoformat(raw))
+            except ValueError:
+                continue
+    if not parsed_refs:
+        return default_when_unknown
+    return max(0, (rej_date - max(parsed_refs)).days)
+
+
 def _assert_pending_state_preserves_committed_breakers(
     committed_state: Mapping[str, Any],
     pending_state: Mapping[str, Any],
@@ -1912,6 +1932,7 @@ def _assert_pending_state_preserves_committed_breakers(
     rej_ds: str,
     expected_engine_hash: str,
     expected_spec_version: str,
+    expected_base_session_date: str | None = None,
 ) -> None:
     """Enforce fail-closed monotonic latch/severity preservation from committed ledger state to pending state."""
     if "engine_hash" in pending_state and pending_state["engine_hash"] != expected_engine_hash:
@@ -1979,7 +2000,12 @@ def _assert_pending_state_preserves_committed_breakers(
             p_l5_fresh = p_l5.get("fresh_session_count", 0)
             if isinstance(p_l5_fresh, bool) or not isinstance(p_l5_fresh, int) or p_l5_fresh < 0:
                 raise EngineIdentityError("Pending state invalid L5 fresh_session_count")
-            if (c_l5.get("active") is True or c_l5.get("latched") is True) and p_l5_fresh > c_l5_fresh_int + 1:
+            l5_steps = _max_elapsed_session_steps(
+                (c_l5.get("last_session"), c_l5.get("trip_session"), expected_base_session_date),
+                rej_ds,
+                default_when_unknown=1,
+            )
+            if (c_l5.get("active") is True or c_l5.get("latched") is True) and p_l5_fresh > c_l5_fresh_int + l5_steps:
                 raise EngineIdentityError("Pending state forged L5 fresh_session_count advancement")
 
     c_o1 = committed_state.get("O1")
@@ -1998,8 +2024,20 @@ def _assert_pending_state_preserves_committed_breakers(
         if isinstance(c_o1, Mapping) and c_o1.get("last_tripped_session") == rej_ds:
             if p_o1.get("last_tripped_session") != rej_ds or p_o1_fresh != 0:
                 raise EngineIdentityError("Pending state cleared same-session O1 trip")
-        if p_o1_fresh > c_o1_fresh + 1:
-            raise EngineIdentityError("Pending state forged O1 fresh_session_count advancement")
+        if p_o1.get("last_tripped_session") == rej_ds and p_o1_fresh != 0:
+            raise EngineIdentityError("Pending state inconsistent same-session O1 fresh_session_count")
+        if isinstance(c_o1, Mapping) or expected_base_session_date is not None:
+            o1_steps = _max_elapsed_session_steps(
+                (
+                    c_o1.get("last_session") if isinstance(c_o1, Mapping) else None,
+                    c_o1.get("last_tripped_session") if isinstance(c_o1, Mapping) else None,
+                    expected_base_session_date,
+                ),
+                rej_ds,
+                default_when_unknown=1,
+            )
+            if p_o1_fresh > c_o1_fresh + o1_steps:
+                raise EngineIdentityError("Pending state forged O1 fresh_session_count advancement")
 
     for row_id in ("V1", "V3"):
         c_map = committed_state.get(row_id)
@@ -2048,16 +2086,52 @@ def _assert_pending_state_preserves_committed_breakers(
                     )
                 if not isinstance(c_cnt, int) or isinstance(c_cnt, bool):
                     raise EngineIdentityError(f"Invalid committed V4.{fund} clearing_counter")
-                can_step = c_last is None or rej_ds > str(c_last)
-                max_allowed = c_cnt + (1 if can_step else 0)
+                max_steps = _max_elapsed_session_steps(
+                    (c_last, expected_base_session_date),
+                    rej_ds,
+                    default_when_unknown=1,
+                )
+                max_allowed = c_cnt + max_steps
                 if p_cnt < 0 or p_cnt >= 10 or p_cnt > max_allowed:
                     raise EngineIdentityError(
                         f"Pending state forged V4.{fund} clearing_counter jump ({c_cnt} -> {p_cnt})"
                     )
-                if p_cnt > c_cnt and pf.get("last_session_below_threshold") != rej_ds:
-                    raise EngineIdentityError(
-                        f"Pending state V4.{fund} clearing_counter incremented without matching session"
+                if p_cnt > c_cnt:
+                    p_last = pf.get("last_session_below_threshold") if isinstance(pf, Mapping) else None
+                    if (
+                        not isinstance(p_last, str)
+                        or not _DATE_YYYY_MM_DD_RE.fullmatch(p_last)
+                        or p_last > rej_ds
+                    ):
+                        raise EngineIdentityError(
+                            f"Pending state V4.{fund} clearing_counter incremented without matching session"
+                        )
+                    try:
+                        date.fromisoformat(p_last)
+                    except ValueError as exc:
+                        raise EngineIdentityError(
+                            f"Pending state V4.{fund} clearing_counter invalid session date"
+                        ) from exc
+                    if (
+                        isinstance(c_last, str)
+                        and _DATE_YYYY_MM_DD_RE.fullmatch(c_last)
+                        and p_last <= c_last
+                    ) or (
+                        expected_base_session_date is not None
+                        and p_last <= expected_base_session_date
+                    ):
+                        raise EngineIdentityError(
+                            f"Pending state V4.{fund} clearing_counter incremented without newer session"
+                        )
+                    steps_to_p_last = _max_elapsed_session_steps(
+                        (c_last, expected_base_session_date),
+                        p_last,
+                        default_when_unknown=1,
                     )
+                    if p_cnt > c_cnt + steps_to_p_last:
+                        raise EngineIdentityError(
+                            f"Pending state forged V4.{fund} clearing_counter jump ({c_cnt} -> {p_cnt})"
+                        )
 
     c_v5 = committed_state.get("V5")
     if isinstance(c_v5, Mapping):
@@ -2082,8 +2156,12 @@ def _assert_pending_state_preserves_committed_breakers(
                     raise EngineIdentityError(f"Pending state downgraded escalated V5.{fund}")
             if isinstance(pf, Mapping):
                 p_cnt = pf.get("consecutive_beyond_tolerance", 0)
-                can_step = c_last is None or rej_ds > str(c_last)
-                max_allowed = c_cnt_int + (1 if can_step else 0)
+                v5_steps = _max_elapsed_session_steps(
+                    (c_last, expected_base_session_date),
+                    rej_ds,
+                    default_when_unknown=1,
+                )
+                max_allowed = c_cnt_int + v5_steps
                 if (
                     isinstance(p_cnt, bool)
                     or not isinstance(p_cnt, int)
@@ -2113,6 +2191,7 @@ def load_pending_rejected_state_snapshot(
     expected_spec_version: str,
     expected_base_prior_state_sha256: str | None = None,
     committed_base_prior_row_state: Mapping[str, Any] | None = None,
+    expected_base_session_date: str | None = None,
 ) -> tuple[dict, dict] | None:
     """Load and verify pending O1/O2 rejected-day row state if present (fail closed on tamper/drift)."""
     s_dir = Path(snapshots_dir)
@@ -2198,6 +2277,7 @@ def load_pending_rejected_state_snapshot(
             rej_ds=rej_ds,
             expected_engine_hash=expected_engine_hash,
             expected_spec_version=expected_spec_version,
+            expected_base_session_date=expected_base_session_date,
         )
 
     return state_obj, payload

@@ -2929,6 +2929,9 @@ def _run_daily_drill_cycle_locked(
                     expected_state_sha256=expected_base_prior_sha,
                     allow_missing_at_genesis=False,
                 )
+        expected_base_sess_date = (
+            str(head_env["record_body"]["session_date"]) if head_env is not None else None
+        )
         pending_rej = load_pending_rejected_state_snapshot(
             snapshots_dir,
             expected_chain_id=cfg.chain_id,
@@ -2939,20 +2942,17 @@ def _run_daily_drill_cycle_locked(
             expected_spec_version=ev.spec_version,
             expected_base_prior_state_sha256=expected_base_prior_sha,
             committed_base_prior_row_state=committed_base_state,
+            expected_base_session_date=expected_base_sess_date,
         )
         if pending_rej is not None:
             prior_state = pending_rej[0]
             prior_row_state_used = copy.deepcopy(prior_state)
-            pending_meta = pending_rej[1]
-            if pending_meta.get("rejected_session_date") == session_date and isinstance(
-                pending_meta.get("base_prior_row_state"), dict
-            ):
-                session_base_prior_state = copy.deepcopy(pending_meta["base_prior_row_state"])
-            else:
-                session_base_prior_state = copy.deepcopy(prior_state)
+            session_base_prior_state = (
+                copy.deepcopy(committed_base_state) if head_env is not None else {}
+            )
         elif head_env is not None:
             prior_state = committed_base_state
-            session_base_prior_state = copy.deepcopy(prior_state)
+            session_base_prior_state = copy.deepcopy(committed_base_state)
     elif head_env is not None:
         breakers = head_env["record_body"]["evaluator"]["breakers"]
         prior_state = {

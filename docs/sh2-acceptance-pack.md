@@ -13,8 +13,8 @@
 | `fuse_bundle_hash` | `78fed9dfc9b0b0a618fce6bb5a956063135f34845545e6a5154a32e119354cc9` |
 | `fuse_freeze_hash` | `1da74ca508161ba6d9a424101321381a9f5156d8cb2c84c03be2fd2fe3f22a74` |
 | `csa22-v2` `spec_digest` | `2ba8cd7684c361209df68bfa2e10004c1f9922a645c7ec55d421fda520561798` |
-| `production_code_version_sha` | `25f03dc0648d4bbb5e06d43e05325f87d98c0a2ce9a2303bd8ed44d94cbfe0ee` |
-| `production_policy_config_hash` | `dbd58595c4cbfb4b06774b4b70e5dad40293355770a56af53b66402e7581db5b` |
+| `production_code_version_sha` | `f048a58c3b3bed2839a37357d9029cc41da0f6e214084c6cc327090f0b6427f2` |
+| `production_policy_config_hash` | `030f3d62c5a997d922f3c014fe6f7e1ab55e935a8b1c83a4005828f263a5899e` |
 | Production config | [`config/production-scheduler.json`](../config/production-scheduler.json) (`chain_id="prod-sh2-v1"`, `mode="production"`, `production_chain_locked=true`, `clk01_active=false`) |
 | Deployment target (Item 18) | Secret-free GCP Cloud Run Jobs (`us-east1`); legacy Mac mini units marked deprecated |
 
