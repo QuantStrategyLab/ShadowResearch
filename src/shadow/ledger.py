@@ -530,6 +530,66 @@ def verify_receipt(
     return True, None
 
 
+def compute_inputs_digest(
+    session_inputs: Mapping[str, object],
+    *,
+    w_ref: object,
+    active_control_state: object,
+    market_records_digest: str | None,
+    session_date: str,
+) -> str:
+    """Compute canonical SHA-256 inputs_digest matching build_record_body preimage."""
+    if not isinstance(session_inputs, Mapping):
+        raise CanonicalizationError("session_inputs must be a mapping")
+    funds = session_inputs.get("funds")
+    if not isinstance(funds, Mapping):
+        raise CanonicalizationError("session_inputs.funds must be a mapping")
+    fund_snap: dict[str, object] = {}
+    for inst in INSTRUMENT_ORDER:
+        fcfg = funds.get(inst)
+        if not isinstance(fcfg, Mapping):
+            raise CanonicalizationError(f"session_inputs.funds.{inst} must be a mapping")
+        try:
+            close_canon = canonical_decimal_str(fcfg["close_price"])  # type: ignore[arg-type]
+            s_canon = canonical_decimal_str(fcfg["s"])  # type: ignore[arg-type]
+            sigma_canon = canonical_decimal_str(fcfg["sigma_forecast"])  # type: ignore[arg-type]
+        except Exception as exc:
+            raise CanonicalizationError(f"invalid fund input decimal for {inst}: {exc}") from exc
+        if "q_pre" not in fcfg:
+            raise CanonicalizationError(f"missing q_pre for {inst}")
+        fund_snap[inst] = {
+            "close_price": close_canon,
+            "q_pre": fcfg["q_pre"],
+            "s": s_canon,
+            "sigma_forecast": sigma_canon,
+        }
+    try:
+        canonical_inputs_snapshot: dict[str, object] = {
+            "E": canonical_decimal_str(session_inputs["E"]),  # type: ignore[arg-type]
+            "E_star": canonical_decimal_str(session_inputs["E_star"]),  # type: ignore[arg-type]
+            "H": canonical_decimal_str(session_inputs.get("H", "0")),  # type: ignore[arg-type]
+            "L": canonical_decimal_str(session_inputs["L"]),  # type: ignore[arg-type]
+            "W_ref": w_ref,
+            "active_control_state": active_control_state,
+            "funds": fund_snap,
+            "market_records_digest": market_records_digest,
+            "session_date": session_date,
+        }
+        if session_inputs.get("prior_E") is not None:
+            canonical_inputs_snapshot["prior_E"] = canonical_decimal_str(session_inputs["prior_E"])  # type: ignore[arg-type]
+        if session_inputs.get("external_flow") is not None:
+            canonical_inputs_snapshot["external_flow"] = canonical_decimal_str(session_inputs["external_flow"])  # type: ignore[arg-type]
+        if session_inputs.get("monthly_returns") is not None:
+            canonical_inputs_snapshot["monthly_returns"] = [
+                canonical_decimal_str(x) for x in session_inputs["monthly_returns"]  # type: ignore[attr-defined]
+            ]
+    except Exception as exc:
+        if isinstance(exc, CanonicalizationError):
+            raise
+        raise CanonicalizationError(f"invalid session_inputs for inputs_digest: {exc}") from exc
+    return sha256_canonical(canonical_inputs_snapshot)
+
+
 def build_record_body(
     *,
     chain_id: str,
@@ -589,34 +649,13 @@ def build_record_body(
         active_control_state=eff_scope["aggregate"],
     )
 
-    canonical_inputs_snapshot: dict[str, object] = {
-        "E": canonical_decimal_str(session_inputs["E"]),
-        "E_star": canonical_decimal_str(session_inputs["E_star"]),
-        "H": canonical_decimal_str(session_inputs.get("H", "0")),
-        "L": canonical_decimal_str(session_inputs["L"]),
-        "W_ref": sizing_res["bankroll"]["W_ref"],
-        "active_control_state": eff_scope["aggregate"],
-        "funds": {
-            inst: {
-                "close_price": canonical_decimal_str(session_inputs["funds"][inst]["close_price"]),
-                "q_pre": session_inputs["funds"][inst]["q_pre"],
-                "s": canonical_decimal_str(session_inputs["funds"][inst]["s"]),
-                "sigma_forecast": canonical_decimal_str(session_inputs["funds"][inst]["sigma_forecast"]),
-            }
-            for inst in INSTRUMENT_ORDER
-        },
-        "market_records_digest": market_records_digest,
-        "session_date": session_date,
-    }
-    if session_inputs.get("prior_E") is not None:
-        canonical_inputs_snapshot["prior_E"] = canonical_decimal_str(session_inputs["prior_E"])
-    if session_inputs.get("external_flow") is not None:
-        canonical_inputs_snapshot["external_flow"] = canonical_decimal_str(session_inputs["external_flow"])
-    if session_inputs.get("monthly_returns") is not None:
-        canonical_inputs_snapshot["monthly_returns"] = [
-            canonical_decimal_str(x) for x in session_inputs["monthly_returns"]
-        ]
-    inputs_digest = sha256_canonical(canonical_inputs_snapshot)
+    inputs_digest = compute_inputs_digest(
+        session_inputs,
+        w_ref=sizing_res["bankroll"]["W_ref"],
+        active_control_state=eff_scope["aggregate"],
+        market_records_digest=market_records_digest,
+        session_date=session_date,
+    )
 
     obs_class = "historical_reconstruction" if mode == "reconstruction" else "synthetic"
     ledger_mode = "stage_n_reconstruction" if mode == "reconstruction" else "stage_n_notional"

@@ -1939,6 +1939,455 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(after_md_heal["ok_days"], ["2025-11-21"])
             self.assertFalse(after_md_heal["missed_run_detected"])
 
+    def test_r7_bundle_inputs_digest_report_integrity_crash_tail_and_empty_cli_flags(self) -> None:
+        cfg = replace(
+            load_scheduler_config(DEFAULT_SCHEDULER_CONFIG_PATH),
+            treasury_endpoint="https://treasury.example.test/yield{year}.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. R7 #1: Tampering TQQQ q_pre (0 -> 1) in replay_bundle.json MUST fail retry, next-day append, and detect_missed
+            qpre_dir = root / "bundle_qpre_tamper"
+            d1_ok = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=qpre_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-21"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(d1_ok["appended"])
+            qpre_bundle_path = qpre_dir / "replay" / "replay_bundle.json"
+            qpre_bundle = json.loads(qpre_bundle_path.read_text(encoding="utf-8"))
+            qpre_bundle["sessions"][0]["inputs"]["funds"]["TQQQ"]["q_pre"] = 1
+            qpre_bundle_path.write_text(json.dumps(qpre_bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            qpre_retry = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=qpre_dir,
+                config=cfg,
+                wall_clock=_tick_clock("2025-11-21", "22:40:00"),
+            )
+            self.assertFalse(qpre_retry["appended"])
+            self.assertTrue(qpre_retry["fail_closed"])
+            self.assertEqual(qpre_retry["reason"], "incomplete_or_corrupt_replay_bundle")
+            self.assertIn("inputs_digest", qpre_retry["detail"])
+
+            qpre_day2 = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=qpre_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24"),
+                sleeper=lambda _: None,
+            )
+            self.assertFalse(qpre_day2["appended"])
+            self.assertTrue(qpre_day2["fail_closed"])
+            self.assertEqual(len(ShadowLedger(qpre_dir / "ledger").load_records()), 1)
+
+            qpre_missed = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+                data_dir=qpre_dir,
+                config=cfg,
+            )
+            self.assertEqual(qpre_missed["ok_days"], [])
+            self.assertTrue(qpre_missed["missed_run_detected"])
+            self.assertEqual(qpre_missed["evaluated_trading_days"][0]["status"], "incomplete_or_corrupt_replay_bundle")
+
+            # 2. R7 #2: Tampered report JSON quote ('47.48' -> '999') MUST NOT be copied to MD or pass ok_days; retry restores '47.48'
+            rep_tamper_dir = root / "report_price_999"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=rep_tamper_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["appended"]
+            )
+            t_json_path = rep_tamper_dir / "reports" / "completeness_2025-11-21.json"
+            t_md_path = rep_tamper_dir / "reports" / "completeness_2025-11-21.md"
+            t_rep = json.loads(t_json_path.read_text(encoding="utf-8"))
+            t_rep["required_series"][0]["normalized_value"] = "999"
+            t_json_path.write_text(json.dumps(t_rep, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            # Even if Markdown were also rewritten to match '999', detector MUST still fail vs authoritative bundle+ledger!
+            t_md_path.write_text(t_md_path.read_text(encoding="utf-8").replace("`47.48`", "`999`"), encoding="utf-8")
+
+            missed_999 = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+                data_dir=rep_tamper_dir,
+                config=cfg,
+            )
+            self.assertEqual(missed_999["ok_days"], [])
+            self.assertTrue(missed_999["missed_run_detected"])
+            self.assertEqual(
+                missed_999["evaluated_trading_days"][0]["status"],
+                "incomplete_missing_completeness_report",
+            )
+
+            healed_999 = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=rep_tamper_dir,
+                config=cfg,
+                wall_clock=_tick_clock("2025-11-21", "22:40:00"),
+            )
+            self.assertFalse(healed_999["appended"])
+            self.assertTrue(healed_999["recovered_missing_report"])
+            self.assertFalse(healed_999["fail_closed"])
+            self.assertTrue(healed_999["report_written"])
+            self.assertEqual(
+                json.loads(t_json_path.read_text(encoding="utf-8"))["required_series"][0]["normalized_value"],
+                "47.48",
+            )
+            self.assertNotIn("`999`", t_md_path.read_text(encoding="utf-8"))
+            self.assertIn("`47.48`", t_md_path.read_text(encoding="utf-8"))
+            missed_999_after = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-22T05:00:00.000Z",
+                data_dir=rep_tamper_dir,
+                config=cfg,
+            )
+            self.assertEqual(missed_999_after["ok_days"], ["2025-11-21"])
+            self.assertFalse(missed_999_after["missed_run_detected"])
+
+            # 3. R7 #3: Deleted JSON (keeping MD), null quote in JSON, AND unwritable MD failure handling
+            partial_dir = root / "partial_report_heal"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=partial_dir,
+                    config=cfg,
+                    fixtures_dir=DRILL_FIXTURES,
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                )["appended"]
+            )
+            p_json = partial_dir / "reports" / "completeness_2025-11-21.json"
+            p_md = partial_dir / "reports" / "completeness_2025-11-21.md"
+
+            # (3a) Delete JSON keeping MD -> retry regenerates BOTH cleanly and detect_missed marks ok
+            p_json.unlink()
+            self.assertTrue(p_md.is_file())
+            rec_del_json = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=partial_dir,
+                config=cfg,
+                wall_clock=_tick_clock("2025-11-21", "22:40:00"),
+            )
+            self.assertTrue(rec_del_json["recovered_missing_report"])
+            self.assertFalse(rec_del_json["fail_closed"])
+            self.assertTrue(rec_del_json["report_written"])
+            self.assertTrue(p_json.is_file() and p_md.is_file())
+            self.assertEqual(
+                detect_missed_runs(
+                    window_start_date="2025-11-21",
+                    as_of_utc="2025-11-22T05:00:00.000Z",
+                    data_dir=partial_dir,
+                    config=cfg,
+                )["ok_days"],
+                ["2025-11-21"],
+            )
+
+            # (3b) Set one quote to null in JSON keeping MD -> retry regenerates BOTH cleanly
+            null_rep = json.loads(p_json.read_text(encoding="utf-8"))
+            null_rep["required_series"][0]["normalized_value"] = None
+            null_rep["required_series"][0]["status"] = "missing"
+            p_json.write_text(json.dumps(null_rep, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            rec_null_json = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=partial_dir,
+                config=cfg,
+                wall_clock=_tick_clock("2025-11-21", "22:45:00"),
+            )
+            self.assertTrue(rec_null_json["recovered_missing_report"])
+            self.assertFalse(rec_null_json["fail_closed"])
+            self.assertTrue(rec_null_json["report_written"])
+            self.assertIsNotNone(json.loads(p_json.read_text(encoding="utf-8"))["required_series"][0]["normalized_value"])
+            self.assertEqual(
+                detect_missed_runs(
+                    window_start_date="2025-11-21",
+                    as_of_utc="2025-11-22T05:00:00.000Z",
+                    data_dir=partial_dir,
+                    config=cfg,
+                )["ok_days"],
+                ["2025-11-21"],
+            )
+
+            # (3c) Block MD write with a directory at p_md -> retry MUST fail_closed=True, NEVER fake success
+            p_json.unlink()
+            p_md.unlink()
+            p_md.mkdir()
+            rec_unwritable = run_daily_drill_cycle(
+                session_date="2025-11-21",
+                data_dir=partial_dir,
+                config=cfg,
+                wall_clock=_tick_clock("2025-11-21", "22:50:00"),
+            )
+            self.assertFalse(rec_unwritable["recovered_missing_report"])
+            self.assertTrue(rec_unwritable["fail_closed"])
+            self.assertFalse(rec_unwritable["report_written"])
+            p_md.rmdir()
+
+            # 4. R7 #4: Simulated abrupt crash between bundle write and seq_000001.record.json commit
+            class _SimulatedSigkill(BaseException):
+                pass
+
+            crash_tail_dir = root / "crash_between_bundle_and_record"
+            self.assertTrue(
+                run_daily_drill_cycle(
+                    session_date="2025-11-21",
+                    data_dir=crash_tail_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-21"),
+                    sleeper=lambda _: None,
+                )["appended"]
+            )
+            with self.assertRaises(_SimulatedSigkill):
+                run_daily_drill_cycle(
+                    session_date="2025-11-24",
+                    data_dir=crash_tail_dir,
+                    config=cfg,
+                    transport=lambda u, h: _mock_market_transport(u, h),
+                    environ={"TIINGO_API_KEY": "test-key"},
+                    ots_transport=_mock_ots_transport,
+                    wall_clock=_tick_clock("2025-11-24"),
+                    sleeper=lambda _: None,
+                    _post_ledger_commit_hook=lambda: (_ for _ in ()).throw(
+                        _SimulatedSigkill("kill after bundle write before record rename")
+                    ),
+                )
+            # Confirm crashed on-disk state: 1 ledger record, 2 bundle sessions, orphan seq 1 ots/receipt
+            self.assertEqual(len(ShadowLedger(crash_tail_dir / "ledger").load_records()), 1)
+            crashed_bundle = json.loads((crash_tail_dir / "replay" / "replay_bundle.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(crashed_bundle["sessions"]), 2)
+            self.assertTrue((crash_tail_dir / "ledger" / "seq_000001.receipt.json").is_file())
+            self.assertFalse((crash_tail_dir / "ledger" / "seq_000001.record.json").exists())
+
+            # Before retry, detect_missed keeps Day 1 'ok' and flags crashed Day 2 as missed
+            missed_pre = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-25T05:00:00.000Z",
+                data_dir=crash_tail_dir,
+                config=cfg,
+            )
+            self.assertEqual(missed_pre["ok_days"], ["2025-11-21"])
+            self.assertEqual(missed_pre["silent_missed_days"], ["2025-11-24"])
+
+            # Copy crashed directory to also test skipping Day 2 straight to Day 3!
+            import shutil
+
+            skip_day2_dir = root / "crash_tail_skip_day2_to_day3"
+            shutil.copytree(crash_tail_dir, skip_day2_dir)
+
+            # Retry Day 2 and continue with Day 3
+            d2_recovered = run_daily_drill_cycle(
+                session_date="2025-11-24",
+                data_dir=crash_tail_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-24", "22:35:00"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(d2_recovered["appended"])
+            self.assertEqual(d2_recovered["sequence"], 1)
+
+            d3_after = run_daily_drill_cycle(
+                session_date="2025-11-25",
+                data_dir=crash_tail_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-25"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(d3_after["appended"])
+            self.assertEqual(d3_after["sequence"], 2)
+            rep_crash_3 = replay_window(crash_tail_dir / "replay", crash_tail_dir / "ledger")
+            self.assertTrue(rep_crash_3["bit_for_bit_match"])
+            self.assertTrue(rep_crash_3["chain_ok"])
+            self.assertTrue(rep_crash_3["receipts_ok"])
+            self.assertTrue(rep_crash_3["archived_inputs_ok"])
+            self.assertEqual(rep_crash_3["replayed_count"], 3)
+
+            # Skipping Day 2 directly to Day 3 after Day 2 crash also recovers & replays bit-for-bit
+            d3_skip = run_daily_drill_cycle(
+                session_date="2025-11-25",
+                data_dir=skip_day2_dir,
+                config=cfg,
+                transport=lambda u, h: _mock_market_transport(u, h),
+                environ={"TIINGO_API_KEY": "test-key"},
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-25"),
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(d3_skip["appended"])
+            self.assertEqual(d3_skip["sequence"], 1)
+            rep_skip = replay_window(skip_day2_dir / "replay", skip_day2_dir / "ledger")
+            self.assertTrue(rep_skip["bit_for_bit_match"])
+            self.assertTrue(rep_skip["archived_inputs_ok"])
+            self.assertEqual(rep_skip["replayed_count"], 2)
+            missed_skip = detect_missed_runs(
+                window_start_date="2025-11-21",
+                as_of_utc="2025-11-26T05:00:00.000Z",
+                data_dir=skip_day2_dir,
+                config=cfg,
+            )
+            self.assertEqual(missed_skip["ok_days"], ["2025-11-21", "2025-11-25"])
+            self.assertEqual(missed_skip["silent_missed_days"], ["2025-11-24"])
+
+            # Negative crash-tail check: if prefix[0] is tampered OR len == len(ledger)+2, MUST fail closed (never prune!)
+            bad_prefix_dir = root / "crash_tail_tampered_prefix"
+            shutil.copytree(skip_day2_dir, bad_prefix_dir)
+            bp_path = bad_prefix_dir / "replay" / "replay_bundle.json"
+            bp_obj = json.loads(bp_path.read_text(encoding="utf-8"))
+            bp_obj["sessions"][0]["inputs"]["funds"]["TQQQ"]["q_pre"] = 1
+            bp_obj["sessions"].append({"session_date": "2025-11-26"})
+            bp_path.write_text(json.dumps(bp_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            bad_prefix_res = run_daily_drill_cycle(
+                session_date="2025-11-26",
+                data_dir=bad_prefix_dir,
+                config=cfg,
+                fixtures_dir=DRILL_FIXTURES,
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-26"),
+            )
+            self.assertTrue(bad_prefix_res["fail_closed"])
+            self.assertFalse(bad_prefix_res["appended"])
+            self.assertEqual(len(ShadowLedger(bad_prefix_dir / "ledger").load_records()), 2)
+
+            # Duplicate committed session_date in trailing bundle entry (len == ledger + 1) MUST also fail closed without pruning
+            dup_tail_dir = root / "crash_tail_dup_date"
+            shutil.copytree(skip_day2_dir, dup_tail_dir)
+            dt_path = dup_tail_dir / "replay" / "replay_bundle.json"
+            dt_obj = json.loads(dt_path.read_text(encoding="utf-8"))
+            dt_obj["sessions"].append({"session_date": "2025-11-21"})
+            dt_path.write_text(json.dumps(dt_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            dup_tail_res = run_daily_drill_cycle(
+                session_date="2025-11-26",
+                data_dir=dup_tail_dir,
+                config=cfg,
+                fixtures_dir=DRILL_FIXTURES,
+                ots_transport=_mock_ots_transport,
+                wall_clock=_tick_clock("2025-11-26"),
+            )
+            self.assertTrue(dup_tail_res["fail_closed"])
+            self.assertFalse(dup_tail_res["appended"])
+            self.assertIn("invalid_or_duplicate_trailing_bundle_session", dup_tail_res["detail"])
+
+            # 5. R7 #5: Explicit empty '--require-ny-hhmm ""' and sibling empty '--as-of-utc ""' fail closed non-zero
+            run_empty_cli = root / "cli_empty_hhmm"
+            proc_run_empty = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "shadow.scheduler",
+                    "run-drill",
+                    "--session",
+                    "auto",
+                    "--data-dir",
+                    str(run_empty_cli),
+                    "--require-ny-hhmm",
+                    "",
+                ],
+                cwd=str(REPO_ROOT),
+                env={"PATH": "/usr/bin:/bin:/usr/local/bin", "PYTHONPATH": str(REPO_ROOT / "src")},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(proc_run_empty.returncode, 0, proc_run_empty.stdout + proc_run_empty.stderr)
+            self.assertIn("invalid_require_ny_hhmm", proc_run_empty.stdout)
+            self.assertFalse((run_empty_cli / "ledger").exists())
+
+            sim_cli_dir = root / "sim_empty_hhmm"
+            # At 16:30 EST (21:30Z), --require-ny-hhmm '17:30' skips cleanly (rc=0, 0 records); --require-ny-hhmm '' fails (rc=1, 0 records)
+            self.assertEqual(
+                scheduler_cli_main(
+                    [
+                        "simulate-drill",
+                        "--session",
+                        "auto",
+                        "--now-utc",
+                        "2025-11-21T21:30:00.000Z",
+                        "--data-dir",
+                        str(sim_cli_dir),
+                        "--fixtures-dir",
+                        str(DRILL_FIXTURES),
+                        "--require-ny-hhmm",
+                        "17:30",
+                    ]
+                ),
+                0,
+            )
+            self.assertFalse((sim_cli_dir / "ledger").exists())
+
+            self.assertNotEqual(
+                scheduler_cli_main(
+                    [
+                        "simulate-drill",
+                        "--session",
+                        "auto",
+                        "--now-utc",
+                        "2025-11-21T21:30:00.000Z",
+                        "--data-dir",
+                        str(sim_cli_dir),
+                        "--fixtures-dir",
+                        str(DRILL_FIXTURES),
+                        "--require-ny-hhmm",
+                        "",
+                    ]
+                ),
+                0,
+            )
+            self.assertFalse((sim_cli_dir / "ledger").exists())
+
+            self.assertNotEqual(
+                scheduler_cli_main(
+                    [
+                        "detect-missed",
+                        "--start-date",
+                        "2025-11-21",
+                        "--as-of-utc",
+                        "2025-11-22T05:00:00.000Z",
+                        "--data-dir",
+                        str(rep_tamper_dir),
+                        "--require-ny-hhmm",
+                        "",
+                    ]
+                ),
+                0,
+            )
+            self.assertNotEqual(
+                scheduler_cli_main(
+                    [
+                        "detect-missed",
+                        "--start-date",
+                        "2025-11-21",
+                        "--as-of-utc",
+                        "",
+                        "--data-dir",
+                        str(rep_tamper_dir),
+                    ]
+                ),
+                0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

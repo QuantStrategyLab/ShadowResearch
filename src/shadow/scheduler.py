@@ -34,9 +34,11 @@ from shadow.ledger import (
     GENESIS_PREV_HASH,
     ShadowLedger,
     _atomic_write_bytes,
+    _DATE_YYYY_MM_DD_RE,
     build_record_body,
     canonical_json_bytes,
     compute_code_manifest_hash,
+    compute_inputs_digest,
     compute_session_commitment_deadline_utc,
     is_receipt_timely,
     is_utc_ms_timestamp,
@@ -47,13 +49,25 @@ from shadow.ledger import (
 from shadow.manifest import _normalize_config_value
 from shadow.ots import DEFAULT_OTS_CALENDARS, OpenTimestampsClient, OtsTransport, build_synthetic_ots_fixture
 from shadow.replay import replay_window
-from shadow.sizing import policy_config_hash
+from shadow.sizing import INSTRUMENT_ORDER, canonical_decimal_str, policy_config_hash
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCHEDULER_CONFIG_PATH = REPO_ROOT / "config" / "drill-scheduler.json"
 DEFAULT_DEPLOY_DIR = REPO_ROOT / "deploy" / "scheduler"
 _NY_TZ = ZoneInfo("America/New_York")
 _STRICT_HHMM_RE = re.compile(r"^[0-9]{2}:[0-9]{2}$", re.ASCII)
+_ALLOWED_SESSION_INPUT_KEYS = frozenset(
+    {"E", "E_star", "H", "L", "funds", "prior_E", "external_flow", "monthly_returns"}
+)
+_ALLOWED_FUND_INPUT_KEYS = frozenset({"s", "close_price", "q_pre", "sigma_forecast"})
+_STANDING_ASSERTION_KEYS = (
+    "kelly_applied",
+    "orders_placed",
+    "B0",
+    "H",
+    "stop_loss_return_rule",
+    "loss_controls_armed",
+)
 
 
 def _parse_strict_hhmm(raw_val: object, *, field_name: str) -> tuple[int, int, str]:
@@ -231,10 +245,8 @@ def ny_local_time_matches(
 ) -> bool:
     """Return True iff now_utc falls within tolerance_minutes of any comma-separated HH:MM America/New_York."""
     if not isinstance(target_hhmm, str) or not target_hhmm.strip():
-        raise ValueError(f"missing_or_invalid_require_ny_hhmm:{target_hhmm!r}")
+        _parse_strict_hhmm(target_hhmm, field_name="require_ny_hhmm")
     parts = [part.strip() for part in target_hhmm.split(",")]
-    if any(not part for part in parts):
-        raise ValueError(f"missing_or_invalid_require_ny_hhmm:{target_hhmm!r}")
     validated_targets = [
         _parse_strict_hhmm(part, field_name="require_ny_hhmm")[:2]
         for part in parts
@@ -474,12 +486,80 @@ def _market_records_complete(mkt_list: object) -> bool:
     return present >= set(REQUIRED_MARKET_SERIES)
 
 
+def _validate_bundle_session_against_record(
+    sess_entry: object,
+    env: dict,
+    idx: int,
+) -> tuple[bool, str | None]:
+    """Verify one replay_bundle session entry matches its committed ledger record."""
+    if not isinstance(sess_entry, dict):
+        return False, f"invalid_bundle_session_entry_{idx}"
+    pb = env.get("record_body", {}) if isinstance(env, dict) else {}
+    if not isinstance(pb, dict):
+        return False, f"invalid_committed_record_body_{idx}"
+    if sess_entry.get("session_date") != pb.get("session_date"):
+        return False, f"bundle_session_date_mismatch_seq_{idx}"
+    if sess_entry.get("decision_timestamp_utc") != pb.get("decision_timestamp_utc"):
+        return False, f"bundle_decision_timestamp_mismatch_seq_{idx}"
+    if sess_entry.get("discipline_labels") != pb.get("discipline_labels"):
+        return False, f"bundle_discipline_labels_mismatch_seq_{idx}"
+
+    mkt_recs = sess_entry.get("market_records")
+    if not _market_records_complete(mkt_recs):
+        return False, f"bundle_incomplete_or_null_market_records_seq_{idx}"
+    assert isinstance(mkt_recs, list)
+    computed_mkt_digest = sha256_canonical(mkt_recs)
+    if sess_entry.get("market_records_digest") != computed_mkt_digest:
+        return False, f"bundle_market_records_digest_mismatch_seq_{idx}"
+
+    sess_inputs = sess_entry.get("inputs")
+    if not isinstance(sess_inputs, dict) or not set(sess_inputs.keys()).issubset(_ALLOWED_SESSION_INPUT_KEYS):
+        return False, f"bundle_invalid_inputs_shape_seq_{idx}"
+    funds = sess_inputs.get("funds")
+    if not isinstance(funds, dict) or set(funds.keys()) != set(INSTRUMENT_ORDER):
+        return False, f"bundle_invalid_inputs_funds_seq_{idx}"
+    mkt_by_inst = {rec["instrument"]: rec for rec in mkt_recs}
+    for inst in INSTRUMENT_ORDER:
+        fcfg = funds.get(inst)
+        if not isinstance(fcfg, dict) or set(fcfg.keys()) != _ALLOWED_FUND_INPUT_KEYS:
+            return False, f"bundle_invalid_fund_keys_{inst}_seq_{idx}"
+        try:
+            if canonical_decimal_str(fcfg["close_price"]) != canonical_decimal_str(
+                mkt_by_inst[inst]["normalized_value"]
+            ):
+                return False, f"bundle_close_price_mismatch_{inst}_seq_{idx}"
+        except Exception as exc:
+            return False, f"bundle_invalid_close_price_{inst}_seq_{idx}:{exc}"
+    try:
+        if canonical_decimal_str(sess_inputs.get("H", "0")) != "0":
+            return False, f"bundle_non_zero_H_seq_{idx}"
+        w_ref = pb.get("bankroll", {}).get("W_ref") if isinstance(pb.get("bankroll"), dict) else None
+        ev_block = pb.get("evaluator") if isinstance(pb.get("evaluator"), dict) else {}
+        eff_scope = ev_block.get("effective_state_by_scope") if isinstance(ev_block, dict) else {}
+        act_state = eff_scope.get("aggregate") if isinstance(eff_scope, dict) else None
+        computed_inputs_digest = compute_inputs_digest(
+            sess_inputs,
+            w_ref=w_ref,
+            active_control_state=act_state,
+            market_records_digest=computed_mkt_digest,
+            session_date=str(pb.get("session_date")),
+        )
+    except Exception as exc:
+        return False, f"bundle_inputs_digest_error_seq_{idx}:{exc}"
+    if computed_inputs_digest != pb.get("inputs_digest"):
+        return False, f"bundle_inputs_digest_mismatch_seq_{idx}"
+    return True, None
+
+
 def _validate_replay_bundle_matches_ledger(
     bundle_dir: Path,
     prior_records: list[dict],
     *,
     cfg: DrillSchedulerConfig,
     spec: dict,
+    allow_trailing_uncommitted_tail: bool = False,
+    prune_uncommitted_tail: bool = False,
+    ledger: ShadowLedger | None = None,
 ) -> tuple[bool, str | None, dict | None]:
     """Require replay_bundle.json to match all committed prior_records when ledger is non-empty."""
     if not prior_records:
@@ -495,29 +575,81 @@ def _validate_replay_bundle_matches_ledger(
         return False, "invalid_replay_bundle_type", None
     if bundle_obj.get("chain_id") != cfg.chain_id or bundle_obj.get("mode") != cfg.mode:
         return False, "replay_bundle_chain_identity_mismatch", None
+    if bundle_obj.get("calendar_version") != cfg.calendar_version:
+        return False, "replay_bundle_calendar_version_mismatch", None
     if bundle_obj.get("calendar_spec_digest") != spec["spec_digest"]:
         return False, "replay_bundle_calendar_digest_mismatch", None
+
+    pb0 = prior_records[0].get("record_body", {}) if isinstance(prior_records[0], dict) else {}
+    b_code = bundle_obj.get("code_version_sha")
+    b_phash = bundle_obj.get("policy_config_hash")
+    b_rcfg = bundle_obj.get("runtime_config")
+    if (
+        not isinstance(b_code, str)
+        or not isinstance(b_phash, str)
+        or not isinstance(b_rcfg, dict)
+        or b_code != pb0.get("code_version_sha")
+        or b_phash != pb0.get("policy_config_hash")
+    ):
+        return False, "replay_bundle_policy_or_code_identity_mismatch", None
+    try:
+        recomputed_phash = policy_config_hash(
+            runtime_config=b_rcfg,
+            calendar_spec=spec,
+            code_manifest_hash=b_code,
+        )
+    except Exception as exc:
+        return False, f"replay_bundle_policy_hash_error:{exc}", None
+    if recomputed_phash != b_phash:
+        return False, "replay_bundle_policy_config_hash_mismatch", None
+
     sessions = bundle_obj.get("sessions")
-    if not isinstance(sessions, list) or len(sessions) != len(prior_records):
+    if not isinstance(sessions, list):
+        return False, "replay_bundle_session_count_mismatch:ledger=valid,bundle=invalid", None
+
+    n = len(prior_records)
+    has_uncommitted_tail = allow_trailing_uncommitted_tail and len(sessions) == n + 1
+    if len(sessions) != n and not has_uncommitted_tail:
         return (
             False,
-            f"replay_bundle_session_count_mismatch:ledger={len(prior_records)},bundle={len(sessions) if isinstance(sessions, list) else 'invalid'}",
+            f"replay_bundle_session_count_mismatch:ledger={n},bundle={len(sessions)}",
             None,
         )
-    for idx, (env, sess_entry) in enumerate(zip(prior_records, sessions)):
-        if not isinstance(sess_entry, dict):
-            return False, f"invalid_bundle_session_entry_{idx}", None
-        pb = env.get("record_body", {}) if isinstance(env, dict) else {}
-        if sess_entry.get("session_date") != pb.get("session_date"):
-            return False, f"bundle_session_date_mismatch_seq_{idx}", None
-        if sess_entry.get("decision_timestamp_utc") != pb.get("decision_timestamp_utc"):
-            return False, f"bundle_decision_timestamp_mismatch_seq_{idx}", None
-        mkt_recs = sess_entry.get("market_records")
-        if not _market_records_complete(mkt_recs):
-            return False, f"bundle_incomplete_or_null_market_records_seq_{idx}", None
-        assert isinstance(mkt_recs, list)
-        if sess_entry.get("market_records_digest") != sha256_canonical(mkt_recs):
-            return False, f"bundle_market_records_digest_mismatch_seq_{idx}", None
+
+    for idx, (env, sess_entry) in enumerate(zip(prior_records, sessions[:n])):
+        ok_sess, err_sess = _validate_bundle_session_against_record(sess_entry, env, idx)
+        if not ok_sess:
+            return False, err_sess, None
+
+    if has_uncommitted_tail:
+        committed_dates = {
+            r["record_body"]["session_date"]
+            for r in prior_records
+            if isinstance(r, dict) and isinstance(r.get("record_body"), dict)
+        }
+        tail = sessions[-1]
+        tail_ds = tail.get("session_date") if isinstance(tail, dict) else None
+        if (
+            not isinstance(tail, dict)
+            or not isinstance(tail_ds, str)
+            or not _DATE_YYYY_MM_DD_RE.fullmatch(tail_ds)
+            or tail_ds in committed_dates
+        ):
+            return False, f"invalid_or_duplicate_trailing_bundle_session:{tail_ds!r}", None
+        try:
+            date.fromisoformat(tail_ds)
+        except ValueError:
+            return False, f"invalid_trailing_bundle_session_date:{tail_ds!r}", None
+        if prune_uncommitted_tail:
+            bundle_obj["sessions"] = list(sessions[:n])
+            _atomic_write_text(bundle_path, json.dumps(bundle_obj, indent=2, sort_keys=True) + "\n")
+            if ledger is not None and not ledger._record_path(n).exists():
+                for orphan_p in (ledger._ots_path(n), ledger._receipt_path(n)):
+                    if orphan_p.exists():
+                        orphan_p.unlink()
+            if len(bundle_obj["sessions"]) != n:
+                return False, "replay_bundle_prune_verification_failed", None
+
     return True, None, bundle_obj
 
 
@@ -525,8 +657,15 @@ def _is_committed_session_report_valid(
     reports_dir: Path,
     session_date: str,
     committed_env: dict,
+    *,
+    committed_mkt_records: list[dict],
+    deadlines: Mapping[str, str],
+    cfg: DrillSchedulerConfig,
+    cal: Mapping[str, object],
+    ledger: ShadowLedger,
+    expected_consecutive_count: int,
 ) -> bool:
-    """Return True iff both completeness JSON and Markdown exist, match committed_env, and have 7 complete series."""
+    """Return True iff both completeness JSON and Markdown exist, match ledger+bundle+receipt, and render cleanly."""
     json_path = reports_dir / f"completeness_{session_date}.json"
     md_path = reports_dir / f"completeness_{session_date}.md"
     if not json_path.is_file() or not md_path.is_file():
@@ -538,6 +677,53 @@ def _is_committed_session_report_valid(
     if not isinstance(rep_obj, dict):
         return False
     body = committed_env.get("record_body", {})
+    if not isinstance(body, dict):
+        return False
+
+    if rep_obj.get("session_date") != session_date or body.get("session_date") != session_date:
+        return False
+    if rep_obj.get("chain_id") != cfg.chain_id or body.get("chain_id") != cfg.chain_id:
+        return False
+    if rep_obj.get("mode") != cfg.mode or body.get("mode") != cfg.mode:
+        return False
+    if (
+        rep_obj.get("calendar_version") != cal.get("calendar_version")
+        or body.get("calendar_version") != cal.get("calendar_version")
+    ):
+        return False
+    if (
+        rep_obj.get("calendar_spec_digest") != cal.get("spec_digest")
+        or body.get("calendar_spec_digest") != cal.get("spec_digest")
+    ):
+        return False
+    if rep_obj.get("session_state") != cal.get("session_state"):
+        return False
+    if rep_obj.get("session_close_utc") != deadlines.get("session_close_utc"):
+        return False
+    if rep_obj.get("decision_cutoff_utc") != deadlines.get("decision_cutoff_utc"):
+        return False
+    if rep_obj.get("commitment_deadline_utc") != deadlines.get("commitment_deadline_utc"):
+        return False
+    if rep_obj.get("decision_timestamp_utc") != body.get("decision_timestamp_utc"):
+        return False
+    if rep_obj.get("observation_class") != body.get("observation_class"):
+        return False
+    if rep_obj.get("notifications_sent") != 0:
+        return False
+    if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
+        return False
+    consec = rep_obj.get("consecutive_session_count")
+    if isinstance(consec, bool) or consec != expected_consecutive_count:
+        return False
+
+    rep_created = rep_obj.get("created_at_utc")
+    if (
+        not is_utc_ms_timestamp(rep_created)
+        or rep_created < deadlines["session_close_utc"]
+        or rep_created > deadlines["commitment_deadline_utc"]
+    ):
+        return False
+
     ledger_meta = rep_obj.get("ledger")
     if not isinstance(ledger_meta, dict) or ledger_meta.get("appended") is not True:
         return False
@@ -545,17 +731,84 @@ def _is_committed_session_report_valid(
         return False
     if ledger_meta.get("chain_head_digest") != committed_env.get("record_sha256"):
         return False
-    if rep_obj.get("decision_timestamp_utc") != body.get("decision_timestamp_utc"):
+    if ledger_meta.get("fail_closed_reason") is not None:
         return False
-    if not is_utc_ms_timestamp(rep_obj.get("created_at_utc")):
+
+    body_assert = body.get("assertions")
+    if not isinstance(body_assert, dict):
         return False
-    if not _report_series_complete(rep_obj.get("required_series")):
+    expected_standing = {k: body_assert.get(k) for k in _STANDING_ASSERTION_KEYS}
+    if rep_obj.get("standing_assertions") != expected_standing:
         return False
+
+    expected_series = _summarize_required_series(committed_mkt_records)
+    if (
+        not _report_series_complete(rep_obj.get("required_series"))
+        or rep_obj.get("required_series") != expected_series
+    ):
+        return False
+
+    try:
+        expected_rcp = _summarize_committed_receipt(
+            ledger=ledger,
+            seq=body["sequence"],
+            env=committed_env,
+            deadline_utc=str(deadlines["commitment_deadline_utc"]),
+            decision_utc=str(body["decision_timestamp_utc"]),
+        )
+    except Exception:
+        return False
+    rep_rcp = rep_obj.get("receipt")
+    if not isinstance(rep_rcp, dict):
+        return False
+    for rcp_key in (
+        "anchor",
+        "status",
+        "ots_file",
+        "ots_sha256",
+        "obtained_at_utc",
+        "commitment_deadline_utc",
+        "creditable",
+    ):
+        if rep_rcp.get(rcp_key) != expected_rcp.get(rcp_key):
+            return False
+    rep_reasons = rep_rcp.get("non_creditable_reasons")
+    if expected_rcp.get("status") == "missing":
+        if (
+            not isinstance(rep_reasons, list)
+            or len(rep_reasons) < 2
+            or not str(rep_reasons[0]).startswith("missing_ots_receipt")
+            or "drill_mode" not in rep_reasons
+        ):
+            return False
+    elif rep_reasons != expected_rcp.get("non_creditable_reasons"):
+        return False
+
     try:
         md_text = md_path.read_text(encoding="utf-8")
     except Exception:
         return False
     return md_text == _render_completeness_markdown(rep_obj)
+
+
+def _is_immutable_late_or_preclose_report(existing_rep: dict | None) -> bool:
+    if not isinstance(existing_rep, dict):
+        return False
+    ex_ledger = existing_rep.get("ledger")
+    if not isinstance(ex_ledger, dict) or ex_ledger.get("appended") is not False:
+        return False
+    ex_reason = str(ex_ledger.get("fail_closed_reason") or "")
+    if "late_after_" in ex_reason or "session_not_yet_closed" in ex_reason:
+        return True
+    ex_close = existing_rep.get("session_close_utc")
+    ex_cutoff = existing_rep.get("decision_cutoff_utc")
+    ex_dec = existing_rep.get("decision_timestamp_utc")
+    return bool(
+        is_utc_ms_timestamp(ex_close)
+        and is_utc_ms_timestamp(ex_cutoff)
+        and is_utc_ms_timestamp(ex_dec)
+        and (ex_dec < ex_close or ex_dec > ex_cutoff)
+    )
 
 
 def _can_upgrade_prior_fail_closed_report(
@@ -569,18 +822,7 @@ def _can_upgrade_prior_fail_closed_report(
     ex_ledger = existing_rep.get("ledger")
     if not isinstance(ex_ledger, dict) or ex_ledger.get("appended") is not False:
         return False
-    ex_reason = str(ex_ledger.get("fail_closed_reason") or "")
-    if "late_after_" in ex_reason or "session_not_yet_closed" in ex_reason:
-        return False
-    ex_close = existing_rep.get("session_close_utc")
-    ex_cutoff = existing_rep.get("decision_cutoff_utc")
-    ex_dec = existing_rep.get("decision_timestamp_utc")
-    if (
-        is_utc_ms_timestamp(ex_close)
-        and is_utc_ms_timestamp(ex_cutoff)
-        and is_utc_ms_timestamp(ex_dec)
-        and (ex_dec < ex_close or ex_dec > ex_cutoff)
-    ):
+    if _is_immutable_late_or_preclose_report(existing_rep):
         return False
     new_ledger = new_report.get("ledger")
     if not isinstance(new_ledger, dict) or new_ledger.get("appended") is not True:
@@ -606,8 +848,9 @@ def _write_completeness_report(
     *,
     created_at_utc: str,
     post_json_write_hook: Callable[[], None] | None = None,
+    allow_committed_recovery: bool = False,
 ) -> tuple[tuple[Path, Path], bool]:
-    """Write completeness JSON+MD atomically; only upgrade an earlier in-window fail-closed report on committed success."""
+    """Write completeness JSON+MD atomically; handle initial upgrade vs committed missing/corrupt recovery."""
     reports_dir.mkdir(parents=True, exist_ok=True)
     ds = report["session_date"]
     json_path = reports_dir / f"completeness_{ds}.json"
@@ -621,7 +864,20 @@ def _write_completeness_report(
                     existing_rep = parsed_rep
             except Exception:
                 existing_rep = None
-        if not _can_upgrade_prior_fail_closed_report(
+        if allow_committed_recovery:
+            new_ledger = report.get("ledger")
+            new_deadline = report.get("commitment_deadline_utc")
+            if (
+                not isinstance(new_ledger, dict)
+                or new_ledger.get("appended") is not True
+                or not is_utc_ms_timestamp(new_deadline)
+                or not is_utc_ms_timestamp(created_at_utc)
+                or created_at_utc > new_deadline
+                or not _report_series_complete(report.get("required_series"))
+                or _is_immutable_late_or_preclose_report(existing_rep)
+            ):
+                return (json_path, md_path), False
+        elif not _can_upgrade_prior_fail_closed_report(
             existing_rep, report, created_at_utc=created_at_utc
         ):
             return (json_path, md_path), False
@@ -653,7 +909,9 @@ def _update_replay_bundle(
         code_manifest_hash=code_sha,
     )
     if bundle_path.is_file():
-        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        bundle = parse_json_no_duplicates(bundle_path.read_text(encoding="utf-8"))
+        if not isinstance(bundle, dict):
+            raise ValueError("invalid_replay_bundle_type")
     else:
         if seq > 0:
             raise ValueError(f"missing_replay_bundle_for_non_empty_ledger:seq={seq}")
@@ -675,6 +933,16 @@ def _update_replay_bundle(
     # Drop any uncommitted orphan session entry left by an abrupt kill before seq_NNNNNN.record.json rename
     if len(sessions) > seq:
         sessions = sessions[:seq]
+    if seq == 0:
+        bundle["chain_id"] = cfg.chain_id
+        bundle["mode"] = cfg.mode
+        bundle["calendar_version"] = cfg.calendar_version
+        bundle["calendar_spec_dir"] = spec["spec_dir"]
+        bundle["calendar_spec_digest"] = spec["spec_digest"]
+        bundle["policy_config_hash"] = p_hash
+        bundle["runtime_config"] = runtime_config
+        bundle["code_version_sha"] = code_sha
+        bundle["archive_dir"] = str(archive_dir)
     sessions.append(session_entry)
     bundle["sessions"] = sessions
     _atomic_write_text(bundle_path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
@@ -1196,7 +1464,13 @@ def _run_daily_drill_cycle_locked(
     bundle_obj_validated: dict | None = None
     if prior_records:
         bundle_ok, bundle_err, bundle_obj_validated = _validate_replay_bundle_matches_ledger(
-            bundle_dir, prior_records, cfg=cfg, spec=spec
+            bundle_dir,
+            prior_records,
+            cfg=cfg,
+            spec=spec,
+            allow_trailing_uncommitted_tail=True,
+            prune_uncommitted_tail=True,
+            ledger=ledger,
         )
         if not bundle_ok:
             bundle_reason = (
@@ -1218,7 +1492,7 @@ def _run_daily_drill_cycle_locked(
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
 
-    # 3b. Reconcile already-committed session if completeness report was missing or stale after crash
+    # 3b. Reconcile already-committed session if completeness report is missing, invalid, or out-of-sync with ledger+bundle
     existing_env = next(
         (
             r
@@ -1234,54 +1508,6 @@ def _run_daily_drill_cycle_locked(
         ex_seq = ex_body["sequence"]
         json_path = reports_dir / f"completeness_{session_date}.json"
         md_path = reports_dir / f"completeness_{session_date}.md"
-        existing_rep: dict | None = None
-        if json_path.is_file():
-            try:
-                parsed_rep = parse_json_no_duplicates(json_path.read_text(encoding="utf-8"))
-                if isinstance(parsed_rep, dict):
-                    existing_rep = parsed_rep
-            except Exception:
-                existing_rep = None
-
-        if _is_committed_session_report_valid(reports_dir, session_date, existing_env):
-            return {
-                "appended": False,
-                "fail_closed": False,
-                "reason": "already_committed_session_preserved",
-                "sequence": ex_seq,
-                "record_sha256": existing_env["record_sha256"],
-                "report": existing_rep,
-                "report_paths": [str(json_path), str(md_path)],
-                "report_written": False,
-                "existing_report_preserved": True,
-                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
-            }
-
-        # Valid JSON already upgraded/written, Markdown missing or stale -> heal Markdown atomically
-        if (
-            existing_rep is not None
-            and isinstance(existing_rep.get("ledger"), dict)
-            and existing_rep["ledger"].get("appended") is True
-            and existing_rep["ledger"].get("sequence") == ex_seq
-            and existing_rep["ledger"].get("chain_head_digest") == existing_env.get("record_sha256")
-            and existing_rep.get("decision_timestamp_utc") == ex_body.get("decision_timestamp_utc")
-            and is_utc_ms_timestamp(existing_rep.get("created_at_utc"))
-            and _report_series_complete(existing_rep.get("required_series"))
-        ):
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(md_path, _render_completeness_markdown(existing_rep))
-            return {
-                "appended": False,
-                "recovered_missing_report": True,
-                "fail_closed": False,
-                "sequence": ex_seq,
-                "record_sha256": existing_env["record_sha256"],
-                "report": existing_rep,
-                "report_paths": [str(json_path), str(md_path)],
-                "report_written": True,
-                "existing_report_preserved": True,
-                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
-            }
 
         recovered_mkt_records: list[dict] | None = None
         if isinstance(bundle_obj_validated, dict):
@@ -1305,25 +1531,50 @@ def _run_daily_drill_cycle_locked(
                 "report": None,
                 "report_paths": [],
                 "report_written": False,
-                "existing_report_preserved": existing_rep is not None,
+                "existing_report_preserved": json_path.exists() or md_path.exists(),
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
 
-        recovered_series = _summarize_required_series(recovered_mkt_records)
-
-        receipt_summary = _summarize_committed_receipt(
-            ledger=ledger,
-            seq=ex_seq,
-            env=existing_env,
-            deadline_utc=deadline_utc,
-            decision_utc=ex_body["decision_timestamp_utc"],
-        )
         consecutive_now = _count_consecutive_trading_sessions(
             [r for r in prior_records if r["record_body"]["sequence"] < ex_seq],
             session_date,
             spec,
             cfg.venue,
             current_appended=True,
+        )
+
+        if _is_committed_session_report_valid(
+            reports_dir,
+            session_date,
+            existing_env,
+            committed_mkt_records=recovered_mkt_records,
+            deadlines=deadlines,
+            cfg=cfg,
+            cal=cal,
+            ledger=ledger,
+            expected_consecutive_count=consecutive_now,
+        ):
+            existing_rep = parse_json_no_duplicates(json_path.read_text(encoding="utf-8"))
+            return {
+                "appended": False,
+                "fail_closed": False,
+                "reason": "already_committed_session_preserved",
+                "sequence": ex_seq,
+                "record_sha256": existing_env["record_sha256"],
+                "report": existing_rep,
+                "report_paths": [str(json_path), str(md_path)],
+                "report_written": False,
+                "existing_report_preserved": True,
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
+
+        recovered_series = _summarize_required_series(recovered_mkt_records)
+        receipt_summary = _summarize_committed_receipt(
+            ledger=ledger,
+            seq=ex_seq,
+            env=existing_env,
+            deadline_utc=deadline_utc,
+            decision_utc=ex_body["decision_timestamp_utc"],
         )
         report, footprint = _build_committed_completeness_report(
             t_start=t_start,
@@ -1342,14 +1593,60 @@ def _run_daily_drill_cycle_locked(
             recovered_missing_report=True,
         )
         report_created_utc = _format_utc_ms(clock_fn())
-        report_paths, wrote_report = _write_completeness_report(
-            reports_dir,
-            report,
-            created_at_utc=report_created_utc,
-            post_json_write_hook=_post_report_json_hook,
+        wrote_report = False
+        report_paths: tuple[Path, Path] = (json_path, md_path)
+        write_error: str | None = None
+        if report_created_utc > deadline_utc:
+            write_error = "late_after_commitment_deadline_backfill_rejected"
+        else:
+            try:
+                report_paths, wrote_report = _write_completeness_report(
+                    reports_dir,
+                    report,
+                    created_at_utc=report_created_utc,
+                    post_json_write_hook=_post_report_json_hook,
+                    allow_committed_recovery=True,
+                )
+            except OSError as exc:
+                if _post_report_json_hook is not None:
+                    raise
+                wrote_report = False
+                write_error = f"completeness_report_write_error:{exc}"
+
+        verified_after_write = bool(
+            wrote_report
+            and _is_committed_session_report_valid(
+                reports_dir,
+                session_date,
+                existing_env,
+                committed_mkt_records=recovered_mkt_records,
+                deadlines=deadlines,
+                cfg=cfg,
+                cal=cal,
+                ledger=ledger,
+                expected_consecutive_count=consecutive_now,
+            )
         )
-        if wrote_report:
-            report["created_at_utc"] = report_created_utc
+        if not verified_after_write:
+            fail_reason = write_error or "incomplete_missing_completeness_report"
+            return {
+                "appended": False,
+                "recovered_missing_report": False,
+                "fail_closed": True,
+                "reason": fail_reason,
+                "detail": (
+                    f"Committed session {session_date} failed completeness report regeneration/verification"
+                ),
+                "sequence": ex_seq,
+                "record_sha256": existing_env["record_sha256"],
+                "report": None,
+                "report_paths": [],
+                "report_written": False,
+                "existing_report_preserved": json_path.exists() or md_path.exists(),
+                "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
+            }
+
+        report["created_at_utc"] = report_created_utc
         return {
             "appended": False,
             "recovered_missing_report": True,
@@ -1358,7 +1655,7 @@ def _run_daily_drill_cycle_locked(
             "record_sha256": existing_env["record_sha256"],
             "report": report,
             "report_paths": [str(p) for p in report_paths],
-            "report_written": wrote_report,
+            "report_written": True,
             "existing_report_preserved": False,
             "footprint": footprint,
         }
@@ -1712,17 +2009,18 @@ def detect_missed_runs(
     by_session: dict[str, dict] = {
         env["record_body"]["session_date"]: env for env in records
     }
-    bundle_path = root / "replay" / "replay_bundle.json"
-    bundle_sessions_by_date: dict[str, dict] = {}
-    if bundle_path.is_file():
-        try:
-            bundle_obj = parse_json_no_duplicates(bundle_path.read_text(encoding="utf-8"))
-            if isinstance(bundle_obj, dict) and isinstance(bundle_obj.get("sessions"), list):
-                for b_sess in bundle_obj["sessions"]:
-                    if isinstance(b_sess, dict) and isinstance(b_sess.get("session_date"), str):
-                        bundle_sessions_by_date[b_sess["session_date"]] = b_sess
-        except Exception:
-            bundle_sessions_by_date = {}
+    bundle_ok = True
+    bundle_err: str | None = None
+    bundle_obj_validated: dict | None = None
+    if records:
+        bundle_ok, bundle_err, bundle_obj_validated = _validate_replay_bundle_matches_ledger(
+            root / "replay",
+            records,
+            cfg=cfg,
+            spec=spec,
+            allow_trailing_uncommitted_tail=True,
+            prune_uncommitted_tail=False,
+        )
 
     as_of_dt = _parse_utc_iso(as_of_utc)
     as_of_ms = _format_utc_ms(as_of_dt)
@@ -1813,37 +2111,45 @@ def detect_missed_runs(
                         failed_days.append(ds)
                         detail = str(err_timely)
                     else:
-                        b_sess = bundle_sessions_by_date.get(ds)
-                        bmkt = b_sess.get("market_records") if isinstance(b_sess, dict) else None
-                        has_valid_bundle = (
-                            isinstance(b_sess, dict)
-                            and b_sess.get("session_date") == ds
-                            and b_sess.get("decision_timestamp_utc") == body.get("decision_timestamp_utc")
-                            and _market_records_complete(bmkt)
-                            and isinstance(bmkt, list)
-                            and b_sess.get("market_records_digest") == sha256_canonical(bmkt)
-                        )
-                        rep_created = rep_obj.get("created_at_utc") if rep_obj is not None else None
-                        rep_valid_vs_ledger = _is_committed_session_report_valid(reports_dir, ds, env)
-                        if not has_valid_bundle:
-                            status = "incomplete_missing_replay_bundle"
+                        if not bundle_ok or bundle_obj_validated is None:
+                            status = (
+                                "incomplete_missing_replay_bundle"
+                                if bundle_err == "missing_replay_bundle_for_non_empty_ledger"
+                                else "incomplete_or_corrupt_replay_bundle"
+                            )
                             silent_missed_days.append(ds)
                             failed_days.append(ds)
-                            detail = "committed_record_missing_valid_replay_bundle"
-                        elif (
-                            not rep_valid_vs_ledger
-                            or not is_utc_ms_timestamp(rep_created)
-                            or rep_created < deadlines["session_close_utc"]
-                            or rep_created > deadline_utc
-                        ):
-                            status = "incomplete_missing_completeness_report"
-                            silent_missed_days.append(ds)
-                            failed_days.append(ds)
-                            detail = "committed_record_missing_valid_completeness_report"
+                            detail = str(bundle_err or "committed_record_missing_valid_replay_bundle")
                         else:
-                            status = "ok"
-                            ok_days.append(ds)
-                            detail = "appended_with_timely_receipt"
+                            b_sess = bundle_obj_validated["sessions"][seq]
+                            bmkt = b_sess["market_records"]
+                            expected_consecutive = _count_consecutive_trading_sessions(
+                                [r for r in records if r["record_body"]["sequence"] < seq],
+                                ds,
+                                spec,
+                                cfg.venue,
+                                current_appended=True,
+                            )
+                            rep_valid_vs_ledger = _is_committed_session_report_valid(
+                                reports_dir,
+                                ds,
+                                env,
+                                committed_mkt_records=bmkt,
+                                deadlines=deadlines,
+                                cfg=cfg,
+                                cal=cal,
+                                ledger=ledger,
+                                expected_consecutive_count=expected_consecutive,
+                            )
+                            if not rep_valid_vs_ledger:
+                                status = "incomplete_missing_completeness_report"
+                                silent_missed_days.append(ds)
+                                failed_days.append(ds)
+                                detail = "committed_record_missing_valid_completeness_report"
+                            else:
+                                status = "ok"
+                                ok_days.append(ds)
+                                detail = "appended_with_timely_receipt"
         elif rep_obj is not None:
             rep_created = rep_obj.get("created_at_utc")
             rep_reason = str(
@@ -2196,19 +2502,42 @@ def _resolve_auto_run_target(
                 None,
             )
             if committed_env is not None:
-                bundle_ok, _, _ = _validate_replay_bundle_matches_ledger(
-                    bundle_dir, prior_records, cfg=cfg, spec=spec
+                bundle_ok, _, bundle_obj = _validate_replay_bundle_matches_ledger(
+                    bundle_dir,
+                    prior_records,
+                    cfg=cfg,
+                    spec=spec,
+                    allow_trailing_uncommitted_tail=True,
+                    prune_uncommitted_tail=False,
                 )
-                if bundle_ok and _is_committed_session_report_valid(
-                    reports_dir, ny_today, committed_env
-                ):
-                    return None, {
-                        "status": "already_committed_no_op",
-                        "ny_date": ny_today,
-                        "session_state": "half_day",
-                        "appended": False,
-                        "reports_written": 0,
-                    }
+                if bundle_ok and bundle_obj is not None:
+                    ex_seq = committed_env["record_body"]["sequence"]
+                    bmkt = bundle_obj["sessions"][ex_seq]["market_records"]
+                    expected_consecutive = _count_consecutive_trading_sessions(
+                        [r for r in prior_records if r["record_body"]["sequence"] < ex_seq],
+                        ny_today,
+                        spec,
+                        cfg.venue,
+                        current_appended=True,
+                    )
+                    if _is_committed_session_report_valid(
+                        reports_dir,
+                        ny_today,
+                        committed_env,
+                        committed_mkt_records=bmkt,
+                        deadlines=deadlines,
+                        cfg=cfg,
+                        cal=today_cal,
+                        ledger=ledger,
+                        expected_consecutive_count=expected_consecutive,
+                    ):
+                        return None, {
+                            "status": "already_committed_no_op",
+                            "ny_date": ny_today,
+                            "session_state": "half_day",
+                            "appended": False,
+                            "reports_written": 0,
+                        }
     return ny_today, None
 
 
@@ -2236,6 +2565,37 @@ def _validate_isolated_simulation_target(data_dir: str | Path, chain_id: str) ->
                 raise DrillOnlyViolationError(
                     f"simulate-drill refuses modifying non-simulation chain {existing_chain!r}"
                 )
+
+
+def _cli_guard_ny_hhmm(raw_hhmm: str | None, ref_dt: datetime) -> tuple[bool, int]:
+    """Evaluate --require-ny-hhmm whenever explicitly passed (including ''). Return (should_run, exit_code)."""
+    if raw_hhmm is None:
+        return True, 0
+    try:
+        matched = ny_local_time_matches(ref_dt, raw_hhmm)
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {"error": "invalid_require_ny_hhmm", "detail": str(exc)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return False, 1
+    if not matched:
+        print(
+            json.dumps(
+                {
+                    "skipped_dst_guard": True,
+                    "now_utc": _format_utc_ms(ref_dt),
+                    "required_ny_hhmm": raw_hhmm,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return False, 0
+    return True, 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2311,19 +2671,14 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_scheduler_config(args.config)
     if args.cmd == "run-drill":
         now_dt = datetime.now(timezone.utc)
-        if args.require_ny_hhmm and not ny_local_time_matches(now_dt, args.require_ny_hhmm):
-            print(
-                json.dumps(
-                    {
-                        "skipped_dst_guard": True,
-                        "now_utc": _format_utc_ms(now_dt),
-                        "required_ny_hhmm": args.require_ny_hhmm,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-            return 0
+        should_run, guard_rc = _cli_guard_ny_hhmm(args.require_ny_hhmm, now_dt)
+        if not should_run:
+            return guard_rc
+        if (args.fixtures_dir is not None and not str(args.fixtures_dir).strip()) or (
+            args.treasury_endpoint is not None and not str(args.treasury_endpoint).strip()
+        ):
+            print(json.dumps({"error": "invalid_cli_argument", "detail": "empty optional path or endpoint"}, indent=2, sort_keys=True))
+            return 1
         try:
             sess_date = args.session
             if sess_date == "auto":
@@ -2352,6 +2707,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 1
+        except ValueError as exc:
+            print(
+                json.dumps(
+                    {"error": "invalid_cli_argument", "detail": str(exc)},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
         print(json.dumps(res, indent=2, sort_keys=True))
         return 0
 
@@ -2361,20 +2725,19 @@ def main(argv: list[str] | None = None) -> int:
         except DrillOnlyViolationError as exc:
             print(json.dumps({"error": "simulation_isolation_rejected", "detail": str(exc)}, indent=2, sort_keys=True))
             return 1
-        sim_dt = _parse_utc_iso(args.now_utc)
-        if args.require_ny_hhmm and not ny_local_time_matches(sim_dt, args.require_ny_hhmm):
-            print(
-                json.dumps(
-                    {
-                        "skipped_dst_guard": True,
-                        "now_utc": _format_utc_ms(sim_dt),
-                        "required_ny_hhmm": args.require_ny_hhmm,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-            return 0
+        try:
+            sim_dt = _parse_utc_iso(args.now_utc)
+        except ValueError as exc:
+            print(json.dumps({"error": "invalid_now_utc", "detail": str(exc)}, indent=2, sort_keys=True))
+            return 1
+        should_run, guard_rc = _cli_guard_ny_hhmm(args.require_ny_hhmm, sim_dt)
+        if not should_run:
+            return guard_rc
+        if (args.fixtures_dir is not None and not str(args.fixtures_dir).strip()) or (
+            args.treasury_endpoint is not None and not str(args.treasury_endpoint).strip()
+        ):
+            print(json.dumps({"error": "invalid_cli_argument", "detail": "empty optional path or endpoint"}, indent=2, sort_keys=True))
+            return 1
         sim_cfg = replace(cfg, chain_id=args.chain_id)
         try:
             sess_date = args.session
@@ -2404,24 +2767,31 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 1
-        print(json.dumps(res, indent=2, sort_keys=True))
-        return 0
-
-    if args.cmd == "detect-missed":
-        as_of_dt = _parse_utc_iso(args.as_of_utc) if args.as_of_utc else datetime.now(timezone.utc)
-        if args.require_ny_hhmm and not ny_local_time_matches(as_of_dt, args.require_ny_hhmm):
+        except ValueError as exc:
             print(
                 json.dumps(
-                    {
-                        "skipped_dst_guard": True,
-                        "now_utc": _format_utc_ms(as_of_dt),
-                        "required_ny_hhmm": args.require_ny_hhmm,
-                    },
+                    {"error": "invalid_cli_argument", "detail": str(exc)},
                     indent=2,
                     sort_keys=True,
                 )
             )
-            return 0
+            return 1
+        print(json.dumps(res, indent=2, sort_keys=True))
+        return 0
+
+    if args.cmd == "detect-missed":
+        try:
+            as_of_dt = (
+                _parse_utc_iso(args.as_of_utc)
+                if args.as_of_utc is not None
+                else datetime.now(timezone.utc)
+            )
+        except ValueError as exc:
+            print(json.dumps({"error": "invalid_as_of_utc", "detail": str(exc)}, indent=2, sort_keys=True))
+            return 1
+        should_run, guard_rc = _cli_guard_ny_hhmm(args.require_ny_hhmm, as_of_dt)
+        if not should_run:
+            return guard_rc
         as_of = _format_utc_ms(as_of_dt)
         try:
             res = detect_missed_runs(
@@ -2434,6 +2804,15 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     {"error": "calendar_coverage_insufficient", "detail": str(exc)},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        except ValueError as exc:
+            print(
+                json.dumps(
+                    {"error": "invalid_cli_argument", "detail": str(exc)},
                     indent=2,
                     sort_keys=True,
                 )
