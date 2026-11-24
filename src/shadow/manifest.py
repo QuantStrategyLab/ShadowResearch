@@ -13,14 +13,17 @@ DEFAULT_SCHEDULER_CONFIG_PATH = REPO_ROOT / "config" / "drill-scheduler.json"
 RUNTIME_MODULE_FILES: tuple[str, ...] = (
     "src/shadow/__init__.py",
     "src/shadow/calendar_consumer.py",
+    "src/shadow/cloudrun_job.py",
     "src/shadow/evaluator.py",
     "src/shadow/feeder.py",
     "src/shadow/feeder_live.py",
+    "src/shadow/fuse_adapter.py",
     "src/shadow/ledger.py",
     "src/shadow/manifest.py",
     "src/shadow/ots.py",
     "src/shadow/replay.py",
     "src/shadow/scheduler.py",
+    "src/shadow/sh2_acceptance.py",
     "src/shadow/sizing.py",
 )
 
@@ -60,8 +63,14 @@ def load_effective_runtime_config(
         "mode",
         "clk01_active",
         "production_mode_forbidden",
+        "production_chain_locked",
+        "deployment_target",
+        "cloudrun_region",
         "venue",
         "calendar_version",
+        "calendar_spec_digest",
+        "fuse_spec_version",
+        "fuse_engine_hash",
         "decision_instant_et",
         "half_day_run_time_et",
         "decision_cutoff_et",
@@ -111,7 +120,8 @@ def compute_code_manifest_hash(
     cal_ver = cal_ver or "csa22-v1"
 
     targets: list[tuple[str, Path]] = [(rel, root / rel) for rel in RUNTIME_MODULE_FILES]
-    targets.append(("config/drill-scheduler.json", cfg_file))
+    cfg_rel = "config/drill-scheduler.json" if config_path is None else f"config/{cfg_file.name}"
+    targets.append((cfg_rel, cfg_file))
     targets.append((f"specs/{cal_ver}/manifest.json", root / "specs" / cal_ver / "manifest.json"))
 
     h = hashlib.sha256()

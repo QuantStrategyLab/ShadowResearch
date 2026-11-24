@@ -11,8 +11,24 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
-from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, Y2_REQUIRED_MARKET_SERIES
-from shadow.feeder import VINTAGE_Y2, default_eod_decision_cutoff_utc, verify_market_record_raw_integrity
+from shadow.evaluator import (
+    REQUIRED_MARKET_SERIES,
+    StubEvaluator,
+    StubProductionForbiddenError,
+    Y2_REQUIRED_MARKET_SERIES,
+)
+from shadow.feeder import (
+    VINTAGE_Y2,
+    default_eod_decision_cutoff_utc,
+    validate_official_close_market_record,
+    verify_market_record_raw_integrity,
+)
+from shadow.fuse_adapter import (
+    PINNED_FUSE_ENGINE_HASH,
+    PINNED_FUSE_SPEC_VERSION,
+    VendoredFuseEvaluator,
+    is_stub_evaluator,
+)
 from shadow.ledger import (
     GENESIS_PREV_HASH,
     ShadowLedger,
@@ -47,6 +63,7 @@ def replay_window(
     ledger_dir: str | Path,
     *,
     bitcoin_merkle_roots: Mapping[int, str] | None = None,
+    evaluator: object | None = None,
 ) -> dict:
     """Re-derive every record bit-for-bit from retained inputs and verify chain + receipts separately."""
     b_dir = Path(bundle_dir)
@@ -153,7 +170,88 @@ def replay_window(
             "replayed_count": 0,
         }
 
-    ev = StubEvaluator()
+    bundle_engine_hash = bundle.get("engine_hash")
+    rec0_body = (
+        stored_records[0]["record_body"]
+        if stored_records
+        and isinstance(stored_records[0], dict)
+        and isinstance(stored_records[0].get("record_body"), dict)
+        else {}
+    )
+    rec0_engine_hash = rec0_body.get("engine_hash")
+    is_prod_bundle = bundle.get("mode") == "production"
+
+    if is_prod_bundle and evaluator is not None and is_stub_evaluator(evaluator):
+        raise StubProductionForbiddenError(
+            "StubEvaluator is structurally forbidden when replaying production mode"
+        )
+    if is_prod_bundle and (
+        str(bundle_engine_hash or "").startswith("stub-")
+        or str(rec0_engine_hash or "").startswith("stub-")
+    ):
+        return {
+            "bit_for_bit_match": False,
+            "chain_ok": chain_ok,
+            "first_bad_sequence": first_bad_seq,
+            "chain_error": chain_err,
+            "receipts_ok": receipts_ok,
+            "bad_receipt_sequence": bad_rec_seq,
+            "receipt_error": rec_err,
+            "receipts_creditable": receipts_creditable,
+            "receipt_credit_issues": receipt_credit_issues,
+            "archived_inputs_ok": False,
+            "mismatches": ["stub_forbidden_in_production"],
+            "error": "stub_forbidden_in_production",
+            "replayed_count": 0,
+        }
+
+    if evaluator is not None:
+        ev = evaluator
+    elif is_prod_bundle or bundle_engine_hash == PINNED_FUSE_ENGINE_HASH or rec0_engine_hash == PINNED_FUSE_ENGINE_HASH:
+        ev = VendoredFuseEvaluator()
+    else:
+        ev = StubEvaluator()
+
+    if is_prod_bundle and (
+        is_stub_evaluator(ev)
+        or getattr(ev, "engine_hash", None) != PINNED_FUSE_ENGINE_HASH
+        or getattr(ev, "spec_version", None) != PINNED_FUSE_SPEC_VERSION
+    ):
+        return {
+            "bit_for_bit_match": False,
+            "chain_ok": chain_ok,
+            "first_bad_sequence": first_bad_seq,
+            "chain_error": chain_err,
+            "receipts_ok": receipts_ok,
+            "bad_receipt_sequence": bad_rec_seq,
+            "receipt_error": rec_err,
+            "receipts_creditable": receipts_creditable,
+            "receipt_credit_issues": receipt_credit_issues,
+            "archived_inputs_ok": False,
+            "mismatches": ["invalid_production_evaluator_identity"],
+            "error": "invalid_production_evaluator_identity",
+            "replayed_count": 0,
+        }
+
+    if bundle_engine_hash is not None and bundle_engine_hash != getattr(ev, "engine_hash", None):
+        return {
+            "bit_for_bit_match": False,
+            "chain_ok": chain_ok,
+            "first_bad_sequence": first_bad_seq,
+            "chain_error": chain_err,
+            "receipts_ok": receipts_ok,
+            "bad_receipt_sequence": bad_rec_seq,
+            "receipt_error": rec_err,
+            "receipts_creditable": receipts_creditable,
+            "receipt_credit_issues": receipt_credit_issues,
+            "archived_inputs_ok": False,
+            "mismatches": [
+                f"bundle_engine_hash_mismatch:bundle={bundle_engine_hash},ev={getattr(ev, 'engine_hash', None)}"
+            ],
+            "error": "bundle_engine_hash_mismatch",
+            "replayed_count": 0,
+        }
+
     prior_state: dict = {}
     prev_hash = GENESIS_PREV_HASH
     mismatches: list[str] = []
@@ -245,9 +343,14 @@ def replay_window(
                             archive_dir,
                             mrec,
                             session_date=sess.get("session_date"),
+                            calendar_session=cal,
                         )
                         if not ok_raw:
                             archive_errors.append(f"seq_{seq}:{raw_err}")
+                    if not is_noncreditable_y2_session:
+                        ok_close, close_err = validate_official_close_market_record(mrec, cal)
+                        if not ok_close:
+                            archive_errors.append(f"seq_{seq}:{close_err}:{m_inst}")
 
                     if m_inst in expected_required_series:
                         elig = mrec.get("eligibility")
@@ -321,6 +424,11 @@ def replay_window(
                                     f"seq_{seq}:invalid_close_price_{inst}:{exc}"
                                 )
 
+        replay_inputs = dict(sess["inputs"])
+        if not is_stub_evaluator(ev) and "market_records" in sess and "market_records" not in replay_inputs:
+            replay_inputs["market_records"] = sess["market_records"]
+            replay_inputs.setdefault("required_series", expected_required_series)
+
         res = build_record_body(
             chain_id=bundle["chain_id"],
             sequence=seq,
@@ -328,7 +436,7 @@ def replay_window(
             mode=bundle["mode"],
             session_date=sess["session_date"],
             decision_timestamp_utc=sess["decision_timestamp_utc"],
-            session_inputs=sess["inputs"],
+            session_inputs=replay_inputs,
             calendar_session=cal,
             code_version_sha=bundle["code_version_sha"],
             evaluator=ev,

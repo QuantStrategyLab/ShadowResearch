@@ -1,0 +1,52 @@
+# Secret-free Cloud Run Job specification example for SHADOW-N SH-2 (us-east1)
+# Replace <project-id>, <repo>, <tag>, <service-account>, and <bucket-name> before deploy.
+# Keep config/production-scheduler.json production_chain_locked=true until OA-SH2-2 sign-off.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: shadow-sh2-eod-job
+  namespace: "<project-id>"
+  labels:
+    cloud.googleapis.com/location: us-east1
+    component: shadow-sh2
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      parallelism: 1
+      taskCount: 1
+      template:
+        spec:
+          maxRetries: 3
+          timeoutSeconds: 300
+          serviceAccountName: "<service-account>@<project-id>.iam.gserviceaccount.com"
+          containers:
+            - image: "us-east1-docker.pkg.dev/<project-id>/<repo>/shadow-sh2:<tag>"
+              env:
+                - name: SHADOW_DATA_DIR
+                  value: /var/lib/shadow/data
+                - name: SHADOW_CONFIG_PATH
+                  value: /app/config/production-scheduler.json
+                - name: SHADOW_CHAIN_MODE
+                  value: production
+                - name: TIINGO_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: tiingo-api-key
+                      key: latest
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              volumeMounts:
+                - name: shadow-state
+                  mountPath: /var/lib/shadow/data
+          volumes:
+            - name: shadow-state
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                readOnly: false
+                volumeAttributes:
+                  bucketName: "<bucket-name>"

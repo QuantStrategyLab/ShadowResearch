@@ -1,0 +1,53 @@
+{
+  "schema_version": "sh2-production-scheduler-v1",
+  "chain_id": "prod-sh2-v1",
+  "mode": "production",
+  "production_chain_locked": true,
+  "clk01_active": false,
+  "production_mode_forbidden": false,
+  "deployment_target": "cloudrun-job",
+  "cloudrun_region": "us-east1",
+  "venue": "XNYS",
+  "calendar_version": "csa22-v2",
+  "calendar_spec_digest": "2ba8cd7684c361209df68bfa2e10004c1f9922a645c7ec55d421fda520561798",
+  "fuse_spec_version": "fuse-eval-spec/v1",
+  "fuse_engine_hash": "12e9b502367a4993d0c36e75ac5c8d24acaee2d1247c5b594796d5adda04ca45",
+  "decision_instant_et": "17:30",
+  "half_day_run_time_et": "14:30",
+  "decision_cutoff_et": "18:00",
+  "decision_cutoff_half_day_et": "15:00",
+  "commitment_deadline_et": "23:30",
+  "treasury_endpoint": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_bill_rates&field_tdr_date_value={year}&page&_format=csv",
+  "yahoo_symbol_map": {
+    "XNDX": "^XNDX",
+    "SEMI": "XSOX"
+  },
+  "ots_calendars": [
+    "https://a.pool.opentimestamps.org",
+    "https://b.pool.opentimestamps.org",
+    "https://alice.btc.calendar.opentimestamps.org"
+  ],
+  "ots_timeout_seconds": 10.0,
+  "max_footprint_bytes": 2147483648,
+  "log_retention_days": 30,
+  "log_max_bytes": 52428800,
+  "resource_caps": {
+    "cpu": "1",
+    "memory_mib": 512,
+    "memory_high_mib": 384,
+    "max_rss_bytes": 536870912,
+    "task_timeout_seconds": 300
+  },
+  "standing_safety_locks": {
+    "live": "OFF",
+    "kelly": "OFF",
+    "kelly_applied": false,
+    "orders_placed": 0,
+    "loss_breakers_armed": false,
+    "enforcement_mode": "shadow_would_have_tripped",
+    "H": "0",
+    "B0": "50000",
+    "stop_loss_return_rule": "OFF",
+    "production_chain_locked": true
+  }
+}

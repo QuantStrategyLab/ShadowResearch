@@ -17,7 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import load_spec, resolve_session
-from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator
+from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, StubProductionForbiddenError
 from shadow.feeder import (
     SOXL_PROXY_LABEL,
     emit_market_records_from_fixtures,
@@ -29,6 +29,16 @@ from shadow.feeder_live import (
     LIVE_SERIES,
     Transport,
     emit_live_market_records,
+)
+from shadow.fuse_adapter import (
+    PINNED_CSA22_V2_DIGEST,
+    PINNED_FUSE_ENGINE_HASH,
+    PINNED_FUSE_SPEC_VERSION,
+    ProductionChainLockedError,
+    VendoredFuseEvaluator,
+    build_fuse_validated_inputs,
+    is_stub_evaluator,
+    resolve_aggregate_control_state,
 )
 from shadow.ledger import (
     GENESIS_PREV_HASH,
@@ -43,7 +53,9 @@ from shadow.ledger import (
     has_committed_detached_evidence,
     is_receipt_timely,
     is_utc_ms_timestamp,
+    load_row_state_snapshot,
     parse_json_no_duplicates,
+    save_row_state_snapshot,
     sha256_canonical,
     verify_receipt,
 )
@@ -54,6 +66,7 @@ from shadow.sizing import INSTRUMENT_ORDER, canonical_decimal_str, policy_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCHEDULER_CONFIG_PATH = REPO_ROOT / "config" / "drill-scheduler.json"
+DEFAULT_PRODUCTION_CONFIG_PATH = REPO_ROOT / "config" / "production-scheduler.json"
 DEFAULT_DEPLOY_DIR = REPO_ROOT / "deploy" / "scheduler"
 _NY_TZ = ZoneInfo("America/New_York")
 _STRICT_HHMM_RE = re.compile(r"^[0-9]{2}:[0-9]{2}$", re.ASCII)
@@ -118,6 +131,12 @@ class DrillSchedulerConfig:
     resource_caps: dict[str, object] | None = None
     schema_version: str = "sh1-drill-scheduler-v1"
     production_mode_forbidden: bool = True
+    production_chain_locked: bool | None = None
+    deployment_target: str | None = None
+    cloudrun_region: str | None = None
+    calendar_spec_digest: str | None = None
+    fuse_spec_version: str | None = None
+    fuse_engine_hash: str | None = None
 
     def __post_init__(self) -> None:
         for fname in (
@@ -176,6 +195,73 @@ def load_scheduler_config(config_path: str | Path | None = None) -> DrillSchedul
         resource_caps=dict(raw.get("resource_caps", {})),
         schema_version=str(raw.get("schema_version", "sh1-drill-scheduler-v1")),
         production_mode_forbidden=bool(raw.get("production_mode_forbidden", True)),
+        production_chain_locked=raw.get("production_chain_locked"),
+        deployment_target=raw.get("deployment_target"),
+        cloudrun_region=raw.get("cloudrun_region"),
+        calendar_spec_digest=raw.get("calendar_spec_digest"),
+        fuse_spec_version=raw.get("fuse_spec_version"),
+        fuse_engine_hash=raw.get("fuse_engine_hash"),
+    )
+
+
+def load_production_scheduler_config(config_path: str | Path | None = None) -> DrillSchedulerConfig:
+    """Load and validate production scheduler config with fail-closed OA-SH2-2 lock state."""
+    path = Path(config_path) if config_path is not None else DEFAULT_PRODUCTION_CONFIG_PATH
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Production scheduler configuration JSON must be an object")
+    if raw.get("mode") != "production":
+        raise DrillOnlyViolationError("Production scheduler config MUST specify mode='production'")
+    if raw.get("fuse_spec_version") != PINNED_FUSE_SPEC_VERSION:
+        raise ValueError(
+            f"Production config must pin fuse_spec_version={PINNED_FUSE_SPEC_VERSION!r}, got {raw.get('fuse_spec_version')!r}"
+        )
+    if raw.get("fuse_engine_hash") != PINNED_FUSE_ENGINE_HASH:
+        raise ValueError(
+            f"Production config must pin fuse_engine_hash={PINNED_FUSE_ENGINE_HASH!r}, got {raw.get('fuse_engine_hash')!r}"
+        )
+    if raw.get("calendar_version") != "csa22-v2" or raw.get("calendar_spec_digest") != PINNED_CSA22_V2_DIGEST:
+        raise CalendarCoverageError(
+            "Production config must pin calendar_version='csa22-v2' and csa22-v2 spec_digest"
+        )
+    validated_times: dict[str, str] = {}
+    for time_key in (
+        "decision_instant_et",
+        "half_day_run_time_et",
+        "decision_cutoff_et",
+        "decision_cutoff_half_day_et",
+        "commitment_deadline_et",
+    ):
+        if time_key not in raw:
+            raise ValueError(f"missing_required_scheduler_config:{time_key}")
+        _, _, validated_times[time_key] = _parse_strict_hhmm(raw[time_key], field_name=time_key)
+    return DrillSchedulerConfig(
+        chain_id=str(raw["chain_id"]),
+        mode="production",
+        clk01_active=bool(raw.get("clk01_active", False)),
+        venue=str(raw["venue"]),
+        calendar_version=str(raw["calendar_version"]),
+        decision_instant_et=validated_times["decision_instant_et"],
+        half_day_run_time_et=validated_times["half_day_run_time_et"],
+        decision_cutoff_et=validated_times["decision_cutoff_et"],
+        decision_cutoff_half_day_et=validated_times["decision_cutoff_half_day_et"],
+        commitment_deadline_et=validated_times["commitment_deadline_et"],
+        treasury_endpoint=str(raw.get("treasury_endpoint", DEFAULT_TREASURY_URL_TEMPLATE)),
+        yahoo_symbol_map=dict(raw.get("yahoo_symbol_map", DEFAULT_YAHOO_SYMBOL_MAP)),
+        ots_calendars=tuple(raw.get("ots_calendars", DEFAULT_OTS_CALENDARS)),
+        ots_timeout_seconds=float(raw.get("ots_timeout_seconds", 10.0)),
+        max_footprint_bytes=int(raw.get("max_footprint_bytes", 2 * 1024 * 1024 * 1024)),
+        log_retention_days=int(raw.get("log_retention_days", 30)),
+        log_max_bytes=int(raw.get("log_max_bytes", 50 * 1024 * 1024)),
+        resource_caps=dict(raw.get("resource_caps", {})),
+        schema_version=str(raw.get("schema_version", "sh2-production-scheduler-v1")),
+        production_mode_forbidden=bool(raw.get("production_mode_forbidden", False)),
+        production_chain_locked=bool(raw.get("production_chain_locked", True)),
+        deployment_target=str(raw.get("deployment_target", "cloudrun-job")),
+        cloudrun_region=str(raw.get("cloudrun_region", "us-east1")),
+        calendar_spec_digest=str(raw["calendar_spec_digest"]),
+        fuse_spec_version=str(raw["fuse_spec_version"]),
+        fuse_engine_hash=str(raw["fuse_engine_hash"]),
     )
 
 
@@ -213,6 +299,17 @@ def _effective_runtime_config(
         "log_max_bytes": cfg.log_max_bytes,
         "resource_caps": dict(cfg.resource_caps or {}),
     }
+    for opt_key in (
+        "production_chain_locked",
+        "deployment_target",
+        "cloudrun_region",
+        "calendar_spec_digest",
+        "fuse_spec_version",
+        "fuse_engine_hash",
+    ):
+        opt_val = getattr(cfg, opt_key)
+        if opt_val is not None:
+            raw[opt_key] = opt_val
     return _normalize_config_value(raw)  # type: ignore[return-value]
 
 
@@ -564,7 +661,7 @@ def _validate_bundle_session_against_record(
         w_ref = pb.get("bankroll", {}).get("W_ref") if isinstance(pb.get("bankroll"), dict) else None
         ev_block = pb.get("evaluator") if isinstance(pb.get("evaluator"), dict) else {}
         eff_scope = ev_block.get("effective_state_by_scope") if isinstance(ev_block, dict) else {}
-        act_state = eff_scope.get("aggregate") if isinstance(eff_scope, dict) else None
+        act_state = resolve_aggregate_control_state(eff_scope) if isinstance(eff_scope, dict) else None
         computed_inputs_digest = compute_inputs_digest(
             sess_inputs,
             w_ref=w_ref,
@@ -900,7 +997,8 @@ def _is_committed_session_report_valid(
         return False
     if rep_obj.get("notifications_sent") != 0:
         return False
-    if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
+    expected_scope = "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+    if rep_obj.get("consecutive_session_scope") != expected_scope:
         return False
     consec = rep_obj.get("consecutive_session_count")
     if isinstance(consec, bool) or consec != expected_consecutive_count:
@@ -1061,7 +1159,8 @@ def _is_fail_closed_session_report_valid(
     notif = rep_obj.get("notifications_sent")
     if type(notif) is not int or notif != 0:
         return False
-    if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
+    expected_scope = "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+    if rep_obj.get("consecutive_session_scope") != expected_scope:
         return False
     consec = rep_obj.get("consecutive_session_count")
     if type(consec) is not int or consec < 0:
@@ -1271,6 +1370,8 @@ def _update_replay_bundle(
     archive_dir: Path,
     session_entry: dict,
     seq: int,
+    engine_hash: str | None = None,
+    spec_version: str | None = None,
 ) -> Path:
     bundle_dir.mkdir(parents=True, exist_ok=True)
     bundle_path = bundle_dir / "replay_bundle.json"
@@ -1298,6 +1399,10 @@ def _update_replay_bundle(
             "archive_dir": str(archive_dir),
             "sessions": [],
         }
+        if engine_hash is not None:
+            bundle["engine_hash"] = engine_hash
+        if spec_version is not None:
+            bundle["spec_version"] = spec_version
     sessions = list(bundle.get("sessions", []))
     if len(sessions) < seq:
         raise ValueError(f"replay_bundle_truncated_vs_ledger:len={len(sessions)}<seq={seq}")
@@ -1314,6 +1419,10 @@ def _update_replay_bundle(
         bundle["runtime_config"] = runtime_config
         bundle["code_version_sha"] = code_sha
         bundle["archive_dir"] = str(archive_dir)
+        if engine_hash is not None:
+            bundle["engine_hash"] = engine_hash
+        if spec_version is not None:
+            bundle["spec_version"] = spec_version
     sessions.append(session_entry)
     bundle["sessions"] = sessions
     _atomic_write_text(bundle_path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
@@ -1337,6 +1446,10 @@ def _commit_drill_session_atomically(
     archive_dir: Path,
     session_entry: dict,
     post_ledger_hook: Callable[[], None] | None = None,
+    snapshots_dir: Path | None = None,
+    next_row_state: dict | None = None,
+    engine_hash: str | None = None,
+    spec_version: str | None = None,
 ) -> dict:
     """Serialize via chain_lock, stage replay_bundle, commit seq_NNNNNN.record.json, then write detached .ots/.receipt."""
     with ledger.chain_lock():
@@ -1355,6 +1468,8 @@ def _commit_drill_session_atomically(
                 archive_dir=archive_dir,
                 session_entry=session_entry,
                 seq=seq,
+                engine_hash=engine_hash,
+                spec_version=spec_version,
             )
             bundle_modified = True
             if post_ledger_hook is not None:
@@ -1362,20 +1477,21 @@ def _commit_drill_session_atomically(
 
         try:
             if ots_bytes is not None:
-                return ledger.append_record(
+                env = ledger.append_record(
                     body,
                     obtained_at_utc=rcp_obtained_utc,
                     ots_bytes=ots_bytes,
                     commitment_deadline_utc=deadline_utc,
                     before_record_commit=_stage_bundle_before_marker,
                 )
-            if allow_unanchored:
-                return ledger.append_record(
+            elif allow_unanchored:
+                env = ledger.append_record(
                     body,
                     allow_unanchored=True,
                     before_record_commit=_stage_bundle_before_marker,
                 )
-            raise RuntimeError("OTS receipt missing and unanchored append disabled")
+            else:
+                raise RuntimeError("OTS receipt missing and unanchored append disabled")
         except Exception:
             if bundle_modified:
                 if prior_bundle_bytes is not None:
@@ -1383,6 +1499,23 @@ def _commit_drill_session_atomically(
                 elif bundle_path.exists():
                     bundle_path.unlink()
             raise
+        if (
+            snapshots_dir is not None
+            and next_row_state is not None
+            and engine_hash is not None
+            and spec_version is not None
+        ):
+            save_row_state_snapshot(
+                snapshots_dir,
+                chain_id=cfg.chain_id,
+                sequence=seq,
+                session_date=str(body["session_date"]),
+                record_sha256=env["record_sha256"],
+                engine_hash=engine_hash,
+                spec_version=spec_version,
+                next_row_state=next_row_state,
+            )
+        return env
 
 
 def _summarize_required_series(mkt_recs: list[dict]) -> list[dict]:
@@ -1516,7 +1649,9 @@ def _build_committed_completeness_report(
         "ledger": ledger_meta,
         "receipt": receipt_summary,
         "consecutive_session_count": consecutive_now,
-        "consecutive_session_scope": "drill_only_not_clk01",
+        "consecutive_session_scope": (
+            "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+        ),
         "standing_assertions": {
             "kelly_applied": False,
             "orders_placed": 0,
@@ -1525,7 +1660,9 @@ def _build_committed_completeness_report(
             "stop_loss_return_rule": "OFF",
             "loss_controls_armed": False,
         },
-        "observation_class": "synthetic",
+        "observation_class": (
+            "decision_time_market" if cfg.mode == "production" else "synthetic"
+        ),
         "notifications_sent": 0,
         "metrics": {
             "wall_seconds": round(time.monotonic() - t_start, 6),
@@ -1642,6 +1779,7 @@ def run_daily_drill_cycle(
     sigma_by_inst: Mapping[str, str] | None = None,
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = True,
+    evaluator: object | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None = None,
     _post_record_commit_hook: Callable[[], None] | None = None,
     _post_report_json_hook: Callable[[], None] | None = None,
@@ -1651,6 +1789,130 @@ def run_daily_drill_cycle(
     cfg = config if config is not None else load_scheduler_config()
     if cfg.mode != "drill" or cfg.clk01_active:
         raise DrillOnlyViolationError("Drill cycle refused non-drill or clk01_active config")
+    return _execute_cycle_with_config(
+        t_start=t_start,
+        cfg=cfg,
+        session_date=session_date,
+        data_dir=data_dir,
+        spec_dir=spec_dir,
+        transport=transport,
+        environ=environ,
+        fixtures_dir=fixtures_dir,
+        ots_client=ots_client,
+        ots_transport=ots_transport,
+        wall_clock=wall_clock,
+        clock=clock,
+        sleeper=sleeper,
+        treasury_endpoint=treasury_endpoint,
+        yahoo_symbol_map=yahoo_symbol_map,
+        q_pre_by_inst=q_pre_by_inst,
+        sigma_by_inst=sigma_by_inst,
+        revision_seq=revision_seq,
+        allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
+        evaluator=evaluator,
+        _post_ledger_commit_hook=_post_ledger_commit_hook,
+        _post_record_commit_hook=_post_record_commit_hook,
+        _post_report_json_hook=_post_report_json_hook,
+    )
+
+
+def run_production_cycle(
+    *,
+    session_date: str,
+    data_dir: str | Path,
+    config_path: str | Path | None = None,
+    config: DrillSchedulerConfig | None = None,
+    spec_dir: str | Path | None = None,
+    transport: Transport | None = None,
+    environ: Mapping[str, str] | None = None,
+    fixtures_dir: str | Path | None = None,
+    ots_client: OpenTimestampsClient | None = None,
+    ots_transport: OtsTransport | None = None,
+    wall_clock: Callable[[], datetime] | None = None,
+    clock: Callable[[], float] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+    treasury_endpoint: str | None = None,
+    yahoo_symbol_map: Mapping[str, str] | None = None,
+    q_pre_by_inst: Mapping[str, object] | None = None,
+    sigma_by_inst: Mapping[str, str] | None = None,
+    revision_seq: int = 0,
+    allow_unanchored_on_ots_failure: bool = False,
+    evaluator: object | None = None,
+) -> dict:
+    """Execute one CLK-01 production cycle ONLY when OA-SH2-2 lock is explicitly unlocked."""
+    t_start = time.monotonic()
+    cfg = config if config is not None else load_production_scheduler_config(config_path)
+    if cfg.mode != "production":
+        raise DrillOnlyViolationError("run_production_cycle requires mode='production'")
+    if cfg.production_chain_locked is not False or not cfg.clk01_active:
+        raise ProductionChainLockedError(
+            "Production chain is locked pending OA-SH2-2 sign-off; 0 production appends permitted"
+        )
+    if allow_unanchored_on_ots_failure:
+        raise ValueError("Production chain structurally forbids unanchored appends")
+    ev = evaluator if evaluator is not None else VendoredFuseEvaluator()
+    if is_stub_evaluator(ev):
+        raise StubProductionForbiddenError(
+            "StubEvaluator is structurally forbidden in production forward-clock mode"
+        )
+    if (
+        getattr(ev, "engine_hash", None) != PINNED_FUSE_ENGINE_HASH
+        or getattr(ev, "spec_version", None) != PINNED_FUSE_SPEC_VERSION
+    ):
+        raise ValueError("Production cycle requires exact pinned FUSE-1 identity")
+    return _execute_cycle_with_config(
+        t_start=t_start,
+        cfg=cfg,
+        session_date=session_date,
+        data_dir=data_dir,
+        spec_dir=spec_dir,
+        transport=transport,
+        environ=environ,
+        fixtures_dir=fixtures_dir,
+        ots_client=ots_client,
+        ots_transport=ots_transport,
+        wall_clock=wall_clock,
+        clock=clock,
+        sleeper=sleeper,
+        treasury_endpoint=treasury_endpoint,
+        yahoo_symbol_map=yahoo_symbol_map,
+        q_pre_by_inst=q_pre_by_inst,
+        sigma_by_inst=sigma_by_inst,
+        revision_seq=revision_seq,
+        allow_unanchored_on_ots_failure=False,
+        evaluator=ev,
+        _post_ledger_commit_hook=None,
+        _post_record_commit_hook=None,
+        _post_report_json_hook=None,
+    )
+
+
+def _execute_cycle_with_config(
+    *,
+    t_start: float,
+    cfg: DrillSchedulerConfig,
+    session_date: str,
+    data_dir: str | Path,
+    spec_dir: str | Path | None,
+    transport: Transport | None,
+    environ: Mapping[str, str] | None,
+    fixtures_dir: str | Path | None,
+    ots_client: OpenTimestampsClient | None,
+    ots_transport: OtsTransport | None,
+    wall_clock: Callable[[], datetime] | None,
+    clock: Callable[[], float] | None,
+    sleeper: Callable[[float], None] | None,
+    treasury_endpoint: str | None,
+    yahoo_symbol_map: Mapping[str, str] | None,
+    q_pre_by_inst: Mapping[str, object] | None,
+    sigma_by_inst: Mapping[str, str] | None,
+    revision_seq: int,
+    allow_unanchored_on_ots_failure: bool,
+    evaluator: object | None,
+    _post_ledger_commit_hook: Callable[[], None] | None,
+    _post_record_commit_hook: Callable[[], None] | None,
+    _post_report_json_hook: Callable[[], None] | None,
+) -> dict:
 
     root = Path(data_dir)
     ledger_dir = root / "ledger"
@@ -1716,6 +1978,7 @@ def run_daily_drill_cycle(
             sigma_by_inst=sigma_by_inst,
             revision_seq=revision_seq,
             allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
+            evaluator=evaluator,
             _post_ledger_commit_hook=_post_ledger_commit_hook,
             _post_record_commit_hook=_post_record_commit_hook,
             _post_report_json_hook=_post_report_json_hook,
@@ -1750,6 +2013,7 @@ def _run_daily_drill_cycle_locked(
     sigma_by_inst: Mapping[str, str] | None,
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
+    evaluator: object | None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
     _post_report_json_hook: Callable[[], None] | None,
@@ -2257,14 +2521,14 @@ def _run_daily_drill_cycle_locked(
             yahoo_symbol_map=eff_yahoo_map,
             session_close_utc=session_close_utc,
             decision_cutoff_utc=decision_cutoff_utc,
-            observation_class="synthetic",
+            observation_class="decision_time_market" if cfg.mode == "production" else "synthetic",
             auto_advance_revision=True,
         )
 
     raw_integrity_failures: list[str] = []
     for rec in mkt_recs:
         ok_raw, raw_err = verify_market_record_raw_integrity(
-            archive_dir, rec, session_date=session_date
+            archive_dir, rec, session_date=session_date, calendar_session=cal
         )
         if not ok_raw:
             raw_integrity_failures.append(str(raw_err))
@@ -2272,7 +2536,7 @@ def _run_daily_drill_cycle_locked(
     by_inst = {r["instrument"]: r for r in mkt_recs}
     series_summary = _summarize_required_series(mkt_recs)
 
-    # Step 3: Build notional inputs & evaluate C-FUSE-EVAL stub
+    # Step 3: Build notional inputs & evaluate C-FUSE-EVAL (stub or vendored FUSE-1)
     q_pre_map = dict(q_pre_by_inst or {})
     sig_map = dict(sigma_by_inst or {})
     tqqq_close = by_inst.get("TQQQ", {}).get("normalized_value")
@@ -2302,7 +2566,18 @@ def _run_daily_drill_cycle_locked(
     eval_inputs["market_records"] = mkt_recs
     eval_inputs["required_series"] = required_for_eval
 
-    ev = StubEvaluator()
+    if evaluator is not None:
+        ev = evaluator
+    elif cfg.mode == "production" or cfg.fuse_engine_hash == PINNED_FUSE_ENGINE_HASH:
+        ev = VendoredFuseEvaluator()
+    else:
+        ev = StubEvaluator()
+
+    if cfg.mode == "production" and is_stub_evaluator(ev):
+        raise StubProductionForbiddenError(
+            "StubEvaluator is structurally forbidden in production forward-clock mode"
+        )
+
     eff_cfg = _effective_runtime_config(
         cfg,
         treasury_endpoint=eff_treasury,
@@ -2315,8 +2590,20 @@ def _run_daily_drill_cycle_locked(
         code_manifest_hash=code_sha,
     )
     seq = len(prior_records)
+    snapshots_dir = root / "state_snapshots"
     prior_state: dict = {}
-    if head_env is not None:
+    if not is_stub_evaluator(ev):
+        if head_env is not None:
+            prior_state, _ = load_row_state_snapshot(
+                snapshots_dir,
+                expected_chain_id=cfg.chain_id,
+                expected_engine_hash=ev.engine_hash,
+                expected_spec_version=ev.spec_version,
+                expected_sequence=seq - 1,
+                expected_record_sha256=head_hash,
+                allow_missing_at_genesis=False,
+            )
+    elif head_env is not None:
         breakers = head_env["record_body"]["evaluator"]["breakers"]
         prior_state = {
             b["id"]: {"state": b["state"], "latched": b["latched"], "reason": b["reason"]}
@@ -2345,15 +2632,27 @@ def _run_daily_drill_cycle_locked(
             },
         }
     else:
-        eval_inputs["calendar"] = cal
+        if is_stub_evaluator(ev):
+            eval_inputs["calendar"] = cal
+            ev_validated = eval_inputs
+            ev_mode = cfg.mode
+        else:
+            ev_validated = build_fuse_validated_inputs(
+                eval_inputs,
+                cal,
+                policy_hash=p_hash,
+                session_date=session_date,
+                as_of=decision_utc,
+            )
+            ev_mode = "shadow"
         rows_by_id, eff_scope, next_state = ev.evaluate(
             spec_version=ev.spec_version,
             engine_hash=ev.engine_hash,
             policy_hash=p_hash,
             session=session_date,
             as_of=decision_utc,
-            mode=cfg.mode,
-            validated_inputs=eval_inputs,
+            mode=ev_mode,
+            validated_inputs=ev_validated,
             prior_row_state=prior_state,
             authorized_events=None,
         )
@@ -2368,6 +2667,28 @@ def _run_daily_drill_cycle_locked(
             }
         else:
             mkt_digest = sha256_canonical(mkt_recs)
+            cycle_inputs = (
+                dict(session_inputs)
+                if is_stub_evaluator(ev)
+                else {
+                    **session_inputs,
+                    "market_records": mkt_recs,
+                    "required_series": required_for_eval,
+                }
+            )
+            cycle_labels = (
+                {
+                    "production_chain": True,
+                    "soxl_basis": SOXL_PROXY_LABEL,
+                    "forward_clock_credit_eligible": True,
+                }
+                if cfg.mode == "production"
+                else {
+                    "drill_chain": True,
+                    "soxl_basis": SOXL_PROXY_LABEL,
+                    "forward_clock_credit_eligible": False,
+                }
+            )
             built = build_record_body(
                 chain_id=cfg.chain_id,
                 sequence=seq,
@@ -2375,16 +2696,12 @@ def _run_daily_drill_cycle_locked(
                 mode=cfg.mode,
                 session_date=session_date,
                 decision_timestamp_utc=decision_utc,
-                session_inputs=session_inputs,
+                session_inputs=cycle_inputs,
                 calendar_session=cal,
                 code_version_sha=code_sha,
                 evaluator=ev,
                 prior_row_state=prior_state,
-                discipline_labels={
-                    "drill_chain": True,
-                    "soxl_basis": SOXL_PROXY_LABEL,
-                    "forward_clock_credit_eligible": False,
-                },
+                discipline_labels=cycle_labels,
                 market_records_digest=mkt_digest,
                 runtime_config=eff_cfg,
                 calendar_spec=spec,
@@ -2480,6 +2797,10 @@ def _run_daily_drill_cycle_locked(
         archive_dir=archive_dir,
         session_entry=session_entry,
         post_ledger_hook=_post_ledger_commit_hook,
+        snapshots_dir=None if is_stub_evaluator(ev) else snapshots_dir,
+        next_row_state=None if is_stub_evaluator(ev) else built["next_row_state"],
+        engine_hash=None if is_stub_evaluator(ev) else ev.engine_hash,
+        spec_version=None if is_stub_evaluator(ev) else ev.spec_version,
     )
     if _post_record_commit_hook is not None:
         _post_record_commit_hook()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -242,7 +243,14 @@ def resolve_session(
             "blocks_eligibility": False,
         }
 
-    if observed_venue_status is not None and observed_venue_status != result["session_state"]:
+    venue_matches = (
+        observed_venue_status == result["session_state"]
+        or (
+            observed_venue_status == "core_session_open"
+            and result["session_state"] in ("regular", "half_day")
+        )
+    )
+    if observed_venue_status is not None and not venue_matches:
         result["blocks_orders"] = True
         result["blocks_eligibility"] = True
         result["venue_disagreement"] = True
@@ -290,3 +298,69 @@ def resolve_prior_close_session(
                 return sess
 
     return _unknown_session(venue, local_date.isoformat(), rules, spec_digest, "out_of_range")
+
+
+def classify_us_equity_session_window(
+    timestamp_utc: str,
+    calendar_session: Mapping[str, object],
+) -> str:
+    """Classify a UTC timestamp into core RTH vs US 23/5 extended/overnight session windows."""
+    tz = ZoneInfo(str(calendar_session.get("timezone", "America/New_York")))
+    iso_norm = timestamp_utc[:-1] + "+00:00" if timestamp_utc.endswith("Z") else timestamp_utc
+    dt_local = datetime.fromisoformat(iso_norm).astimezone(tz)
+    local_date_str = dt_local.date().isoformat()
+    local_t = dt_local.time()
+    trade_date = str(calendar_session.get("trade_date", ""))
+
+    if local_t >= time(20, 0) or local_t < time(4, 0):
+        return "extended_overnight_open"
+    if not calendar_session.get("is_trading_day") or calendar_session.get("blocks_eligibility"):
+        return "closed"
+    if local_date_str > trade_date:
+        return "next_trade_date_window"
+    if local_date_str < trade_date:
+        return "closed"
+
+    close_hhmm = str(calendar_session.get("close_local") or "16:00")
+    ch, cm = map(int, close_hhmm.split(":"))
+    close_t = time(ch, cm)
+    if time(9, 30) <= local_t <= close_t:
+        return "core_session_open"
+    if close_t < local_t < time(20, 0):
+        return "after_hours_extended"
+    if time(4, 0) <= local_t < time(9, 30):
+        return "pre_market_extended"
+    return "closed"
+
+
+def is_official_close_bar_timestamp(
+    timestamp_utc: str,
+    calendar_session: Mapping[str, object],
+) -> tuple[bool, str | None]:
+    """Validate that a market print timestamp belongs to core RTH and not 23/5 overnight/T+1."""
+    tz = ZoneInfo(str(calendar_session.get("timezone", "America/New_York")))
+    iso_norm = timestamp_utc[:-1] + "+00:00" if timestamp_utc.endswith("Z") else timestamp_utc
+    try:
+        dt_local = datetime.fromisoformat(iso_norm).astimezone(tz)
+    except ValueError:
+        return False, "invalid_bar_timestamp"
+
+    trade_date = str(calendar_session.get("trade_date", ""))
+    local_date_str = dt_local.date().isoformat()
+    if local_date_str > trade_date:
+        return False, "next_trade_date_contamination"
+    if local_date_str < trade_date:
+        return False, "session_not_in_payload"
+
+    if not calendar_session.get("is_trading_day") or calendar_session.get("blocks_eligibility"):
+        return False, "non_trading_session"
+
+    close_hhmm = str(calendar_session.get("close_local") or "16:00")
+    ch, cm = map(int, close_hhmm.split(":"))
+    close_t = time(ch, cm)
+    local_t = dt_local.time()
+    if local_t >= time(21, 0):
+        return False, "next_trade_date_contamination"
+    if local_t < time(9, 30) or local_t > close_t:
+        return False, "extended_hours_overnight_rejected"
+    return True, None

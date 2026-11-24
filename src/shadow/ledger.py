@@ -15,7 +15,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
-from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator
+from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator, StubProductionForbiddenError
+from shadow.fuse_adapter import (
+    EngineIdentityError,
+    build_fuse_validated_inputs,
+    is_stub_evaluator,
+    resolve_aggregate_control_state,
+    serialize_breakers_for_ledger,
+)
 from shadow.manifest import compute_code_manifest_hash, load_effective_runtime_config
 from shadow.ots import OtsFormatError, parse_ots_proof, verify_ots_bytes
 from shadow.sizing import (
@@ -184,6 +191,8 @@ def validate_record_body(body: dict) -> None:
 
     if body["mode"] not in ("drill", "reconstruction", "production"):
         raise CanonicalizationError(f"Unsupported mode: {body['mode']!r}")
+    if body["mode"] == "production" and body.get("observation_class") == "synthetic":
+        raise CanonicalizationError("Synthetic observation_class is structurally forbidden in production mode")
     if body["mode"] == "production" and str(body.get("engine_hash", "")).startswith("stub-"):
         raise CanonicalizationError("Stub engine_hash is structurally forbidden in production mode")
     ev_obj = body.get("evaluator")
@@ -609,7 +618,7 @@ def build_record_body(
     session_inputs: dict,
     calendar_session: dict,
     code_version_sha: str,
-    evaluator: StubEvaluator | None = None,
+    evaluator: object | None = None,
     prior_row_state: dict | None = None,
     discipline_labels: dict | None = None,
     market_records_digest: str | None = None,
@@ -618,6 +627,10 @@ def build_record_body(
 ) -> dict:
     """Run evaluator + sizing and assemble a canonical record_body (or O1/O2 fail-closed dict)."""
     ev = evaluator if evaluator is not None else StubEvaluator()
+    if mode == "production" and is_stub_evaluator(ev):
+        raise StubProductionForbiddenError(
+            "Production mode structurally forbids StubEvaluator and requires vendored FUSE-1"
+        )
     p_hash = policy_config_hash(
         runtime_config=runtime_config,
         calendar_spec=calendar_spec or calendar_session,
@@ -625,18 +638,32 @@ def build_record_body(
     )
     prior = prior_row_state if prior_row_state is not None else {}
 
-    eval_inputs = dict(session_inputs)
-    eval_inputs["calendar"] = calendar_session
+    if is_stub_evaluator(ev):
+        eval_inputs = dict(session_inputs)
+        eval_inputs["calendar"] = calendar_session
+        eval_mode = mode
+        auth_events = None
+    else:
+        eval_inputs = build_fuse_validated_inputs(
+            session_inputs,
+            calendar_session,
+            policy_hash=p_hash,
+            session_date=session_date,
+            as_of=decision_timestamp_utc,
+        )
+        eval_mode = "shadow"
+        auth_events = session_inputs.get("authorized_events")
+
     rows_by_id, eff_scope, next_state = ev.evaluate(
         spec_version=ev.spec_version,
         engine_hash=ev.engine_hash,
         policy_hash=p_hash,
         session=session_date,
         as_of=decision_timestamp_utc,
-        mode=mode,
+        mode=eval_mode,
         validated_inputs=eval_inputs,
         prior_row_state=prior,
-        authorized_events=None,
+        authorized_events=auth_events,
     )
 
     if rows_by_id["O1"]["would_have_tripped"] or rows_by_id["O2"]["would_have_tripped"]:
@@ -652,21 +679,40 @@ def build_record_body(
     if canonical_decimal_str(session_inputs.get("H", "0")) != "0":
         raise CanonicalizationError("Stage N ledger boundary requires H == '0'")
 
+    active_state = resolve_aggregate_control_state(eff_scope)
+
     sizing_res = compute_session_sizing(
         session_inputs,
-        active_control_state=eff_scope["aggregate"],
+        active_control_state=active_state,
     )
 
     inputs_digest = compute_inputs_digest(
         session_inputs,
         w_ref=sizing_res["bankroll"]["W_ref"],
-        active_control_state=eff_scope["aggregate"],
+        active_control_state=active_state,
         market_records_digest=market_records_digest,
         session_date=session_date,
     )
 
-    obs_class = "historical_reconstruction" if mode == "reconstruction" else "synthetic"
-    ledger_mode = "stage_n_reconstruction" if mode == "reconstruction" else "stage_n_notional"
+    if mode == "production":
+        obs_class = "decision_time_market"
+        ledger_mode = "stage_n_production"
+    elif mode == "reconstruction":
+        obs_class = "historical_reconstruction"
+        ledger_mode = "stage_n_reconstruction"
+    else:
+        obs_class = "synthetic"
+        ledger_mode = "stage_n_notional"
+
+    forward_credit = bool(
+        mode == "production"
+        and getattr(ev, "production_clock_capable", False) is True
+        and not (
+            isinstance(discipline_labels, dict)
+            and discipline_labels.get("forward_clock_credit_eligible") is False
+        )
+    )
+    serialized_breakers = serialize_breakers_for_ledger(rows_by_id)
 
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -694,12 +740,12 @@ def build_record_body(
             "spec_version": ev.spec_version,
             "engine_hash": ev.engine_hash,
             "effective_state_by_scope": eff_scope,
-            "breakers": [rows_by_id[bid] for bid in ALL_BREAKER_IDS],
+            "breakers": serialized_breakers,
         },
         "assertions": {
             "B0": "50000",
             "H": sizing_res["bankroll"]["H"],
-            "forward_clock_credit_eligible": False,
+            "forward_clock_credit_eligible": forward_credit,
             "kelly_applied": False,
             "loss_controls_armed": False,
             "orders_placed": 0,
@@ -749,9 +795,14 @@ def check_forward_clock_credit(
     config_path: str | Path | None = None,
     calendar_spec: dict | None = None,
     spec_dir: str | Path | None = None,
+    expected_engine_hash: str | None = None,
+    expected_spec_version: str | None = None,
+    production_chain_locked: bool = False,
 ) -> tuple[bool, list[str]]:
     """Determine whether a ledger record sequence is eligible for CLK-01..04 forward credit."""
     reasons: list[str] = []
+    if production_chain_locked:
+        reasons.append("production_chain_locked")
     if not records:
         reasons.append("empty_chain")
         return False, reasons
@@ -883,6 +934,10 @@ def check_forward_clock_credit(
                     reasons.append(f"seq_{seq}:evaluator_engine_hash_mismatch")
             if not isinstance(ev_spec, str) or not ev_spec:
                 reasons.append(f"seq_{seq}:missing_evaluator_spec_version")
+            if expected_engine_hash is not None and top_engine_hash != expected_engine_hash:
+                reasons.append(f"seq_{seq}:unexpected_engine_hash")
+            if expected_spec_version is not None and ev_spec != expected_spec_version:
+                reasons.append(f"seq_{seq}:unexpected_spec_version")
 
         identity_checks = (
             ("chain_id", body.get("chain_id")),
@@ -1166,6 +1221,8 @@ class ShadowLedger:
                 record_body["policy_config_hash"],
                 record_body["code_version_sha"],
                 record_body["calendar_spec_digest"],
+                record_body["engine_hash"],
+                record_body["evaluator"]["spec_version"],
             )
             dedup_key = (
                 record_body["mode"],
@@ -1183,6 +1240,8 @@ class ShadowLedger:
                     pb["policy_config_hash"],
                     pb["code_version_sha"],
                     pb["calendar_spec_digest"],
+                    pb["engine_hash"],
+                    pb["evaluator"]["spec_version"],
                 )
                 if prior_identity != chain_identity:
                     raise LedgerAppendError(
@@ -1459,3 +1518,113 @@ class ShadowLedger:
             if not ok_btc:
                 issues.append({"sequence": seq, "reason": str(btc_err)})
         return len(issues) == 0, issues
+
+
+def save_row_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    chain_id: str,
+    sequence: int,
+    session_date: str,
+    record_sha256: str,
+    engine_hash: str,
+    spec_version: str,
+    next_row_state: dict,
+) -> Path:
+    """Persist next_row_state atomically for restart continuity with identity pins."""
+    if not isinstance(next_row_state, dict):
+        raise EngineIdentityError("next_row_state must be a dict")
+    s_dir = Path(snapshots_dir)
+    s_dir.mkdir(parents=True, exist_ok=True)
+    state_canonical = json.dumps(
+        next_row_state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    payload = {
+        "schema_version": "c-sh-state-snapshot-v1",
+        "chain_id": chain_id,
+        "sequence": sequence,
+        "session_date": session_date,
+        "record_sha256": record_sha256,
+        "engine_hash": engine_hash,
+        "spec_version": spec_version,
+        "state_sha256": hashlib.sha256(state_canonical).hexdigest(),
+        "next_row_state": next_row_state,
+    }
+    raw_bytes = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    seq_path = s_dir / f"seq_{sequence:06d}.state.json"
+    latest_path = s_dir / "latest.state.json"
+    _atomic_write_bytes(seq_path, raw_bytes)
+    _atomic_write_bytes(latest_path, raw_bytes)
+    return seq_path
+
+
+def load_row_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    expected_chain_id: str,
+    expected_engine_hash: str,
+    expected_spec_version: str,
+    expected_sequence: int | None = None,
+    expected_record_sha256: str | None = None,
+    allow_missing_at_genesis: bool = True,
+) -> tuple[dict, dict | None]:
+    """Load and verify persisted row state before next evaluation (fail closed on drift/corruption)."""
+    s_dir = Path(snapshots_dir)
+    target = (
+        s_dir / f"seq_{expected_sequence:06d}.state.json"
+        if expected_sequence is not None
+        else s_dir / "latest.state.json"
+    )
+    if not target.is_file():
+        if allow_missing_at_genesis and expected_sequence is None and not (s_dir / "latest.state.json").exists():
+            return {}, None
+        raise EngineIdentityError(f"Missing persisted row state snapshot: {target}")
+
+    try:
+        payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt row state snapshot {target}: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-state-snapshot-v1":
+        raise EngineIdentityError(f"Invalid row state snapshot schema in {target}")
+    if payload.get("chain_id") != expected_chain_id:
+        raise EngineIdentityError(
+            f"State snapshot chain_id mismatch: expected {expected_chain_id!r}, got {payload.get('chain_id')!r}"
+        )
+    if payload.get("engine_hash") != expected_engine_hash:
+        raise EngineIdentityError(
+            f"State snapshot engine_hash mismatch: expected {expected_engine_hash!r}, got {payload.get('engine_hash')!r}"
+        )
+    if payload.get("spec_version") != expected_spec_version:
+        raise EngineIdentityError(
+            f"State snapshot spec_version mismatch: expected {expected_spec_version!r}, got {payload.get('spec_version')!r}"
+        )
+    if expected_sequence is not None and payload.get("sequence") != expected_sequence:
+        raise EngineIdentityError(
+            f"State snapshot sequence mismatch: expected {expected_sequence}, got {payload.get('sequence')!r}"
+        )
+    if expected_record_sha256 is not None and payload.get("record_sha256") != expected_record_sha256:
+        raise EngineIdentityError("State snapshot record_sha256 mismatch")
+
+    state_obj = payload.get("next_row_state")
+    if not isinstance(state_obj, dict):
+        raise EngineIdentityError("State snapshot next_row_state must be a dict")
+    recomputed_sha = hashlib.sha256(
+        json.dumps(
+            state_obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload.get("state_sha256") != recomputed_sha:
+        raise EngineIdentityError("State snapshot checksum mismatch")
+
+    return state_obj, payload

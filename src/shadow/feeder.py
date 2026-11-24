@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
-from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
+from shadow.calendar_consumer import (
+    DEFAULT_SPEC_DIR,
+    is_official_close_bar_timestamp,
+    load_spec,
+    resolve_session,
+)
 from shadow.evaluator import StubEvaluator
 from shadow.ledger import (
     GENESIS_PREV_HASH,
@@ -250,28 +255,123 @@ def _parse_finite_decimal(raw: object, field_name: str) -> Decimal:
     return dec
 
 
-def select_tiingo_row(raw_bytes: bytes, session_date: str) -> dict:
-    """Parse Tiingo daily JSON array and return the row matching session_date with CA fields."""
+_EXTENDED_SESSION_MARKERS = frozenset(
+    {
+        "extended",
+        "after_hours",
+        "after_hours_extended",
+        "overnight",
+        "extended_overnight_open",
+        "pre_market",
+        "pre_market_extended",
+        "blue_ocean_overnight",
+    }
+)
+
+
+def _official_close_time_for_calendar(calendar_session: Mapping[str, object] | None) -> dt_time:
+    if isinstance(calendar_session, Mapping):
+        close_local = calendar_session.get("close_local")
+        if isinstance(close_local, str) and ":" in close_local:
+            hh, mm = map(int, close_local.split(":"))
+            return dt_time(hh, mm)
+        if calendar_session.get("session_state") == "half_day":
+            return dt_time(13, 0)
+    return dt_time(16, 0)
+
+
+def _validate_core_rth_bar_timestamp(
+    raw_ts: object,
+    session_date: str,
+    calendar_session: Mapping[str, object] | None = None,
+) -> None:
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return
+    txt = raw_ts.strip()
+    if len(txt) == 10:
+        if txt > session_date:
+            raise ValueError("next_trade_date_contamination")
+        return
+    if "T00:00:00" in txt and (txt.endswith("Z") or "+" in txt or txt.endswith("-00:00")):
+        # Canonical Tiingo midnight-UTC daily session marker ("YYYY-MM-DDT00:00:00.000Z")
+        row_d = txt[:10]
+        if row_d > session_date:
+            raise ValueError("next_trade_date_contamination")
+        return
+    iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
+    try:
+        dt_ny = datetime.fromisoformat(iso_norm).astimezone(_NY_TZ)
+    except ValueError as exc:
+        raise ValueError("tiingo_invalid_timestamp") from exc
+    dt_d = dt_ny.date().isoformat()
+    if dt_d > session_date:
+        raise ValueError("next_trade_date_contamination")
+    if dt_d < session_date:
+        raise ValueError("session_not_in_payload")
+    close_t = _official_close_time_for_calendar(calendar_session)
+    if dt_ny.time() >= dt_time(21, 0):
+        raise ValueError("next_trade_date_contamination")
+    if dt_ny.time() < dt_time(9, 30) or dt_ny.time() > close_t:
+        raise ValueError("extended_hours_overnight_rejected")
+
+
+def select_tiingo_row(
+    raw_bytes: bytes,
+    session_date: str,
+    *,
+    calendar_session: Mapping[str, object] | None = None,
+) -> dict:
+    """Parse Tiingo daily JSON array and return Official Close row (rejecting 23/5 overnight/T+1)."""
     rows = json.loads(raw_bytes.decode("utf-8"))
     if not isinstance(rows, list):
         raise ValueError("tiingo_payload_not_list")
+    extended_err: str | None = None
     for row in rows:
-        if (
-            isinstance(row, dict)
-            and str(row.get("date", "")).startswith(session_date)
-            and row.get("close") is not None
-        ):
+        if not isinstance(row, dict):
+            continue
+        raw_date = str(row.get("date", ""))
+        if not raw_date.startswith(session_date) or row.get("close") is None:
+            continue
+        for marker_key in ("session", "market_session", "session_window", "session_time"):
+            marker_val = row.get(marker_key)
+            if isinstance(marker_val, str) and marker_val.strip().lower() in _EXTENDED_SESSION_MARKERS:
+                extended_err = "extended_hours_overnight_rejected"
+                break
+        else:
+            if row.get("extendedHours") is True or row.get("isExtendedHours") is True:
+                extended_err = "extended_hours_overnight_rejected"
+                continue
+            try:
+                _validate_core_rth_bar_timestamp(raw_date, session_date, calendar_session)
+                if "timestamp" in row and row.get("timestamp") is not None:
+                    _validate_core_rth_bar_timestamp(row.get("timestamp"), session_date, calendar_session)
+                if "publicationTimestamp" in row and row.get("publicationTimestamp") is not None:
+                    pub = str(row["publicationTimestamp"]).strip()
+                    iso_pub = pub[:-1] + "+00:00" if pub.endswith("Z") else pub
+                    pub_ny = datetime.fromisoformat(iso_pub).astimezone(_NY_TZ)
+                    if pub_ny.date().isoformat() > session_date:
+                        raise ValueError("next_trade_date_contamination")
+            except ValueError as exc:
+                extended_err = str(exc)
+                continue
             if row.get("divCash") is None or row.get("splitFactor") is None:
                 raise ValueError("tiingo_missing_corporate_action_fields")
             _parse_finite_decimal(row["close"], "tiingo_close")
             _parse_finite_decimal(row["divCash"], "tiingo_divCash")
             _parse_finite_decimal(row["splitFactor"], "tiingo_splitFactor")
             return row
+    if extended_err is not None:
+        raise ValueError(extended_err)
     raise ValueError("session_not_in_payload")
 
 
-def select_yahoo_close(raw_bytes: bytes, session_date: str) -> Decimal:
-    """Parse Yahoo chart JSON and return close Decimal matching America/New_York session_date."""
+def select_yahoo_close(
+    raw_bytes: bytes,
+    session_date: str,
+    *,
+    calendar_session: Mapping[str, object] | None = None,
+) -> Decimal:
+    """Parse Yahoo chart JSON and return core RTH Official Close Decimal matching session_date."""
     payload = json.loads(raw_bytes.decode("utf-8"))
     results = (payload.get("chart") or {}).get("result") if isinstance(payload, dict) else None
     if not isinstance(results, list) or not results or not isinstance(results[0], dict):
@@ -282,7 +382,9 @@ def select_yahoo_close(raw_bytes: bytes, session_date: str) -> Decimal:
     closes = quote.get("close") or []
     if not timestamps:
         raise ValueError("session_not_in_payload")
+    close_t = _official_close_time_for_calendar(calendar_session)
     selected: Decimal | None = None
+    extended_err: str | None = None
     for ts, close in zip(timestamps, closes):
         if ts is None or close is None:
             continue
@@ -290,13 +392,23 @@ def select_yahoo_close(raw_bytes: bytes, session_date: str) -> Decimal:
             raise ValueError("yahoo_invalid_timestamp")
         try:
             ts_int = int(ts)
-            bar_date = datetime.fromtimestamp(ts_int, tz=_NY_TZ).date().isoformat()
+            bar_dt = datetime.fromtimestamp(ts_int, tz=_NY_TZ)
+            bar_date = bar_dt.date().isoformat()
         except (ValueError, TypeError, OverflowError, OSError) as exc:
             raise ValueError("yahoo_invalid_timestamp") from exc
         if bar_date == session_date:
+            bar_time = bar_dt.time()
+            if bar_time >= dt_time(21, 0):
+                extended_err = "next_trade_date_contamination"
+                continue
+            if bar_time < dt_time(9, 30) or bar_time > close_t:
+                extended_err = "extended_hours_overnight_rejected"
+                continue
             selected = _parse_finite_decimal(close, "yahoo_close")
     if selected is not None:
         return selected
+    if extended_err is not None:
+        raise ValueError(extended_err)
     raise ValueError("session_not_in_payload")
 
 
@@ -424,7 +536,7 @@ def _record_from_verified_bytes(
     session_close_utc: str | None = None,
 ) -> dict:
     if kind == "etf_tiingo":
-        row = select_tiingo_row(verified_bytes, session_date)
+        row = select_tiingo_row(verified_bytes, session_date, calendar_session=cal)
         close_str = canonical_decimal_str(Decimal(str(row["close"])))
         div_cash = canonical_decimal_str(Decimal(str(row["divCash"])))
         split_ratio = canonical_decimal_str(Decimal(str(row["splitFactor"])))
@@ -462,7 +574,7 @@ def _record_from_verified_bytes(
         )
 
     if kind == "idx_yahoo":
-        close_dec = select_yahoo_close(verified_bytes, session_date)
+        close_dec = select_yahoo_close(verified_bytes, session_date, calendar_session=cal)
         disclosures: dict[str, object] = {}
         if inst == "SEMI" and session_date >= XSOX_SUBSTITUTION_CUTOFF:
             disclosures["xsox_for_icesemit_substitution"] = True
@@ -612,6 +724,7 @@ def verify_market_record_raw_integrity(
     rec: dict,
     *,
     session_date: str | None = None,
+    calendar_session: Mapping[str, object] | None = None,
 ) -> tuple[bool, str | None]:
     """Verify SHA-256 of archived raw bytes and byte-for-byte re-derivation of normalized_value."""
     a_dir = Path(archive_dir)
@@ -635,12 +748,14 @@ def verify_market_record_raw_integrity(
         if kind == "etf_tiingo":
             if session_date is not None and eff_sess != session_date:
                 return False, f"effective_session_mismatch:{rec.get('instrument')}:{eff_sess}!={session_date}"
-            row = select_tiingo_row(verified, eff_sess)
+            row = select_tiingo_row(verified, eff_sess, calendar_session=calendar_session)
             rederived = canonical_decimal_str(Decimal(str(row["close"])))
         elif kind == "idx_yahoo":
             if session_date is not None and eff_sess != session_date:
                 return False, f"effective_session_mismatch:{rec.get('instrument')}:{eff_sess}!={session_date}"
-            rederived = canonical_decimal_str(select_yahoo_close(verified, eff_sess))
+            rederived = canonical_decimal_str(
+                select_yahoo_close(verified, eff_sess, calendar_session=calendar_session)
+            )
         elif kind == "rate_sofr":
             if session_date is not None:
                 entry = select_nyfed_sofr_entry(verified, session_date)
@@ -804,9 +919,16 @@ def emit_market_records_from_payloads(
         except ValueError as exc:
             err_msg = str(exc)
             if (
-                err_msg not in ("session_not_in_payload", "tiingo_missing_corporate_action_fields")
+                err_msg
+                not in (
+                    "session_not_in_payload",
+                    "tiingo_missing_corporate_action_fields",
+                    "extended_hours_overnight_rejected",
+                    "next_trade_date_contamination",
+                    "yahoo_invalid_timestamp",
+                    "tiingo_invalid_timestamp",
+                )
                 and not err_msg.startswith(("invalid_numeric:", "nonfinite_numeric:"))
-                and err_msg != "yahoo_invalid_timestamp"
             ):
                 raise
             rec = _build_missing_record(
@@ -1179,3 +1301,26 @@ def run_reconstruction_window(
         "ledger": ledger,
         "market_records": mkt_by_session,
     }
+
+
+def validate_official_close_market_record(
+    rec: Mapping[str, object],
+    calendar_session: Mapping[str, object],
+) -> tuple[bool, str | None]:
+    """Enforce US 23/5 16:00 ET Official Close isolation & non-contamination for equity/index prints."""
+    inst = str(rec.get("instrument", ""))
+    disclosures = rec.get("disclosures") if isinstance(rec.get("disclosures"), Mapping) else {}
+    session_marker = str(disclosures.get("session_window") or disclosures.get("market_session") or "").lower()
+    if session_marker in _EXTENDED_SESSION_MARKERS:
+        return False, "extended_hours_overnight_rejected"
+    if inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI"):
+        trade_date = str(calendar_session.get("trade_date") or "")
+        eff = str(rec.get("effective_session") or "")
+        if trade_date and eff > trade_date:
+            return False, "next_trade_date_contamination"
+        bar_ts = disclosures.get("bar_timestamp_utc")
+        if isinstance(bar_ts, str) and bar_ts.strip():
+            ok_ts, err = is_official_close_bar_timestamp(bar_ts, calendar_session)
+            if not ok_ts:
+                return False, err
+    return True, None
