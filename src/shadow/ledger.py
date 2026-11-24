@@ -39,6 +39,7 @@ from shadow.sizing import (
 )
 
 GENESIS_PREV_HASH = "0" * 64
+NO_PENDING_REJECTED_STATE_SHA256 = GENESIS_PREV_HASH
 SCHEMA_VERSION = "c-sh-ledger-v1"
 _NY_TZ = ZoneInfo("America/New_York")
 
@@ -2221,15 +2222,25 @@ def authenticate_pending_rejected_state_snapshot(
             raise EngineIdentityError(
                 f"invalid_expected_pending_state_sha256:{expected_pending_state_sha256!r}"
             )
+    if require_external_pending_auth and expected_pending_state_sha256 is None:
+        raise EngineIdentityError(
+            "production_pending_rejected_state_unauthenticated: require expected_pending_state_sha256 (or NO_PENDING_REJECTED_STATE_SHA256)"
+        )
     s_dir = Path(snapshots_dir)
     target = s_dir / "pending_rejected_state.json"
     if not target.is_file():
-        if expected_pending_state_sha256 is not None:
+        if expected_pending_state_sha256 is not None and not hmac.compare_digest(
+            expected_pending_state_sha256,
+            NO_PENDING_REJECTED_STATE_SHA256,
+        ):
             raise EngineIdentityError("production_pending_rejected_state_missing")
         return None
-    if require_external_pending_auth and expected_pending_state_sha256 is None:
+    if expected_pending_state_sha256 is not None and hmac.compare_digest(
+        expected_pending_state_sha256,
+        NO_PENDING_REJECTED_STATE_SHA256,
+    ):
         raise EngineIdentityError(
-            "production_pending_rejected_state_unauthenticated: require expected_pending_state_sha256"
+            "production_pending_rejected_state_unexpected: pending_rejected_state.json exists but NO_PENDING_REJECTED_STATE_SHA256 was provided"
         )
     try:
         payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))

@@ -10,9 +10,11 @@
 #   (GENESIS_PREV_HASH) once, then replace or remove it after seq=0 commits.
 # - Recurring runs & retries (seq >= 1): ALWAYS set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret
 #   Manager) to the externally authorized committed head digest (for both advancing runs and
-#   same-session retries) WITHOUT keeping the zero genesis marker; optional SHADOW_BITCOIN_MERKLE_ROOTS_PATH
-#   adds corroborating OTS verification, and SHADOW_TRUSTED_PENDING_STATE_SHA256 pins any pending
-#   rejected_state snapshot emitted after an O1/O2 failure.
+#   same-session retries) WITHOUT keeping the zero genesis marker; ALSO always set
+#   SHADOW_TRUSTED_PENDING_STATE_SHA256 on every production run (0*64 NO_PENDING_REJECTED_STATE_SHA256
+#   when no unconsumed rejection exists, or the emitted pending_rejected_state_sha256 after any
+#   O1/O2/deadline/OTS rejection until a committed session retires it); optional
+#   SHADOW_BITCOIN_MERKLE_ROOTS_PATH adds corroborating OTS verification.
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:

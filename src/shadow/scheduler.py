@@ -52,6 +52,7 @@ from shadow.fuse_adapter import (
 )
 from shadow.ledger import (
     GENESIS_PREV_HASH,
+    NO_PENDING_REJECTED_STATE_SHA256,
     ShadowLedger,
     _DATE_YYYY_MM_DD_RE,
     _HEX64_RE,
@@ -1754,6 +1755,7 @@ def _build_fail_closed_result(
     receipt_status: str = "not_applicable_fail_closed",
     receipt_obtained_at_utc: str | None = None,
     receipt_reasons: list[str] | None = None,
+    pending_rejected_state_sha256: str | None = None,
 ) -> dict:
     report = {
         "session_date": session_date,
@@ -1800,6 +1802,8 @@ def _build_fail_closed_result(
             "peak_rss_bytes": _peak_rss_bytes(),
         },
     }
+    if pending_rejected_state_sha256 is not None:
+        report["pending_rejected_state_sha256"] = pending_rejected_state_sha256
     report_paths, wrote_report = _write_completeness_report(
         reports_dir,
         report,
@@ -1807,7 +1811,7 @@ def _build_fail_closed_result(
     )
     if wrote_report:
         report["created_at_utc"] = created_at_utc
-    return {
+    res_out = {
         "appended": False,
         "fail_closed": True,
         "reason": reason_key,
@@ -1817,6 +1821,9 @@ def _build_fail_closed_result(
         "existing_report_preserved": not wrote_report,
         "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
     }
+    if pending_rejected_state_sha256 is not None:
+        res_out["pending_rejected_state_sha256"] = pending_rejected_state_sha256
+    return res_out
 
 
 def run_daily_drill_cycle(
@@ -2411,6 +2418,36 @@ def _reconcile_uncommitted_staged_snapshots(
     )
 
 
+def _check_no_unconsumed_pending_rejected_reports(
+    reports_dir: Path,
+    *,
+    head_session_date: str | None,
+) -> None:
+    """Fail closed if a post-head rejected completeness report recorded a pending state now absent."""
+    if not reports_dir.is_dir():
+        return
+    for rpath in sorted(reports_dir.glob("completeness_*.json")):
+        try:
+            rep = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(rep, Mapping):
+            continue
+        rep_ledger = rep.get("ledger")
+        pend_sha = rep.get("pending_rejected_state_sha256")
+        if (
+            isinstance(rep_ledger, Mapping)
+            and rep_ledger.get("appended") is False
+            and isinstance(pend_sha, str)
+            and pend_sha
+        ):
+            rep_ds = str(rep.get("session_date") or "")
+            if head_session_date is None or rep_ds > head_session_date:
+                raise EngineIdentityError(
+                    "production_pending_rejected_state_missing: post-head rejected report records pending_rejected_state_sha256 but pending_rejected_state.json is absent"
+                )
+
+
 def _authenticate_production_history(
     *,
     ledger: ShadowLedger,
@@ -2420,6 +2457,7 @@ def _authenticate_production_history(
     expected_prior_head_sha256: str | None,
     expected_pending_state_sha256: str | None = None,
     snapshots_dir: Path | None = None,
+    reports_dir: Path | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None,
 ) -> None:
     """Fail closed if persisted production history or pending state is unauthenticated before reuse."""
@@ -2440,11 +2478,16 @@ def _authenticate_production_history(
         if not hmac.compare_digest(expected_prior_head_sha256, GENESIS_PREV_HASH):
             raise EngineIdentityError("production_trusted_head_mismatch:empty_ledger")
         if snapshots_dir is not None:
-            authenticate_pending_rejected_state_snapshot(
+            auth_pending = authenticate_pending_rejected_state_snapshot(
                 snapshots_dir,
                 expected_pending_state_sha256=expected_pending_state_sha256,
                 require_external_pending_auth=True,
             )
+            if auth_pending is None and reports_dir is not None:
+                _check_no_unconsumed_pending_rejected_reports(
+                    reports_dir,
+                    head_session_date=None,
+                )
         return
 
     if expected_prior_head_sha256 is None:
@@ -2472,11 +2515,18 @@ def _authenticate_production_history(
         raise EngineIdentityError("production_trusted_head_mismatch")
 
     if existing_env is None and snapshots_dir is not None:
-        authenticate_pending_rejected_state_snapshot(
+        auth_pending = authenticate_pending_rejected_state_snapshot(
             snapshots_dir,
             expected_pending_state_sha256=expected_pending_state_sha256,
             require_external_pending_auth=True,
         )
+        if auth_pending is None and reports_dir is not None:
+            head_body = prior_records[-1].get("record_body") if isinstance(prior_records[-1], Mapping) else None
+            head_ds = str(head_body.get("session_date")) if isinstance(head_body, Mapping) and head_body.get("session_date") else None
+            _check_no_unconsumed_pending_rejected_reports(
+                reports_dir,
+                head_session_date=head_ds,
+            )
 
     if bitcoin_merkle_roots is not None:
         ok_credit, credit_issues = ledger.assess_receipt_creditability(
@@ -2582,6 +2632,7 @@ def _run_daily_drill_cycle_locked(
         expected_prior_head_sha256=expected_prior_head_sha256,
         expected_pending_state_sha256=expected_pending_state_sha256,
         snapshots_dir=root / "state_snapshots",
+        reports_dir=reports_dir,
         bitcoin_merkle_roots=bitcoin_merkle_roots,
     )
     prior_streak = _count_consecutive_trading_sessions(
@@ -3351,9 +3402,8 @@ def _run_daily_drill_cycle_locked(
             required_series=series_summary,
             receipt_status="not_applicable_fail_closed",
             receipt_reasons=["fail_closed_no_append", f"{cfg.mode}_mode"],
+            pending_rejected_state_sha256=pending_sha,
         )
-        if pending_sha is not None:
-            fail_res["pending_rejected_state_sha256"] = pending_sha
         return fail_res
 
     # Step 4: Obtain detached OTS receipt, check real post-stamp wall-clock, commit atomically
@@ -3397,9 +3447,8 @@ def _run_daily_drill_cycle_locked(
             receipt_status="late_backfill_rejected",
             receipt_obtained_at_utc=rcp_obtained_utc,
             receipt_reasons=[fail_reason, "drill_mode"],
+            pending_rejected_state_sha256=pending_sha,
         )
-        if pending_sha is not None:
-            fail_res["pending_rejected_state_sha256"] = pending_sha
         return fail_res
 
     if ots_bytes is None and not allow_unanchored_on_ots_failure:

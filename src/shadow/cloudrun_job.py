@@ -271,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--expected-pending-state-sha256",
-        help="Expected pending_rejected_state.json SHA-256 (overrides SHADOW_TRUSTED_PENDING_STATE_SHA256)",
+        help="Expected pending_rejected_state.json SHA-256 or zero marker 0*64 when clean (overrides SHADOW_TRUSTED_PENDING_STATE_SHA256)",
     )
     parser.add_argument(
         "--bitcoin-merkle-roots-path",

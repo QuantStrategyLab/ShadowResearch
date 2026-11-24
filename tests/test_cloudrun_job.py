@@ -24,7 +24,12 @@ if _DEMO not in sys.path:
 from run_sh2_demo import _build_session_fixture_files, build_live_mock_transport  # noqa: E402
 from shadow.cloudrun_job import run_cloudrun_job  # noqa: E402
 from shadow.fuse_adapter import EngineIdentityError, PINNED_FUSE_ENGINE_HASH, ProductionChainLockedError  # noqa: E402
-from shadow.ledger import ChainConcurrencyConflictError, GENESIS_PREV_HASH, ShadowLedger  # noqa: E402
+from shadow.ledger import (
+    ChainConcurrencyConflictError,
+    GENESIS_PREV_HASH,
+    NO_PENDING_REJECTED_STATE_SHA256,
+    ShadowLedger,
+)
 from shadow.ots import OpenTimestampsClient, build_synthetic_ots_fixture  # noqa: E402
 
 
@@ -220,6 +225,7 @@ class CloudRunJobTest(unittest.TestCase):
                 environ={
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                 },
                 ots_client=_FakeOts(),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
@@ -434,6 +440,7 @@ class CloudRunJobTest(unittest.TestCase):
                 environ={
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                 },
                 ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
@@ -494,6 +501,7 @@ class CloudRunJobTest(unittest.TestCase):
                 environ={
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                 },
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
             )
@@ -512,6 +520,7 @@ class CloudRunJobTest(unittest.TestCase):
                 environ={
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                     "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
                 },
                 ots_client=_make_ots("2026-01-06", "2026-01-07T03:00:00.000Z"),
@@ -588,6 +597,7 @@ class CloudRunJobTest(unittest.TestCase):
                 environ={
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                 },
                 ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
@@ -628,6 +638,7 @@ class CloudRunJobTest(unittest.TestCase):
                 environ={
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                 },
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clk,
@@ -663,6 +674,38 @@ class CloudRunJobTest(unittest.TestCase):
             )
             self.assertEqual(proc_pend_unauth.returncode, 3)
             self.assertIn("production_pending_rejected_state_unauthenticated", proc_pend_unauth.stdout)
+
+            # Deleting pending_rejected_state.json while passing NO_PENDING_REJECTED_STATE_SHA256 fails closed exit 3
+            deleted_pend_dir = Path(tmpdir) / "deleted_pend_copy"
+            shutil.copytree(reauth_dir, deleted_pend_dir)
+            (deleted_pend_dir / "state_snapshots" / "pending_rejected_state.json").unlink()
+            proc_pend_deleted = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(deleted_pend_dir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-07",
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_pend_deleted.returncode, 3)
+            self.assertIn("production_pending_rejected_state_missing", proc_pend_deleted.stdout)
 
             ok_after_pend = run_cloudrun_job(
                 data_dir=reauth_dir,
