@@ -1348,8 +1348,9 @@ def extract_prior_close_from_tiingo_bytes(
     session_date: str,
     *,
     calendar_session: Mapping[str, object] | None = None,
+    target_prior_date: str | None = None,
 ) -> str | None:
-    """Return latest valid prior-session (< session_date) close string from multi-day Tiingo JSON."""
+    """Return valid prior-session close string from Tiingo JSON matching target_prior_date (or latest < session_date)."""
     try:
         rows = json.loads(raw_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1362,7 +1363,12 @@ def extract_prior_close_from_tiingo_bytes(
             continue
         raw_date = str(row.get("date", ""))
         row_d = raw_date[:10]
-        if len(row_d) != 10 or row_d >= session_date or row.get("close") is None:
+        if len(row_d) != 10 or row.get("close") is None:
+            continue
+        if target_prior_date is not None:
+            if row_d != target_prior_date:
+                continue
+        elif row_d >= session_date:
             continue
         if row.get("extendedHours") is True or row.get("isExtendedHours") is True:
             continue
@@ -1395,8 +1401,9 @@ def extract_prior_close_from_yahoo_bytes(
     session_date: str,
     *,
     calendar_session: Mapping[str, object] | None = None,
+    target_prior_date: str | None = None,
 ) -> str | None:
-    """Return latest valid prior-session (< session_date) close string from multi-day Yahoo JSON."""
+    """Return valid prior-session close string from Yahoo JSON matching target_prior_date (or latest < session_date)."""
     try:
         payload = json.loads(raw_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1422,7 +1429,10 @@ def extract_prior_close_from_yahoo_bytes(
             bar_date = bar_dt.date().isoformat()
         except (ValueError, TypeError, OverflowError, OSError):
             continue
-        if bar_date >= session_date:
+        if target_prior_date is not None:
+            if bar_date != target_prior_date:
+                continue
+        elif bar_date >= session_date:
             continue
         bar_t = bar_dt.time()
         if bar_t < dt_time(9, 30) or bar_t > close_t or bar_t >= dt_time(21, 0):

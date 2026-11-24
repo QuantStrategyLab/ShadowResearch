@@ -161,6 +161,8 @@ class CloudRunJobTest(unittest.TestCase):
         ym = (_REPO_ROOT / "deploy" / "cloudrun" / "job-spec.example.yaml").read_text(encoding="utf-8")
         self.assertIn("us-east1", ym)
         self.assertIn("maxRetries: 0", ym)
+        self.assertIn("gcsfuse.run.googleapis.com", ym)
+        self.assertNotIn("gcsfuse.csi.storage.gke.io", ym)
         self.assertIn("secretKeyRef", ym)
         self.assertIn("<project-id>", ym)
         self.assertNotIn("/" + "Users/", ym)

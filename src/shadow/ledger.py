@@ -216,6 +216,18 @@ def validate_record_body(body: dict) -> None:
         raise CanonicalizationError("evaluator.engine_hash must match record engine_hash")
     if body["mode"] == "production" and ev_obj["engine_hash"].startswith("stub-"):
         raise CanonicalizationError("Stub evaluator.engine_hash is structurally forbidden in production mode")
+    is_legacy_stub_or_sh1_fixture = (
+        ev_obj["engine_hash"].startswith("stub-")
+        or ev_obj["spec_version"] == "c-fuse-eval-stub-v1"
+    )
+    if "next_row_state_sha256" in ev_obj:
+        nrs_sha = ev_obj.get("next_row_state_sha256")
+        if not isinstance(nrs_sha, str) or not _HEX64_RE.fullmatch(nrs_sha):
+            raise CanonicalizationError("evaluator.next_row_state_sha256 must be 64 lowercase hex chars")
+    elif not is_legacy_stub_or_sh1_fixture:
+        raise CanonicalizationError(
+            "evaluator.next_row_state_sha256 is required for non-stub evaluator records"
+        )
     if not isinstance(body["sequence"], int) or isinstance(body["sequence"], bool) or body["sequence"] < 0:
         raise CanonicalizationError(f"Invalid sequence: {body['sequence']!r}")
     for hex_field in (
@@ -615,6 +627,23 @@ def compute_inputs_digest(
     return sha256_canonical(canonical_inputs_snapshot)
 
 
+def o1_blocks_session_commit(o1_output: Mapping[str, Any]) -> bool:
+    """Return True when O1 tripped on missing/stale/invalid input, allowing FUSE-1 B3 clearing_period."""
+    return bool(o1_output.get("would_have_tripped")) and o1_output.get("reason") != "clearing_period"
+
+
+def _sha256_canonical_state_dict(state_obj: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            state_obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def build_record_body(
     *,
     chain_id: str,
@@ -674,7 +703,7 @@ def build_record_body(
         authorized_events=auth_events,
     )
 
-    if rows_by_id["O1"]["would_have_tripped"] or rows_by_id["O2"]["would_have_tripped"]:
+    if o1_blocks_session_commit(rows_by_id["O1"]) or rows_by_id["O2"]["would_have_tripped"]:
         return {
             "appended": False,
             "fail_closed": True,
@@ -725,6 +754,17 @@ def build_record_body(
     )
     serialized_breakers = serialize_breakers_for_ledger(rows_by_id)
 
+    evaluator_block: dict[str, object] = {
+        "spec_version": ev.spec_version,
+        "engine_hash": ev.engine_hash,
+        "effective_state_by_scope": eff_scope,
+        "breakers": serialized_breakers,
+    }
+    if not is_stub_evaluator(ev):
+        evaluator_block["next_row_state_sha256"] = _sha256_canonical_state_dict(
+            next_state if isinstance(next_state, dict) else {}
+        )
+
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "chain_id": chain_id,
@@ -747,12 +787,7 @@ def build_record_body(
         "raw_vs_adjusted": sizing_res["raw_vs_adjusted"],
         "monthly_diagnostic": sizing_res["monthly_diagnostic"],
         "tiers": sizing_res["tiers"],
-        "evaluator": {
-            "spec_version": ev.spec_version,
-            "engine_hash": ev.engine_hash,
-            "effective_state_by_scope": eff_scope,
-            "breakers": serialized_breakers,
-        },
+        "evaluator": evaluator_block,
         "assertions": {
             "B0": "50000",
             "H": sizing_res["bankroll"]["H"],
@@ -824,13 +859,38 @@ def check_forward_clock_credit(
 
     if config_path is not None:
         cfg_file = Path(config_path)
-        if cfg_file.is_file():
+        if not cfg_file.is_file():
+            reasons.append("missing_production_config")
+            eff_locked = True
+            if eff_expected_engine_hash is None:
+                eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+            if eff_expected_spec_version is None:
+                eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+        else:
             try:
                 raw_cfg = parse_json_no_duplicates(cfg_file.read_text(encoding="utf-8"))
             except Exception as exc:
                 reasons.append(f"invalid_production_config:{exc}")
                 raw_cfg = None
-            if isinstance(raw_cfg, dict) and raw_cfg.get("mode") == "production":
+            if not isinstance(raw_cfg, dict) or raw_cfg.get("mode") != "production":
+                bad_mode = raw_cfg.get("mode") if isinstance(raw_cfg, dict) else "invalid"
+                reasons.append(f"non_production_config_rejected:{bad_mode}")
+                eff_locked = True
+                if eff_expected_engine_hash is None:
+                    eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+                if eff_expected_spec_version is None:
+                    eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+            elif raw_cfg.get("production_mode_forbidden") is True or (
+                "production_mode_forbidden" in raw_cfg
+                and not isinstance(raw_cfg.get("production_mode_forbidden"), bool)
+            ):
+                reasons.append("non_production_config_rejected:production_mode_forbidden")
+                eff_locked = True
+                if eff_expected_engine_hash is None:
+                    eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+                if eff_expected_spec_version is None:
+                    eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+            else:
                 if eff_locked is None:
                     eff_locked = not (
                         raw_cfg.get("production_chain_locked") is False
@@ -1010,6 +1070,14 @@ def check_forward_clock_credit(
                 reasons.append(f"seq_{seq}:unexpected_engine_hash")
             if eff_expected_spec_version is not None and ev_spec != eff_expected_spec_version:
                 reasons.append(f"seq_{seq}:unexpected_spec_version")
+            if (
+                ev_spec == PINNED_FUSE_SPEC_VERSION
+                or top_engine_hash == PINNED_FUSE_ENGINE_HASH
+                or body.get("calendar_version") == "csa22-v2"
+            ):
+                nrs_sha = ev_obj.get("next_row_state_sha256")
+                if not isinstance(nrs_sha, str) or not _HEX64_RE.fullmatch(nrs_sha):
+                    reasons.append(f"seq_{seq}:missing_or_invalid_next_row_state_sha256")
 
         identity_checks = (
             ("chain_id", body.get("chain_id")),
@@ -1738,6 +1806,7 @@ def load_row_state_snapshot(
     expected_spec_version: str,
     expected_sequence: int | None = None,
     expected_record_sha256: str | None = None,
+    expected_state_sha256: str | None = None,
     allow_missing_at_genesis: bool = True,
 ) -> tuple[dict, dict | None]:
     """Load and verify persisted row state before next evaluation (fail closed on drift/corruption)."""
@@ -1781,17 +1850,16 @@ def load_row_state_snapshot(
     state_obj = payload.get("next_row_state")
     if not isinstance(state_obj, dict):
         raise EngineIdentityError("State snapshot next_row_state must be a dict")
-    recomputed_sha = hashlib.sha256(
-        json.dumps(
-            state_obj,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    recomputed_sha = _sha256_canonical_state_dict(state_obj)
     if payload.get("state_sha256") != recomputed_sha:
         raise EngineIdentityError("State snapshot checksum mismatch")
+    if expected_state_sha256 is not None and (
+        recomputed_sha != expected_state_sha256 or payload.get("state_sha256") != expected_state_sha256
+    ):
+        raise EngineIdentityError(
+            f"State snapshot state_sha256 mismatch against committed ledger record: "
+            f"expected {expected_state_sha256}, got {recomputed_sha}"
+        )
 
     return state_obj, payload
 
@@ -1806,19 +1874,16 @@ def save_pending_rejected_state_snapshot(
     engine_hash: str,
     spec_version: str,
     next_row_state: dict,
+    base_prior_row_state: dict | None = None,
 ) -> Path:
-    """Persist next_row_state after an O1/O2-rejected session so latches carry to subsequent sessions."""
+    """Persist next_row_state (plus session-start baseline) after an O1/O2-rejected evaluation."""
     if not isinstance(next_row_state, dict):
         raise EngineIdentityError("pending rejected next_row_state must be a dict")
+    eff_base_prior = base_prior_row_state if base_prior_row_state is not None else {}
+    if not isinstance(eff_base_prior, dict):
+        raise EngineIdentityError("pending rejected base_prior_row_state must be a dict")
     s_dir = Path(snapshots_dir)
     s_dir.mkdir(parents=True, exist_ok=True)
-    state_canonical = json.dumps(
-        next_row_state,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
     payload = {
         "schema_version": "c-sh-pending-rejected-state-v1",
         "chain_id": chain_id,
@@ -1827,8 +1892,10 @@ def save_pending_rejected_state_snapshot(
         "rejected_session_date": rejected_session_date,
         "engine_hash": engine_hash,
         "spec_version": spec_version,
-        "state_sha256": hashlib.sha256(state_canonical).hexdigest(),
+        "state_sha256": _sha256_canonical_state_dict(next_row_state),
         "next_row_state": next_row_state,
+        "base_prior_state_sha256": _sha256_canonical_state_dict(eff_base_prior),
+        "base_prior_row_state": eff_base_prior,
     }
     raw_bytes = (
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
@@ -1836,6 +1903,203 @@ def save_pending_rejected_state_snapshot(
     target = s_dir / "pending_rejected_state.json"
     _atomic_write_bytes(target, raw_bytes)
     return target
+
+
+def _assert_pending_state_preserves_committed_breakers(
+    committed_state: Mapping[str, Any],
+    pending_state: Mapping[str, Any],
+    *,
+    rej_ds: str,
+    expected_engine_hash: str,
+    expected_spec_version: str,
+) -> None:
+    """Enforce fail-closed monotonic latch/severity preservation from committed ledger state to pending state."""
+    if "engine_hash" in pending_state and pending_state["engine_hash"] != expected_engine_hash:
+        raise EngineIdentityError("Pending next_row_state engine_hash mismatch")
+    if "spec_version" in pending_state and pending_state["spec_version"] != expected_spec_version:
+        raise EngineIdentityError("Pending next_row_state spec_version mismatch")
+    if "loss_breakers_armed" in pending_state and pending_state["loss_breakers_armed"] is not False:
+        raise EngineIdentityError("Pending next_row_state loss_breakers_armed violation")
+    if (
+        "enforcement_mode" in pending_state
+        and pending_state["enforcement_mode"] != "shadow_would_have_tripped"
+    ):
+        raise EngineIdentityError("Pending next_row_state enforcement_mode violation")
+
+    for row_id in ("L2", "L3", "L4", "L6", "O3", "O6", "O7", "O8", "O9"):
+        c_entry = committed_state.get(row_id)
+        if isinstance(c_entry, Mapping) and c_entry.get("latched") is True:
+            p_entry = pending_state.get(row_id)
+            if not isinstance(p_entry, Mapping) or p_entry.get("latched") is not True:
+                raise EngineIdentityError(
+                    f"Pending state downgraded or cleared committed {row_id} latch"
+                )
+            if (
+                c_entry.get("trip_session") is not None
+                and p_entry.get("trip_session") != c_entry.get("trip_session")
+            ):
+                raise EngineIdentityError(
+                    f"Pending state altered committed {row_id} trip_session"
+                )
+            if (
+                row_id == "L3"
+                and c_entry.get("cooling_off_until") is not None
+                and p_entry.get("cooling_off_until") != c_entry.get("cooling_off_until")
+            ):
+                raise EngineIdentityError("Pending state altered committed L3 cooling_off_until")
+
+    c_o5 = committed_state.get("O5")
+    if isinstance(c_o5, Mapping):
+        c_cnt = c_o5.get("rejection_count", 0)
+        p_o5 = pending_state.get("O5")
+        if c_o5.get("latched") is True:
+            if not isinstance(p_o5, Mapping) or p_o5.get("latched") is not True:
+                raise EngineIdentityError("Pending state cleared committed O5 latch")
+        if isinstance(c_cnt, int) and not isinstance(c_cnt, bool) and c_cnt > 0:
+            p_cnt = p_o5.get("rejection_count", 0) if isinstance(p_o5, Mapping) else -1
+            if isinstance(p_cnt, bool) or not isinstance(p_cnt, int) or p_cnt < c_cnt:
+                raise EngineIdentityError("Pending state reduced committed O5 rejection_count")
+
+    c_l5 = committed_state.get("L5")
+    if isinstance(c_l5, Mapping):
+        c_l5_fresh = c_l5.get("fresh_session_count", 0)
+        c_l5_fresh_int = (
+            c_l5_fresh
+            if isinstance(c_l5_fresh, int) and not isinstance(c_l5_fresh, bool)
+            else 0
+        )
+        p_l5 = pending_state.get("L5")
+        if (c_l5.get("active") is True or c_l5.get("latched") is True) and (
+            c_l5.get("trip_session") == rej_ds
+            or (c_l5.get("trip_session") is None and c_l5_fresh_int < 1)
+        ):
+            if not isinstance(p_l5, Mapping) or not (p_l5.get("active") or p_l5.get("latched")):
+                raise EngineIdentityError("Pending state cleared active L5 session interlock")
+        if isinstance(p_l5, Mapping):
+            p_l5_fresh = p_l5.get("fresh_session_count", 0)
+            if isinstance(p_l5_fresh, bool) or not isinstance(p_l5_fresh, int) or p_l5_fresh < 0:
+                raise EngineIdentityError("Pending state invalid L5 fresh_session_count")
+            if (c_l5.get("active") is True or c_l5.get("latched") is True) and p_l5_fresh > c_l5_fresh_int + 1:
+                raise EngineIdentityError("Pending state forged L5 fresh_session_count advancement")
+
+    c_o1 = committed_state.get("O1")
+    c_o1_fresh = (
+        c_o1.get("fresh_session_count", 0)
+        if isinstance(c_o1, Mapping)
+        and isinstance(c_o1.get("fresh_session_count", 0), int)
+        and not isinstance(c_o1.get("fresh_session_count", 0), bool)
+        else 0
+    )
+    p_o1 = pending_state.get("O1")
+    if isinstance(p_o1, Mapping):
+        p_o1_fresh = p_o1.get("fresh_session_count", 0)
+        if isinstance(p_o1_fresh, bool) or not isinstance(p_o1_fresh, int) or p_o1_fresh < 0:
+            raise EngineIdentityError("Pending state invalid O1 fresh_session_count")
+        if isinstance(c_o1, Mapping) and c_o1.get("last_tripped_session") == rej_ds:
+            if p_o1.get("last_tripped_session") != rej_ds or p_o1_fresh != 0:
+                raise EngineIdentityError("Pending state cleared same-session O1 trip")
+        if p_o1_fresh > c_o1_fresh + 1:
+            raise EngineIdentityError("Pending state forged O1 fresh_session_count advancement")
+
+    for row_id in ("V1", "V3"):
+        c_map = committed_state.get(row_id)
+        if isinstance(c_map, Mapping):
+            p_map = pending_state.get(row_id)
+            for fund, cf in c_map.items():
+                if isinstance(cf, Mapping) and cf.get("latched") is True:
+                    pf = p_map.get(fund) if isinstance(p_map, Mapping) else None
+                    if not isinstance(pf, Mapping) or pf.get("latched") is not True:
+                        raise EngineIdentityError(
+                            f"Pending state cleared committed {row_id}.{fund} latch"
+                        )
+                    if (
+                        cf.get("trip_session") is not None
+                        and pf.get("trip_session") != cf.get("trip_session")
+                    ):
+                        raise EngineIdentityError(
+                            f"Pending state altered committed {row_id}.{fund} trip_session"
+                        )
+
+    c_v2 = committed_state.get("V2")
+    if isinstance(c_v2, Mapping):
+        p_v2 = pending_state.get("V2")
+        for subkey in ("latched_mismatches", "pending_adjustments"):
+            c_sub = c_v2.get(subkey)
+            if isinstance(c_sub, Mapping):
+                p_sub = p_v2.get(subkey) if isinstance(p_v2, Mapping) else None
+                for fund, val in c_sub.items():
+                    if val and (not isinstance(p_sub, Mapping) or not p_sub.get(fund)):
+                        raise EngineIdentityError(
+                            f"Pending state cleared committed V2.{subkey}.{fund}"
+                        )
+
+    c_v4 = committed_state.get("V4")
+    if isinstance(c_v4, Mapping):
+        p_v4 = pending_state.get("V4")
+        for fund, cf in c_v4.items():
+            if isinstance(cf, Mapping) and cf.get("clearing_counter") is not None:
+                c_cnt = cf["clearing_counter"]
+                c_last = cf.get("last_session_below_threshold")
+                pf = p_v4.get(fund) if isinstance(p_v4, Mapping) else None
+                p_cnt = pf.get("clearing_counter") if isinstance(pf, Mapping) else None
+                if isinstance(p_cnt, bool) or not isinstance(p_cnt, int):
+                    raise EngineIdentityError(
+                        f"Pending state cleared active V4.{fund} clearing state"
+                    )
+                if not isinstance(c_cnt, int) or isinstance(c_cnt, bool):
+                    raise EngineIdentityError(f"Invalid committed V4.{fund} clearing_counter")
+                can_step = c_last is None or rej_ds > str(c_last)
+                max_allowed = c_cnt + (1 if can_step else 0)
+                if p_cnt < 0 or p_cnt >= 10 or p_cnt > max_allowed:
+                    raise EngineIdentityError(
+                        f"Pending state forged V4.{fund} clearing_counter jump ({c_cnt} -> {p_cnt})"
+                    )
+                if p_cnt > c_cnt and pf.get("last_session_below_threshold") != rej_ds:
+                    raise EngineIdentityError(
+                        f"Pending state V4.{fund} clearing_counter incremented without matching session"
+                    )
+
+    c_v5 = committed_state.get("V5")
+    if isinstance(c_v5, Mapping):
+        p_v5 = pending_state.get("V5")
+        for fund, cf in c_v5.items():
+            if not isinstance(cf, Mapping):
+                continue
+            c_esc = bool(cf.get("escalated"))
+            c_cnt = cf.get("consecutive_beyond_tolerance", 0)
+            c_cnt_int = c_cnt if isinstance(c_cnt, int) and not isinstance(c_cnt, bool) else 0
+            c_last = cf.get("last_session")
+            pf = p_v5.get(fund) if isinstance(p_v5, Mapping) else None
+            if c_esc or c_cnt_int >= 40:
+                p_cnt_val = pf.get("consecutive_beyond_tolerance", 0) if isinstance(pf, Mapping) else -1
+                if (
+                    not isinstance(pf, Mapping)
+                    or pf.get("escalated") is not True
+                    or isinstance(p_cnt_val, bool)
+                    or not isinstance(p_cnt_val, int)
+                    or p_cnt_val < c_cnt_int
+                ):
+                    raise EngineIdentityError(f"Pending state downgraded escalated V5.{fund}")
+            if isinstance(pf, Mapping):
+                p_cnt = pf.get("consecutive_beyond_tolerance", 0)
+                can_step = c_last is None or rej_ds > str(c_last)
+                max_allowed = c_cnt_int + (1 if can_step else 0)
+                if (
+                    isinstance(p_cnt, bool)
+                    or not isinstance(p_cnt, int)
+                    or p_cnt < 0
+                    or p_cnt > max_allowed
+                ):
+                    raise EngineIdentityError(f"Pending state forged V5.{fund} counter")
+
+    c_o4 = committed_state.get("O4")
+    if isinstance(c_o4, Mapping):
+        p_o4 = pending_state.get("O4")
+        for sym, cs in c_o4.items():
+            if isinstance(cs, Mapping) and "original_order_id" in cs:
+                ps = p_o4.get(sym) if isinstance(p_o4, Mapping) else None
+                if not isinstance(ps, Mapping) or ps.get("original_order_id") != cs["original_order_id"]:
+                    raise EngineIdentityError(f"Pending state altered committed O4.{sym}")
 
 
 def load_pending_rejected_state_snapshot(
@@ -1847,6 +2111,8 @@ def load_pending_rejected_state_snapshot(
     current_session_date: str,
     expected_engine_hash: str,
     expected_spec_version: str,
+    expected_base_prior_state_sha256: str | None = None,
+    committed_base_prior_row_state: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict] | None:
     """Load and verify pending O1/O2 rejected-day row state if present (fail closed on tamper/drift)."""
     s_dir = Path(snapshots_dir)
@@ -1875,24 +2141,63 @@ def load_pending_rejected_state_snapshot(
     if payload.get("spec_version") != expected_spec_version:
         raise EngineIdentityError("Pending state spec_version mismatch")
     rej_ds = payload.get("rejected_session_date")
-    if not isinstance(rej_ds, str) or rej_ds >= current_session_date:
+    if (
+        not isinstance(rej_ds, str)
+        or not _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds)
+        or rej_ds > current_session_date
+    ):
         raise EngineIdentityError(
-            f"Pending state rejected_session_date invalid or not before {current_session_date}: {rej_ds!r}"
+            f"Pending state rejected_session_date invalid or after {current_session_date}: {rej_ds!r}"
         )
+    try:
+        date.fromisoformat(rej_ds)
+    except ValueError as exc:
+        raise EngineIdentityError(f"Pending state rejected_session_date invalid: {rej_ds!r}") from exc
 
     state_obj = payload.get("next_row_state")
     if not isinstance(state_obj, dict):
         raise EngineIdentityError("Pending state next_row_state must be a dict")
-    recomputed_sha = hashlib.sha256(
-        json.dumps(
-            state_obj,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    if payload.get("state_sha256") != recomputed_sha:
+    if payload.get("state_sha256") != _sha256_canonical_state_dict(state_obj):
         raise EngineIdentityError("Pending state checksum mismatch")
+
+    base_obj: dict | None = None
+    if "base_prior_row_state" in payload:
+        raw_base = payload.get("base_prior_row_state")
+        if not isinstance(raw_base, dict):
+            raise EngineIdentityError("Pending state base_prior_row_state must be a dict")
+        base_sha = _sha256_canonical_state_dict(raw_base)
+        if (
+            "base_prior_state_sha256" in payload
+            and payload.get("base_prior_state_sha256") != base_sha
+        ):
+            raise EngineIdentityError("Pending state base_prior_state checksum mismatch")
+        if expected_base_prior_state_sha256 is not None and base_sha != expected_base_prior_state_sha256:
+            raise EngineIdentityError(
+                "Pending state base_prior_row_state does not match committed ledger state digest"
+            )
+        base_obj = raw_base
+    elif expected_base_prior_state_sha256 is not None:
+        raise EngineIdentityError("Pending state missing ledger-bound base_prior_row_state")
+
+    eff_committed: Mapping[str, Any] | None = committed_base_prior_row_state
+    if eff_committed is not None:
+        if (
+            expected_base_prior_state_sha256 is not None
+            and _sha256_canonical_state_dict(eff_committed) != expected_base_prior_state_sha256
+        ):
+            raise EngineIdentityError(
+                "Committed base row state digest mismatch while verifying pending rejected state"
+            )
+    elif expected_base_prior_state_sha256 is not None and base_obj is not None:
+        eff_committed = base_obj
+
+    if eff_committed is not None:
+        _assert_pending_state_preserves_committed_breakers(
+            eff_committed,
+            state_obj,
+            rej_ds=rej_ds,
+            expected_engine_hash=expected_engine_hash,
+            expected_spec_version=expected_spec_version,
+        )
 
     return state_obj, payload

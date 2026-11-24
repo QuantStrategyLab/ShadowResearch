@@ -10,7 +10,7 @@
 - **Image:** [`Dockerfile`](../Dockerfile) (`python:3.13-slim-bookworm`, unprivileged user `shadow`, zero baked credentials).
 - **Vendored Engine Pin:** Copies `vendor/fuse_engine/fuse-eval-spec-v1/12e9b502367a4993d0c36e75ac5c8d24acaee2d1247c5b594796d5adda04ca45/` with `0444` file permissions and zero pre-generated `__pycache__` mutation.
 - **Credentials:** `TIINGO_API_KEY` is bound via GCP Secret Manager reference in [`deploy/cloudrun/job-spec.example.yaml`](../deploy/cloudrun/job-spec.example.yaml), never stored in container images or logs.
-- **Persistent State:** Persistent volume (`ledger/`, `archive/`, `replay/`, `reports/`, `state_snapshots/`) mounted at `SHADOW_DATA_DIR` (`/var/lib/shadow/data`).
+- **Persistent State:** Persistent volume (`ledger/`, `archive/`, `replay/`, `reports/`, `state_snapshots/`) mounted at `SHADOW_DATA_DIR` (`/var/lib/shadow/data`) via the Cloud Run Managed Cloud Storage FUSE CSI driver (`gcsfuse.run.googleapis.com`).
 
 ## 2. Standing Safety Locks & OA-SH2-2 Gate
 

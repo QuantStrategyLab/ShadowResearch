@@ -113,10 +113,11 @@ def _build_two_day_payloads(
     tqqq_split: float = 1.0,
     xndx_ret_override: float | None = None,
 ) -> dict[str, bytes]:
+    from shadow.calendar_consumer import resolve_previous_trading_date
     from shadow.feeder import expected_prior_sofr_business_day
 
     spec = load_spec(REPO_ROOT / "specs" / "csa22-v2")
-    prev_ds = _prior_weekday_str(session_date)
+    prev_ds = resolve_previous_trading_date(spec, "XNYS", session_date) or _prior_weekday_str(session_date)
     sofr_eff = expected_prior_sofr_business_day(session_date, calendar_spec=spec)
     out: dict[str, bytes] = {}
     for sym, prev_px, cur_px in (("TQQQ", 49.0, 50.0), ("SOXL", 39.5, 40.0), ("QQQ", 492.0, 495.0)):

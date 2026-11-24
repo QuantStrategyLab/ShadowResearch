@@ -17,7 +17,11 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from shadow.calendar_consumer import load_spec, resolve_session
+from shadow.calendar_consumer import (
+    load_spec,
+    resolve_previous_trading_date,
+    resolve_session,
+)
 from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, StubProductionForbiddenError
 from shadow.feeder import (
     SOXL_PROXY_LABEL,
@@ -35,6 +39,7 @@ from shadow.feeder_live import (
     emit_live_market_records,
 )
 from shadow.fuse_adapter import (
+    EngineIdentityError,
     PINNED_CSA22_V2_DIGEST,
     PINNED_FUSE_ENGINE_HASH,
     PINNED_FUSE_SPEC_VERSION,
@@ -47,8 +52,10 @@ from shadow.fuse_adapter import (
 from shadow.ledger import (
     GENESIS_PREV_HASH,
     ShadowLedger,
-    _atomic_write_bytes,
     _DATE_YYYY_MM_DD_RE,
+    _HEX64_RE,
+    _atomic_write_bytes,
+    _sha256_canonical_state_dict,
     build_record_body,
     canonical_json_bytes,
     compute_code_manifest_hash,
@@ -59,6 +66,7 @@ from shadow.ledger import (
     is_utc_ms_timestamp,
     load_pending_rejected_state_snapshot,
     load_row_state_snapshot,
+    o1_blocks_session_commit,
     parse_json_no_duplicates,
     save_pending_rejected_state_snapshot,
     save_row_state_snapshot,
@@ -2047,17 +2055,28 @@ def _extract_prior_session_closes(
     session_date: str,
     bundle_obj: dict | None,
     cal: Mapping[str, object],
+    spec: dict | None = None,
+    venue: str = "XNYS",
 ) -> dict[str, str]:
-    """Derive prior trading day close prices from prior committed bundle session or multi-day archives."""
+    """Derive immediately preceding trading day closes from committed bundle or multi-day archives."""
+    _ = cal
+    loaded_spec = spec if spec is not None else load_spec()
+    prev_trading_date = resolve_previous_trading_date(loaded_spec, venue, session_date)
+    if prev_trading_date is None:
+        return {}
+
     closes: dict[str, str] = {}
     if isinstance(bundle_obj, dict):
         sessions = bundle_obj.get("sessions")
         if isinstance(sessions, list) and sessions:
-            prior_sess = None
-            for cand in reversed(sessions):
-                if isinstance(cand, dict) and str(cand.get("session_date", "")) < session_date:
-                    prior_sess = cand
-                    break
+            prior_sess = next(
+                (
+                    cand
+                    for cand in reversed(sessions)
+                    if isinstance(cand, dict) and str(cand.get("session_date", "")) == prev_trading_date
+                ),
+                None,
+            )
             if prior_sess is not None and isinstance(prior_sess.get("market_records"), list):
                 for rec in prior_sess["market_records"]:
                     if (
@@ -2067,6 +2086,7 @@ def _extract_prior_session_closes(
                     ):
                         closes[str(rec["instrument"])] = str(rec["normalized_value"])
 
+    cal_prior = resolve_session(venue, prev_trading_date, spec=loaded_spec)
     for rec in mkt_recs:
         inst = str(rec.get("instrument", ""))
         if inst not in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI") or inst in closes:
@@ -2082,15 +2102,32 @@ def _extract_prior_session_closes(
         provider = str(rec.get("provider", ""))
         if inst in ("TQQQ", "SOXL", "QQQ") or "tiingo" in provider:
             val = extract_prior_close_from_tiingo_bytes(
-                raw_bytes, session_date, calendar_session=cal
+                raw_bytes,
+                session_date,
+                calendar_session=cal_prior,
+                target_prior_date=prev_trading_date,
             )
         else:
             val = extract_prior_close_from_yahoo_bytes(
-                raw_bytes, session_date, calendar_session=cal
+                raw_bytes,
+                session_date,
+                calendar_session=cal_prior,
+                target_prior_date=prev_trading_date,
             )
         if val is not None:
             closes[inst] = val
     return closes
+
+
+def _committed_expected_next_state_sha256(record_env: Mapping[str, object]) -> str:
+    body = record_env.get("record_body")
+    ev_obj = body.get("evaluator") if isinstance(body, Mapping) else None
+    nrs_sha = ev_obj.get("next_row_state_sha256") if isinstance(ev_obj, Mapping) else None
+    if not isinstance(nrs_sha, str) or not _HEX64_RE.fullmatch(nrs_sha):
+        raise EngineIdentityError(
+            "Committed non-stub ledger record missing valid evaluator.next_row_state_sha256"
+        )
+    return nrs_sha
 
 
 def _reconcile_committed_state_snapshot_if_missing(
@@ -2111,6 +2148,7 @@ def _reconcile_committed_state_snapshot_if_missing(
     ex_spec = (ex_body.get("evaluator") or {}).get("spec_version")
     if ex_hash != PINNED_FUSE_ENGINE_HASH or ex_spec != PINNED_FUSE_SPEC_VERSION:
         return
+    ex_expected_state_sha = _committed_expected_next_state_sha256(existing_env)
     try:
         seq_state, _ = load_row_state_snapshot(
             snapshots_dir,
@@ -2119,27 +2157,32 @@ def _reconcile_committed_state_snapshot_if_missing(
             expected_spec_version=PINNED_FUSE_SPEC_VERSION,
             expected_sequence=ex_seq,
             expected_record_sha256=existing_env["record_sha256"],
+            expected_state_sha256=ex_expected_state_sha,
             allow_missing_at_genesis=False,
         )
         if ex_seq == len(prior_records) - 1:
-            load_row_state_snapshot(
-                snapshots_dir,
-                expected_chain_id=cfg.chain_id,
-                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
-                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
-                expected_sequence=ex_seq,
-                expected_record_sha256=existing_env["record_sha256"],
-                allow_missing_at_genesis=False,
-            )
             latest_path = snapshots_dir / "latest.state.json"
             if latest_path.is_file():
-                latest_obj = parse_json_no_duplicates(latest_path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(latest_obj, dict)
-                    and latest_obj.get("sequence") == ex_seq
-                    and latest_obj.get("record_sha256") == existing_env["record_sha256"]
-                ):
-                    return
+                try:
+                    latest_obj = parse_json_no_duplicates(latest_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(latest_obj, dict)
+                        and latest_obj.get("sequence") == ex_seq
+                        and latest_obj.get("record_sha256") == existing_env["record_sha256"]
+                    ):
+                        load_row_state_snapshot(
+                            snapshots_dir,
+                            expected_chain_id=cfg.chain_id,
+                            expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                            expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                            expected_sequence=None,
+                            expected_record_sha256=existing_env["record_sha256"],
+                            expected_state_sha256=ex_expected_state_sha,
+                            allow_missing_at_genesis=False,
+                        )
+                        return
+                except Exception:
+                    pass
             save_row_state_snapshot(
                 snapshots_dir,
                 chain_id=cfg.chain_id,
@@ -2161,21 +2204,28 @@ def _reconcile_committed_state_snapshot_if_missing(
         raise ValueError(f"missing_bundle_session_for_snapshot_recovery:seq={ex_seq}")
     sess_entry = sessions[ex_seq]
     fctx = sess_entry.get("fuse_context") if isinstance(sess_entry.get("fuse_context"), Mapping) else {}
-    if isinstance(fctx, Mapping) and fctx.get("prior_row_state_used") is not None:
-        prior_state = copy.deepcopy(fctx["prior_row_state_used"])
-    elif ex_seq == 0:
-        prior_state = {}
+    if ex_seq == 0:
+        if isinstance(fctx, Mapping) and fctx.get("prior_row_state_used") is not None:
+            prior_state = copy.deepcopy(fctx["prior_row_state_used"])
+        else:
+            prior_state = {}
     else:
         prev_env = prior_records[ex_seq - 1]
-        prior_state, _ = load_row_state_snapshot(
+        prev_expected_sha = _committed_expected_next_state_sha256(prev_env)
+        committed_prev_state, _ = load_row_state_snapshot(
             snapshots_dir,
             expected_chain_id=cfg.chain_id,
             expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
             expected_spec_version=PINNED_FUSE_SPEC_VERSION,
             expected_sequence=ex_seq - 1,
             expected_record_sha256=prev_env["record_sha256"],
+            expected_state_sha256=prev_expected_sha,
             allow_missing_at_genesis=False,
         )
+        if isinstance(fctx, Mapping) and fctx.get("prior_row_state_used") is not None:
+            prior_state = copy.deepcopy(fctx["prior_row_state_used"])
+        else:
+            prior_state = committed_prev_state
 
     rec_inputs = dict(sess_entry["inputs"])
     rec_inputs["market_records"] = sess_entry["market_records"]
@@ -2852,7 +2902,33 @@ def _run_daily_drill_cycle_locked(
     snapshots_dir = root / "state_snapshots"
     prior_state: dict = {}
     prior_row_state_used: dict | None = None
+    session_base_prior_state: dict = {}
     if not is_stub_evaluator(ev):
+        committed_base_state: dict = {}
+        expected_base_prior_sha = _sha256_canonical_state_dict({})
+        if head_env is not None:
+            expected_base_prior_sha = _committed_expected_next_state_sha256(head_env)
+            committed_base_state, _ = load_row_state_snapshot(
+                snapshots_dir,
+                expected_chain_id=cfg.chain_id,
+                expected_engine_hash=ev.engine_hash,
+                expected_spec_version=ev.spec_version,
+                expected_sequence=seq - 1,
+                expected_record_sha256=head_hash,
+                expected_state_sha256=expected_base_prior_sha,
+                allow_missing_at_genesis=False,
+            )
+            if (snapshots_dir / "latest.state.json").is_file():
+                load_row_state_snapshot(
+                    snapshots_dir,
+                    expected_chain_id=cfg.chain_id,
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_sequence=None,
+                    expected_record_sha256=head_hash,
+                    expected_state_sha256=expected_base_prior_sha,
+                    allow_missing_at_genesis=False,
+                )
         pending_rej = load_pending_rejected_state_snapshot(
             snapshots_dir,
             expected_chain_id=cfg.chain_id,
@@ -2861,20 +2937,22 @@ def _run_daily_drill_cycle_locked(
             current_session_date=session_date,
             expected_engine_hash=ev.engine_hash,
             expected_spec_version=ev.spec_version,
+            expected_base_prior_state_sha256=expected_base_prior_sha,
+            committed_base_prior_row_state=committed_base_state,
         )
         if pending_rej is not None:
             prior_state = pending_rej[0]
             prior_row_state_used = copy.deepcopy(prior_state)
+            pending_meta = pending_rej[1]
+            if pending_meta.get("rejected_session_date") == session_date and isinstance(
+                pending_meta.get("base_prior_row_state"), dict
+            ):
+                session_base_prior_state = copy.deepcopy(pending_meta["base_prior_row_state"])
+            else:
+                session_base_prior_state = copy.deepcopy(prior_state)
         elif head_env is not None:
-            prior_state, _ = load_row_state_snapshot(
-                snapshots_dir,
-                expected_chain_id=cfg.chain_id,
-                expected_engine_hash=ev.engine_hash,
-                expected_spec_version=ev.spec_version,
-                expected_sequence=seq - 1,
-                expected_record_sha256=head_hash,
-                allow_missing_at_genesis=False,
-            )
+            prior_state = committed_base_state
+            session_base_prior_state = copy.deepcopy(prior_state)
     elif head_env is not None:
         breakers = head_env["record_body"]["evaluator"]["breakers"]
         prior_state = {
@@ -2893,6 +2971,8 @@ def _run_daily_drill_cycle_locked(
             session_date=session_date,
             bundle_obj=bundle_obj_validated,
             cal=cal,
+            spec=spec,
+            venue=cfg.venue,
         )
         if prior_closes:
             eval_inputs["prior_closes"] = prior_closes
@@ -2947,7 +3027,7 @@ def _run_daily_drill_cycle_locked(
             prior_row_state=prior_state,
             authorized_events=None,
         )
-        if rows_by_id["O1"]["would_have_tripped"] or rows_by_id["O2"]["would_have_tripped"]:
+        if o1_blocks_session_commit(rows_by_id["O1"]) or rows_by_id["O2"]["would_have_tripped"]:
             built = {
                 "appended": False,
                 "fail_closed": True,
@@ -3012,6 +3092,7 @@ def _run_daily_drill_cycle_locked(
                 engine_hash=ev.engine_hash,
                 spec_version=ev.spec_version,
                 next_row_state=built["next_row_state"],
+                base_prior_row_state=session_base_prior_state,
             )
         fail_reason = built["o1_output"].get("reason") or built.get("o2_output", {}).get("reason")
         return _build_fail_closed_result(

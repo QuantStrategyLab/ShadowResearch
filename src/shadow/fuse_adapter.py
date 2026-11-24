@@ -838,7 +838,21 @@ def build_fuse_validated_inputs(
                 r_val = _compute_return_ratio(cur_closes.get(inst_key), prior_closes.get(inst_key))
                 if r_val is not None:
                     derived_idx[ret_label] = r_val
-        idx_returns = derived_idx if len(derived_idx) >= 2 else None
+        has_all_fund_rets = all(
+            fuse_funds[sym].get("fund_return") is not None
+            and fuse_funds[sym].get("index_return") is not None
+            for sym in fuse_funds
+        )
+        idx_returns = (
+            derived_idx
+            if (
+                "NDX" in derived_idx
+                and "SEMI" in derived_idx
+                and len(derived_idx) >= 2
+                and has_all_fund_rets
+            )
+            else None
+        )
     else:
         idx_returns = None
 

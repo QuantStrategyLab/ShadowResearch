@@ -31,10 +31,13 @@ from shadow.calendar_consumer import (  # noqa: E402
     classify_us_equity_session_window,
     is_official_close_bar_timestamp,
     load_spec,
+    resolve_previous_trading_date,
     resolve_prior_close_session,
     resolve_session,
 )
 from shadow.feeder import (  # noqa: E402
+    extract_prior_close_from_tiingo_bytes,
+    extract_prior_close_from_yahoo_bytes,
     select_tiingo_row,
     select_yahoo_close,
     validate_official_close_market_record,
@@ -48,12 +51,19 @@ from shadow.fuse_adapter import (  # noqa: E402
     VendoredFuseEvaluator,
 )
 from shadow.ledger import (  # noqa: E402
+    CanonicalizationError,
     GENESIS_PREV_HASH,
     ShadowLedger,
+    _sha256_canonical_state_dict,
+    build_record_body,
     check_forward_clock_credit,
+    compute_code_manifest_hash,
     load_pending_rejected_state_snapshot,
     load_row_state_snapshot,
+    save_pending_rejected_state_snapshot,
     save_row_state_snapshot,
+    sha256_canonical,
+    validate_record_body,
 )
 from shadow.ots import OpenTimestampsClient, build_synthetic_ots_fixture  # noqa: E402
 from shadow.replay import replay_window  # noqa: E402
@@ -595,6 +605,518 @@ class Sh2PipelineTest(unittest.TestCase):
             )
             self.assertTrue(r_day1["appended"])
             self.assertEqual(r_day1["sequence"], 1)
+
+    def test_immediate_preceding_trading_session_prior_close_and_skip_protection(self) -> None:
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        self.assertEqual(resolve_previous_trading_date(spec_v2, "XNYS", "2026-01-05"), "2026-01-02")
+        self.assertEqual(resolve_previous_trading_date(spec_v2, "XNYS", "2026-07-06"), "2026-07-02")
+
+        # Prior half-day (2026-11-27 13:00 ET close) validates against 2026-11-27 close cutoff, never falling back to 2026-11-25
+        cal_hd = resolve_session("XNYS", "2026-11-27", spec=spec_v2)
+        ts_25 = int(datetime(2026, 11, 25, 16, 0, tzinfo=_NY_TZ).timestamp())
+        ts_27_1300 = int(datetime(2026, 11, 27, 13, 0, tzinfo=_NY_TZ).timestamp())
+        ts_27_1400 = int(datetime(2026, 11, 27, 14, 0, tzinfo=_NY_TZ).timestamp())
+        y_good_hd = json.dumps(
+            {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {"dataGranularity": "1d"},
+                            "timestamp": [ts_25, ts_27_1300],
+                            "indicators": {"quote": [{"close": [28000.0, 29000.0]}]},
+                        }
+                    ]
+                }
+            }
+        ).encode()
+        self.assertEqual(
+            extract_prior_close_from_yahoo_bytes(
+                y_good_hd, "2026-11-30", calendar_session=cal_hd, target_prior_date="2026-11-27"
+            ),
+            "29000",
+        )
+        y_bad_hd = json.dumps(
+            {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {"dataGranularity": "1d"},
+                            "timestamp": [ts_25, ts_27_1400],
+                            "indicators": {"quote": [{"close": [28000.0, 29000.0]}]},
+                        }
+                    ]
+                }
+            }
+        ).encode()
+        self.assertIsNone(
+            extract_prior_close_from_yahoo_bytes(
+                y_bad_hd, "2026-11-30", calendar_session=cal_hd, target_prior_date="2026-11-27"
+            )
+        )
+
+        # Codex P1 scenario: Jan 5 committed (29500), Jan 6 skipped/rejected, Jan 7 (29500) with Jan 6=33000 in payload -> -10.6% -> L6 HALT
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fdir_5 = Path(tmpdir) / "fix_05"
+            _build_session_fixture_files(fdir_5, "2026-01-05")
+
+            # Jan 7 fixtures containing Jan 6 (33000) -> Jan 7 (29500) = -10.606% on XNDX
+            fdir_7_with_6 = Path(tmpdir) / "fix_07_with_06"
+            _build_session_fixture_files(fdir_7_with_6, "2026-01-07")
+            y7 = json.loads((fdir_7_with_6 / "yahoo_xndx_2026-01-07.json").read_text(encoding="utf-8"))
+            y7["chart"]["result"][0]["indicators"]["quote"][0]["close"] = [33000.0, 29500.0]
+            (fdir_7_with_6 / "yahoo_xndx_2026-01-07.json").write_text(json.dumps(y7), encoding="utf-8")
+
+            root_a = Path(tmpdir) / "skip_trip_l6"
+            r5 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root_a,
+                config=drill_cfg,
+                fixtures_dir=fdir_5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r5["appended"])
+
+            r7_crash = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root_a,
+                config=drill_cfg,
+                fixtures_dir=fdir_7_with_6,
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r7_crash["appended"])
+            recs_a = ShadowLedger(root_a / "ledger").load_records()
+            b7 = {b["id"]: b for b in recs_a[-1]["record_body"]["evaluator"]["breakers"]}
+            self.assertEqual(b7["L6"]["state"], "HALT")
+            self.assertTrue(b7["L6"]["would_have_tripped"])
+
+            # If Jan 6 is absent from BOTH bundle AND archive payload (only Jan 5 present), must NEVER reuse Jan 5 -> O1 fails closed!
+            fdir_7_stale = Path(tmpdir) / "fix_07_only_05"
+            _build_session_fixture_files(fdir_7_stale, "2026-01-07")
+            ts_05 = int(datetime(2026, 1, 5, 16, 0, tzinfo=_NY_TZ).timestamp())
+            ts_07 = int(datetime(2026, 1, 7, 16, 0, tzinfo=_NY_TZ).timestamp())
+            y7_only_05 = json.loads((fdir_7_stale / "yahoo_xndx_2026-01-07.json").read_text(encoding="utf-8"))
+            y7_only_05["chart"]["result"][0]["timestamp"] = [ts_05, ts_07]
+            y7_only_05["chart"]["result"][0]["indicators"]["quote"][0]["close"] = [29500.0, 29500.0]
+            (fdir_7_stale / "yahoo_xndx_2026-01-07.json").write_text(json.dumps(y7_only_05), encoding="utf-8")
+
+            root_b = Path(tmpdir) / "skip_fail_closed"
+            run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root_b,
+                config=drill_cfg,
+                fixtures_dir=fdir_5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            r7_fail = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root_b,
+                config=drill_cfg,
+                fixtures_dir=fdir_7_stale,
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r7_fail["appended"])
+            self.assertTrue(r7_fail["fail_closed"])
+            self.assertEqual(r7_fail["reason"], "stale_or_missing_input")
+            self.assertEqual(len(ShadowLedger(root_b / "ledger").load_records()), 1)
+
+    def test_same_session_retry_after_o1_rejection_and_v4_no_double_advance(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Part 1: Run 2026-01-05 missing Treasury (O1 fail-closed), restore Treasury, rerun 2026-01-05 before cutoff -> commits & clears pending
+            root1 = Path(tmpdir) / "same_day_o1"
+            fdir_bad = Path(tmpdir) / "fix_missing_treasury"
+            _build_session_fixture_files(fdir_bad, "2026-01-05")
+            (fdir_bad / "treasury_tbill_2026-01-05.csv").unlink()
+            fdir_good = Path(tmpdir) / "fix_good"
+            _build_session_fixture_files(fdir_good, "2026-01-05")
+
+            r_fail = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root1,
+                config=drill_cfg,
+                fixtures_dir=fdir_bad,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 20, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r_fail["appended"])
+            self.assertTrue((root1 / "state_snapshots" / "pending_rejected_state.json").is_file())
+
+            r_retry = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root1,
+                config=drill_cfg,
+                fixtures_dir=fdir_good,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r_retry["appended"])
+            self.assertEqual(r_retry["sequence"], 0)
+            self.assertFalse((root1 / "state_snapshots" / "pending_rejected_state.json").exists())
+            recs1 = ShadowLedger(root1 / "ledger").load_records()
+            self.assertEqual(len(recs1), 1)
+            b_o1 = {b["id"]: b for b in recs1[0]["record_body"]["evaluator"]["breakers"]}["O1"]
+            self.assertEqual(b_o1["state"], "NO-NEW-RISK")
+            self.assertEqual(b_o1["reason"], "clearing_period")
+            rep1 = replay_window(root1 / "replay", root1 / "ledger")
+            self.assertTrue(rep1["bit_for_bit_match"])
+
+            # Part 2: V4 clearing mode across two rejected attempts + same-day commit increments clearing_counter ONCE
+            root2 = Path(tmpdir) / "same_day_v4"
+            fdir_day0 = Path(tmpdir) / "fix_05"
+            _build_session_fixture_files(fdir_day0, "2026-01-05")
+            r_d0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root2,
+                config=drill_cfg,
+                fixtures_dir=fdir_day0,
+                sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r_d0["appended"])
+            d0_hash = r_d0["record_sha256"]
+
+            fdir_d1_bad = Path(tmpdir) / "fix_06_bad"
+            _build_session_fixture_files(fdir_d1_bad, "2026-01-06")
+            (fdir_d1_bad / "treasury_tbill_2026-01-06.csv").unlink()
+            fdir_d1_good = Path(tmpdir) / "fix_06_good"
+            _build_session_fixture_files(fdir_d1_good, "2026-01-06")
+
+            # Attempt 1 & Attempt 2 on 2026-01-06 fail O1 while V4 is calm (sigma=0.24)
+            for minute in (15, 25):
+                rf = run_daily_drill_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root2,
+                    config=drill_cfg,
+                    fixtures_dir=fdir_d1_bad,
+                    sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                    wall_clock=lambda m=minute: datetime(2026, 1, 6, 22, m, tzinfo=timezone.utc),
+                )
+                self.assertFalse(rf["appended"])
+                pend_state, pend_meta = load_pending_rejected_state_snapshot(  # type: ignore[misc]
+                    root2 / "state_snapshots",
+                    expected_chain_id="drill-v0",
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=d0_hash,
+                    current_session_date="2026-01-06",
+                    expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                    expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                )
+                self.assertEqual(pend_meta["rejected_session_date"], "2026-01-06")
+                # Session-start baseline stays clearing_counter=0 across retries while next_row_state has counter=1 once
+                self.assertEqual(pend_meta["base_prior_row_state"]["V4"]["TQQQ"]["clearing_counter"], 0)
+                self.assertEqual(pend_state["V4"]["TQQQ"]["clearing_counter"], 1)
+
+            # Attempt 3 restores Treasury same day -> commits seq=1 with clearing_counter == 1 (NOT 2 or 3!)
+            r_ok = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root2,
+                config=drill_cfg,
+                fixtures_dir=fdir_d1_good,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 40, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r_ok["appended"])
+            self.assertEqual(r_ok["sequence"], 1)
+            self.assertFalse((root2 / "state_snapshots" / "pending_rejected_state.json").exists())
+            recs2 = ShadowLedger(root2 / "ledger").load_records()
+            b_v4_2 = {b["id"]: b for b in recs2[-1]["record_body"]["evaluator"]["breakers"]}["V4"]
+            self.assertEqual(b_v4_2["outputs"]["TQQQ"]["clearing_counter"], 1)
+            rep2 = replay_window(root2 / "replay", root2 / "ledger")
+            self.assertTrue(rep2["bit_for_bit_match"])
+
+    def test_non_production_config_rejected_by_check_forward_clock_credit(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "credit_cfg_check"
+            unlocked_cfg_path = Path(tmpdir) / "unlocked.json"
+            unlocked_cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            hdrs: dict[int, dict[str, str]] = {}
+
+            class _FakeOts(OpenTimestampsClient):
+                def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                    assert root_hex is not None
+                    hdrs[880100] = {"merkle_root": root_hex, "timestamp": "2026-01-06T03:00:00.000Z"}
+                    return ots_b, "https://a.pool.opentimestamps.org"
+
+            run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config_path=unlocked_cfg_path,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+            )
+            ledger = ShadowLedger(root / "ledger")
+            spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+
+            ok_drill, issues_drill = check_forward_clock_credit(
+                ledger.load_records(),
+                ledger.load_receipts(),
+                ledger_dir=ledger.root_dir,
+                config_path=_REPO_ROOT / "config" / "drill-scheduler.json",
+                bitcoin_merkle_roots=hdrs,
+                commitment_deadline_et="23:30",
+                calendar_spec=spec_v2,
+            )
+            self.assertFalse(ok_drill)
+            self.assertIn("non_production_config_rejected:drill", issues_drill)
+
+            ok_missing, issues_missing = check_forward_clock_credit(
+                ledger.load_records(),
+                ledger.load_receipts(),
+                ledger_dir=ledger.root_dir,
+                config_path=Path(tmpdir) / "missing.json",
+                bitcoin_merkle_roots=hdrs,
+                commitment_deadline_et="23:30",
+                calendar_spec=spec_v2,
+            )
+            self.assertFalse(ok_missing)
+            self.assertIn("missing_production_config", issues_missing)
+
+    def test_ledger_bound_state_digest_prevents_forged_halt_downgrade(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec_v2)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+
+        # 1. Committed non-stub record embeds evaluator.next_row_state_sha256 bound to O8 HALT latch
+        inp_o8 = {
+            "E": "50000",
+            "E_star": "50000",
+            "H": "0",
+            "L": "0",
+            "positions_source_record": {"as_of": "2026-01-05T22:30:00.000Z", "age_sessions": 0},
+            "broker_reconciliation_source_record": {
+                "as_of": "2026-01-05T22:30:00.000Z",
+                "age_sessions": 0,
+            },
+            "index_one_session_returns": {"NDX": 0.0, "SEMI": 0.0},
+            "authorized_events": {"account": [{"type": "kill_switch", "session": "2026-01-05"}]},
+            "funds": {
+                "TQQQ": {
+                    "s": "1",
+                    "close_price": "50",
+                    "q_pre": 100,
+                    "sigma_forecast": "0.24",
+                    "fund_return": 0.0,
+                    "index_return": 0.0,
+                },
+                "SOXL": {
+                    "s": "1",
+                    "close_price": "40",
+                    "q_pre": 100,
+                    "sigma_forecast": "0.22",
+                    "fund_return": 0.0,
+                    "index_return": 0.0,
+                },
+            },
+        }
+        built_o8 = build_record_body(
+            chain_id="prod-o8-bind",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:30:00.000Z",
+            session_inputs=inp_o8,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built_o8["appended"])
+        body_o8 = built_o8["record_body"]
+        state_o8 = built_o8["next_row_state"]
+        self.assertTrue(state_o8["O8"]["latched"])
+        committed_nrs_sha = body_o8["evaluator"]["next_row_state_sha256"]
+        self.assertEqual(committed_nrs_sha, _sha256_canonical_state_dict(state_o8))
+
+        # Stripping next_row_state_sha256 from a non-stub record fails validate_record_body
+        stripped = json.loads(json.dumps(body_o8))
+        del stripped["evaluator"]["next_row_state_sha256"]
+        with self.assertRaises(CanonicalizationError):
+            validate_record_body(stripped)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sdir = Path(tmpdir) / "snaps"
+            rec_sha = sha256_canonical(body_o8)
+            save_row_state_snapshot(
+                sdir,
+                chain_id="prod-o8-bind",
+                sequence=0,
+                session_date="2026-01-05",
+                record_sha256=rec_sha,
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=state_o8,
+            )
+
+            # 2. Forging O8 HALT -> {} in BOTH seq_000000.state.json AND latest.state.json + recomputing state_sha256 MUST FAIL
+            forged_state = json.loads(json.dumps(state_o8))
+            forged_state["O8"] = {}
+            forged_sha = _sha256_canonical_state_dict(forged_state)
+            for fname in ("seq_000000.state.json", "latest.state.json"):
+                fp = sdir / fname
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+                obj["next_row_state"] = forged_state
+                obj["state_sha256"] = forged_sha
+                fp.write_text(json.dumps(obj), encoding="utf-8")
+
+            with self.assertRaises(EngineIdentityError):
+                load_row_state_snapshot(
+                    sdir,
+                    expected_chain_id="prod-o8-bind",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_sequence=0,
+                    expected_record_sha256=rec_sha,
+                    expected_state_sha256=committed_nrs_sha,
+                    allow_missing_at_genesis=False,
+                )
+            with self.assertRaises(EngineIdentityError):
+                load_row_state_snapshot(
+                    sdir,
+                    expected_chain_id="prod-o8-bind",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_sequence=None,
+                    expected_record_sha256=rec_sha,
+                    expected_state_sha256=committed_nrs_sha,
+                    allow_missing_at_genesis=False,
+                )
+
+            # 3. Forging pending_rejected_state.json to clear O8 HALT or forge base_prior_row_state + recomputed checksums MUST FAIL
+            save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id="prod-o8-bind",
+                base_sequence=0,
+                base_record_sha256=rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=forged_state,  # O8 wiped to {} with recomputed state_sha256!
+                base_prior_row_state=state_o8,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    sdir,
+                    expected_chain_id="prod-o8-bind",
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=rec_sha,
+                    current_session_date="2026-01-06",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_base_prior_state_sha256=committed_nrs_sha,
+                    committed_base_prior_row_state=state_o8,
+                )
+
+            # Forging base_prior_row_state itself to {} fails ledger-digest check
+            save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id="prod-o8-bind",
+                base_sequence=0,
+                base_record_sha256=rec_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=forged_state,
+                base_prior_row_state={},
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    sdir,
+                    expected_chain_id="prod-o8-bind",
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=rec_sha,
+                    current_session_date="2026-01-06",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_base_prior_state_sha256=committed_nrs_sha,
+                    committed_base_prior_row_state=state_o8,
+                )
+
+            # 4. End-to-end scheduler rejects forged seq_000000.state.json & forged pending_rejected_state.json, and recovers committed state deterministically
+            drill_cfg = _sh2_drill_cfg()
+            root = Path(tmpdir) / "e2e_bind"
+            f5 = Path(tmpdir) / "fix_05"
+            f6 = Path(tmpdir) / "fix_06"
+            f6_bad = Path(tmpdir) / "fix_06_bad"
+            _build_session_fixture_files(f5, "2026-01-05")
+            _build_session_fixture_files(f6, "2026-01-06")
+            _build_session_fixture_files(f6_bad, "2026-01-06")
+            (f6_bad / "treasury_tbill_2026-01-06.csv").unlink()
+
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r0["appended"])
+
+            snap0_path = root / "state_snapshots" / "seq_000000.state.json"
+            orig_snap0_bytes = snap0_path.read_bytes()
+            snap0_obj = json.loads(orig_snap0_bytes.decode("utf-8"))
+            snap0_obj["next_row_state"]["V4"] = {}
+            snap0_obj["state_sha256"] = _sha256_canonical_state_dict(snap0_obj["next_row_state"])
+            snap0_path.write_text(json.dumps(snap0_obj), encoding="utf-8")
+
+            # Attempting Day 1 with forged snapshot (even valid self-hash!) fails closed BEFORE evaluate
+            with self.assertRaises(EngineIdentityError):
+                run_daily_drill_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config=drill_cfg,
+                    fixtures_dir=f6,
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                )
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 1)
+
+            # Re-running already-committed Day 0 deterministically repairs forged snapshot from ledger+bundle!
+            r0_heal = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
+            )
+            self.assertEqual(r0_heal["reason"], "already_committed_session_preserved")
+            repaired_snap0 = json.loads(snap0_path.read_text(encoding="utf-8"))
+            self.assertEqual(repaired_snap0["next_row_state"]["V4"]["TQQQ"]["clearing_counter"], 0)
+
+            # Day 1 fails O1 -> saves pending_rejected_state.json; attacker clears V4 + recomputes checksums -> rejected!
+            r1_rej = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f6_bad,
+                sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 20, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r1_rej["appended"])
+            pend_path = root / "state_snapshots" / "pending_rejected_state.json"
+            pend_obj = json.loads(pend_path.read_text(encoding="utf-8"))
+            pend_obj["next_row_state"]["V4"] = {}
+            pend_obj["state_sha256"] = _sha256_canonical_state_dict(pend_obj["next_row_state"])
+            pend_path.write_text(json.dumps(pend_obj), encoding="utf-8")
+
+            with self.assertRaises(EngineIdentityError):
+                run_daily_drill_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config=drill_cfg,
+                    fixtures_dir=f6,
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                )
 
 
 if __name__ == "__main__":

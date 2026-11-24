@@ -300,6 +300,33 @@ def resolve_prior_close_session(
     return _unknown_session(venue, local_date.isoformat(), rules, spec_digest, "out_of_range")
 
 
+def resolve_previous_trading_date(
+    spec: dict | None,
+    venue: str,
+    session_date: str,
+) -> str | None:
+    """Return the immediately preceding trading date strictly before session_date, or None."""
+    loaded = spec if spec is not None else load_spec()
+    rules = loaded["rules"]
+    if venue != rules["exchange"]:
+        return None
+    try:
+        cur = date.fromisoformat(session_date)
+    except ValueError:
+        return None
+    cov_start = date.fromisoformat(rules["coverage_start_date"])
+    cov_end = date.fromisoformat(rules["coverage_end_date"])
+    if cur <= cov_start or cur > cov_end:
+        return None
+    cand = cur - timedelta(days=1)
+    while cand >= cov_start:
+        sess = resolve_session(venue, cand.isoformat(), spec=loaded)
+        if sess.get("is_trading_day") and not sess.get("blocks_eligibility"):
+            return cand.isoformat()
+        cand -= timedelta(days=1)
+    return None
+
+
 def classify_us_equity_session_window(
     timestamp_utc: str,
     calendar_session: Mapping[str, object],
