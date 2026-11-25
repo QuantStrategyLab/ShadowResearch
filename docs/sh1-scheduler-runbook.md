@@ -1,4 +1,10 @@
-# SH-1 Drill-Chain Scheduler & Runbook
+# SH-1 Drill-Chain Scheduler & Runbook (Deprecated / Superseded by Item 18)
+
+> **Deprecation / Supersession Notice (Item 18):** Mac mini / Asia-Singapore runtime templates
+> in [`deploy/scheduler/`](../deploy/scheduler/) and this SH-1 host layout are permanently
+> retired for runtime operations. All SH-2 execution targets secret-free GCP Cloud Run Jobs
+> (`us-east1`); see [`docs/sh2-cloudrun-runbook.md`](sh2-cloudrun-runbook.md). Existing
+> `deploy/scheduler/` files remain archived solely for SH-1 offline test compatibility.
 
 This runbook covers the AI-independent daily drill-chain scheduler (`OA-SH1-6`, **drill chain only**; `CLK-01` remains inactive until `SH-2`).
 
