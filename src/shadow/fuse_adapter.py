@@ -715,7 +715,15 @@ def _compute_ca_adjusted_fund_return(
         prev_adj = prev_d / Decimal(str(ca_obj.get("ratio")))
         if prev_adj <= 0:
             return None
-        return float((cur_d - prev_adj) / prev_adj)
+        raw_cash = ca_obj.get("cash_per_share_usd")
+        if raw_cash is None:
+            cash_d = Decimal("0")
+        else:
+            cash_f = _finite_number(raw_cash)
+            if cash_f is None or cash_f < 0.0:
+                return None
+            cash_d = Decimal(str(raw_cash))
+        return float((cur_d + cash_d - prev_adj) / prev_adj)
     if ca_type in ("distribution", "cash_distribution", "dividend"):
         cash_f = _finite_number(ca_obj.get("cash_per_share_usd"))
         if cash_f is None or cash_f < 0.0:
@@ -777,13 +785,16 @@ def _map_market_corporate_action(mca: Mapping[str, Any] | None) -> dict[str, Any
     if not split_dec.is_finite() or not cash_dec.is_finite():
         return None
     if split_dec != Decimal("1"):
-        return {
+        action: dict[str, Any] = {
             "type": "split" if split_dec > Decimal("1") else "reverse_split",
             "ratio": float(split_dec),
             "ex_date": mca.get("ex_date"),
             "adjustment_complete": False,
             "exact_reconciliation": False,
         }
+        if cash_dec > Decimal("0"):
+            action["cash_per_share_usd"] = float(cash_dec)
+        return action
     if cash_dec > Decimal("0"):
         return {
             "type": "distribution",

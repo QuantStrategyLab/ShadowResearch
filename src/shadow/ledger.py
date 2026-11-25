@@ -1467,6 +1467,10 @@ class ShadowLedger:
         reclaim_exp = ShadowLedger._parse_iso_utc(rp.get("expires_at_utc"))
         return reclaim_exp is not None and now_chk >= reclaim_exp
 
+    @staticmethod
+    def _now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
     def _acquire_cross_instance_lease(
         self,
         lease_path: Path,
@@ -1474,7 +1478,7 @@ class ShadowLedger:
         lease_ttl_seconds: float,
     ) -> str:
         lease_id = uuid4().hex
-        now_utc = datetime.now(timezone.utc)
+        now_utc = self._now_utc()
         expires_utc = now_utc + timedelta(seconds=max(1.0, lease_ttl_seconds))
         lease_payload = {
             "schema_version": "c-sh-chain-lease-v1",
@@ -1499,7 +1503,7 @@ class ShadowLedger:
                     orig_st, existing_bytes = self._read_lease_snapshot(lease_path)
                     existing_raw = existing_bytes.decode("utf-8", errors="replace")
                     if not existing_raw.strip():
-                        now_init = datetime.now(timezone.utc)
+                        now_init = self._now_utc()
                         if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
                             raise ChainConcurrencyConflictError(
                                 "Chain lease file initializing by peer writer"
@@ -1519,7 +1523,7 @@ class ShadowLedger:
                     )
 
                 exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
-                now_chk = datetime.now(timezone.utc)
+                now_chk = self._now_utc()
                 if exp_dt is not None and now_chk < exp_dt:
                     raise ChainConcurrencyConflictError(
                         "Chain lease held by active writer: "
@@ -1653,9 +1657,131 @@ class ShadowLedger:
                 )
         raise ChainConcurrencyConflictError("Failed to acquire cross-instance chain lease")
 
+    def _renew_cross_instance_lease(
+        self,
+        lease_path: Path,
+        expected_lease_id: str,
+        *,
+        lease_ttl_seconds: float,
+    ) -> None:
+        """Atomically renew an unexpired owned .chain.lease.json without clobbering displaced leases."""
+        try:
+            cur_st, cur_bytes = self._read_lease_snapshot(lease_path)
+            parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
+        except FileNotFoundError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease vanished before renewal"
+            ) from exc
+        except Exception as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease unreadable before renewal"
+            ) from exc
+
+        now_utc = self._now_utc()
+        exp_dt = (
+            self._parse_iso_utc(parsed.get("expires_at_utc"))
+            if isinstance(parsed, dict)
+            else None
+        )
+        if (
+            not isinstance(parsed, dict)
+            or parsed.get("lease_id") != expected_lease_id
+            or exp_dt is None
+            or now_utc >= exp_dt
+        ):
+            raise ChainConcurrencyConflictError(
+                "Chain lease expired or displaced before renewal"
+            )
+
+        expires_utc = now_utc + timedelta(seconds=max(1.0, float(lease_ttl_seconds)))
+        renewed_payload = dict(parsed)
+        renewed_payload["renewed_at_utc"] = (
+            now_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_utc.microsecond // 1000:03d}Z"
+        )
+        renewed_payload["expires_at_utc"] = (
+            expires_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+            + f"{expires_utc.microsecond // 1000:03d}Z"
+        )
+        renewed_bytes = (
+            json.dumps(renewed_payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+
+        tmp_path = lease_path.with_name(f".chain.lease.tmp.renew.{expected_lease_id}.{uuid4().hex}.lock")
+        try:
+            tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(tfd, renewed_bytes)
+                os.fsync(tfd)
+            finally:
+                os.close(tfd)
+
+            chk_st, chk_bytes = self._read_lease_snapshot(lease_path)
+            if (
+                chk_st.st_dev != cur_st.st_dev
+                or chk_st.st_ino != cur_st.st_ino
+                or chk_bytes != cur_bytes
+                or self._now_utc() >= exp_dt
+            ):
+                raise ChainConcurrencyConflictError(
+                    "Chain lease identity changed or expired during renewal"
+                )
+            os.replace(str(tmp_path), str(lease_path))
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        try:
+            _, verify_bytes = self._read_lease_snapshot(lease_path)
+            verify_obj = parse_json_no_duplicates(verify_bytes.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease unreadable after renewal"
+            ) from exc
+        if not isinstance(verify_obj, dict) or verify_obj.get("lease_id") != expected_lease_id:
+            raise ChainConcurrencyConflictError(
+                "Chain lease displaced during renewal"
+            )
+
+    def assert_active_chain_lease(self) -> None:
+        """Fail closed if caller lacks or has lost its active unexpired cross-instance lease."""
+        key = str(self.root_dir.resolve())
+        locks = getattr(_CHAIN_LOCK_TLS, "locks", None)
+        entry = locks.get(key) if isinstance(locks, dict) else None
+        if entry is None:
+            raise ChainConcurrencyConflictError("Chain lease not held by active writer")
+        lease_id = entry["lease_id"]
+        lease_path = self.root_dir / ".chain.lease.json"
+        with entry["lease_mu"]:
+            if entry.get("lost_error"):
+                raise ChainConcurrencyConflictError(str(entry["lost_error"]))
+            try:
+                _, cur_bytes = self._read_lease_snapshot(lease_path)
+                parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
+            except FileNotFoundError as exc:
+                entry["lost_error"] = "Chain lease missing before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"]) from exc
+            except Exception as exc:
+                entry["lost_error"] = "Chain lease unreadable before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"]) from exc
+            exp_dt = (
+                self._parse_iso_utc(parsed.get("expires_at_utc"))
+                if isinstance(parsed, dict)
+                else None
+            )
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("lease_id") != lease_id
+                or exp_dt is None
+                or self._now_utc() >= exp_dt
+            ):
+                entry["lost_error"] = "Chain lease expired or displaced before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"])
+
     @staticmethod
     def _release_cross_instance_lease(lease_path: Path, expected_lease_id: str) -> None:
-        now_utc = datetime.now(timezone.utc)
+        now_utc = ShadowLedger._now_utc()
         if lease_path.is_file():
             try:
                 parsed = parse_json_no_duplicates(lease_path.read_text(encoding="utf-8"))
@@ -1677,8 +1803,13 @@ class ShadowLedger:
                 pass
 
     @contextmanager
-    def chain_lock(self, *, lease_ttl_seconds: float = 300.0) -> Iterator[None]:
-        """Acquire exclusive flock + atomic .chain.lease.json cross-instance fencing lock."""
+    def chain_lock(
+        self,
+        *,
+        lease_ttl_seconds: float = 300.0,
+        renew_interval_seconds: float | None = None,
+    ) -> Iterator[None]:
+        """Acquire exclusive flock + atomic renewable .chain.lease.json cross-instance fencing lock."""
         self.root_dir.mkdir(parents=True, exist_ok=True)
         key = str(self.root_dir.resolve())
         locks = getattr(_CHAIN_LOCK_TLS, "locks", None)
@@ -1687,6 +1818,7 @@ class ShadowLedger:
             _CHAIN_LOCK_TLS.locks = locks
         entry = locks.get(key)
         if entry is not None:
+            self.assert_active_chain_lease()
             entry["depth"] += 1
             try:
                 yield
@@ -1702,12 +1834,51 @@ class ShadowLedger:
             lease_id = self._acquire_cross_instance_lease(
                 lease_path, lease_ttl_seconds=lease_ttl_seconds
             )
-            locks[key] = {"fd": fd, "depth": 1, "lease_id": lease_id}
+            lease_mu = threading.Lock()
+            stop_event = threading.Event()
+            state: dict[str, object] = {
+                "fd": fd,
+                "depth": 1,
+                "lease_id": lease_id,
+                "lease_mu": lease_mu,
+                "lost_error": None,
+            }
+            locks[key] = state
+            interval = (
+                float(renew_interval_seconds)
+                if renew_interval_seconds is not None
+                else max(0.05, min(60.0, float(lease_ttl_seconds) / 3.0))
+            )
+
+            def _renew_loop() -> None:
+                while not stop_event.wait(interval):
+                    with lease_mu:
+                        if stop_event.is_set():
+                            return
+                        try:
+                            self._renew_cross_instance_lease(
+                                lease_path,
+                                lease_id,
+                                lease_ttl_seconds=lease_ttl_seconds,
+                            )
+                        except (ChainConcurrencyConflictError, OSError) as exc:
+                            state["lost_error"] = str(exc) or "Chain lease renewal failed"
+                            return
+
+            renew_thread = threading.Thread(
+                target=_renew_loop,
+                name=f"shadow-lease-renew-{lease_id[:8]}",
+                daemon=True,
+            )
+            renew_thread.start()
             try:
                 yield
             finally:
+                stop_event.set()
+                renew_thread.join(timeout=2.0)
                 locks.pop(key, None)
-                self._release_cross_instance_lease(lease_path, lease_id)
+                with lease_mu:
+                    self._release_cross_instance_lease(lease_path, lease_id)
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -1888,6 +2059,7 @@ class ShadowLedger:
                     post_marker_writes.append((ots_path, ots_bytes))
                 post_marker_writes.append((rcp_path, canonical_json_bytes(receipt_obj)))
 
+            self.assert_active_chain_lease()
             self.root_dir.mkdir(parents=True, exist_ok=True)
             if allow_unanchored:
                 # Purge any stale orphan .receipt/.ots from an earlier crashed run before committing unanchored.
@@ -1900,7 +2072,9 @@ class ShadowLedger:
             created_paths: list[Path] = []
             try:
                 if before_record_commit is not None:
+                    self.assert_active_chain_lease()
                     before_record_commit()
+                self.assert_active_chain_lease()
                 # Commit seq_NNNNNN.record.json BEFORE detached .ots/.receipt; rollback_sequence / except handler cleans up on Python exception.
                 _atomic_write_bytes(rec_path, canonical_json_bytes(envelope))
                 created_paths.append(rec_path)

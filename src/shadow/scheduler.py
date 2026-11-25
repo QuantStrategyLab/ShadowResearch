@@ -1522,6 +1522,7 @@ def _commit_drill_session_atomically(
 
         def _stage_bundle_before_marker() -> None:
             nonlocal bundle_modified, snap_staged
+            ledger.assert_active_chain_lease()
             _update_replay_bundle(
                 bundle_dir,
                 cfg=cfg,
@@ -1536,6 +1537,7 @@ def _commit_drill_session_atomically(
             )
             bundle_modified = True
             if should_stage_snap and snapshots_dir is not None:
+                ledger.assert_active_chain_lease()
                 save_row_state_snapshot(
                     snapshots_dir,
                     chain_id=cfg.chain_id,
@@ -1583,8 +1585,10 @@ def _commit_drill_session_atomically(
                         latest_snap_path.unlink()
             raise
         if pending_snap_path is not None and pending_snap_path.is_file():
+            ledger.assert_active_chain_lease()
             pending_snap_path.unlink()
         if trusted_head_anchor_path is not None:
+            ledger.assert_active_chain_lease()
             _advance_trusted_head_anchor(
                 trusted_head_anchor_path,
                 chain_id=cfg.chain_id,
@@ -3896,6 +3900,7 @@ def _run_daily_drill_cycle_locked(
             authorized_events=merged_authorized_events or None,
             pending_revision=next_pending_revision,
         )
+        ledger.assert_active_chain_lease()
         save_pending_rejected_state_snapshot(
             snapshots_dir,
             chain_id=cfg.chain_id,
@@ -3917,6 +3922,7 @@ def _run_daily_drill_cycle_locked(
                 if prior_records
                 else None
             )
+            ledger.assert_active_chain_lease()
             _advance_trusted_head_anchor(
                 anchor_resolved,
                 chain_id=cfg.chain_id,

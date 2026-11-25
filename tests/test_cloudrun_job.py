@@ -1954,6 +1954,57 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertFalse(lease_path.exists())
             self.assertFalse(empty_claim_path.exists())
 
+    def test_chain_lock_renews_lease_and_fences_displaced_or_expired_writer(self) -> None:
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Active chain_lock renews lease past initial 1.0s TTL while peer acquisition fails closed
+            ledger = ShadowLedger(Path(tmpdir) / "renew" / "ledger")
+            lease_path = ledger.root_dir / ".chain.lease.json"
+            with ledger.chain_lock(lease_ttl_seconds=1.0, renew_interval_seconds=0.15):
+                initial_obj = json.loads(lease_path.read_text(encoding="utf-8"))
+                time.sleep(1.3)
+                renewed_obj = json.loads(lease_path.read_text(encoding="utf-8"))
+                self.assertEqual(renewed_obj["lease_id"], initial_obj["lease_id"])
+                self.assertIn("renewed_at_utc", renewed_obj)
+                self.assertGreater(renewed_obj["expires_at_utc"], initial_obj["expires_at_utc"])
+                ledger.assert_active_chain_lease()
+                peer = ShadowLedger(ledger.root_dir)
+                with self.assertRaisesRegex(
+                    ChainConcurrencyConflictError, "held by active writer"
+                ):
+                    peer._acquire_cross_instance_lease(lease_path, lease_ttl_seconds=300.0)
+
+            # 2. Displaced/expired lease fences assert_active_chain_lease and append_record (0 writes)
+            fence_ledger = ShadowLedger(Path(tmpdir) / "fence" / "ledger")
+            fence_lease = fence_ledger.root_dir / ".chain.lease.json"
+            base_now = datetime.now(timezone.utc)
+            orig_now_desc = ShadowLedger.__dict__["_now_utc"]
+            now_box = [base_now]
+            ShadowLedger._now_utc = staticmethod(lambda: now_box[0])  # type: ignore[method-assign]
+            try:
+                with fence_ledger.chain_lock(
+                    lease_ttl_seconds=300.0, renew_interval_seconds=3600.0
+                ):
+                    first_obj = json.loads(fence_lease.read_text(encoding="utf-8"))
+                    now_box[0] = base_now + timedelta(seconds=301)
+                    peer_ledger = ShadowLedger(fence_ledger.root_dir)
+                    second_id = peer_ledger._acquire_cross_instance_lease(
+                        fence_lease, lease_ttl_seconds=300.0
+                    )
+                    self.assertNotEqual(second_id, first_obj["lease_id"])
+                    with self.assertRaisesRegex(
+                        ChainConcurrencyConflictError, "expired or displaced"
+                    ):
+                        fence_ledger.assert_active_chain_lease()
+                    with self.assertRaisesRegex(
+                        ChainConcurrencyConflictError, "expired or displaced"
+                    ):
+                        fence_ledger.append_record({"sequence": 0}, allow_unanchored=True)
+                    self.assertEqual(len(fence_ledger.load_records()), 0)
+            finally:
+                ShadowLedger._now_utc = orig_now_desc  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()
