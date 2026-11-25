@@ -11,7 +11,7 @@ import json
 import os
 import re
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -2243,6 +2243,47 @@ def load_row_state_snapshot(
     return state_obj, payload
 
 
+def normalize_pending_authorized_events(
+    authorized_events: object | None,
+) -> list[dict[str, Any]]:
+    """Normalize dict/list FUSE-1 authorized_events cleanly without widening scope."""
+    if not authorized_events:
+        return []
+    candidates: list[dict[str, Any]] = []
+    if isinstance(authorized_events, Sequence) and not isinstance(
+        authorized_events, (str, bytes, bytearray)
+    ):
+        for item in authorized_events:
+            if isinstance(item, Mapping):
+                candidates.append(dict(copy.deepcopy(item)))
+    elif isinstance(authorized_events, Mapping):
+        for scope_key, ev_list in authorized_events.items():
+            if not isinstance(scope_key, str) or not isinstance(ev_list, list):
+                continue
+            for item in ev_list:
+                if not isinstance(item, Mapping):
+                    continue
+                if "scope" in item and item.get("scope") != scope_key:
+                    continue
+                ev_copy = dict(copy.deepcopy(item))
+                ev_copy["scope"] = scope_key
+                candidates.append(ev_copy)
+    else:
+        return []
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ev in candidates:
+        try:
+            key = json.dumps(ev, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except Exception:
+            continue
+        if key not in seen:
+            seen.add(key)
+            deduped.append(ev)
+    return deduped
+
+
 def build_pending_rejected_state_payload(
     *,
     chain_id: str,
@@ -2254,6 +2295,7 @@ def build_pending_rejected_state_payload(
     next_row_state: dict,
     base_prior_row_state: dict | None = None,
     o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
+    authorized_events: dict | list | None = None,
 ) -> dict:
     """Assemble a canonical c-sh-pending-rejected-state-v1 payload in memory."""
     if not isinstance(next_row_state, dict):
@@ -2278,6 +2320,9 @@ def build_pending_rejected_state_payload(
         payload["o4_resolved_symbols"] = sorted(
             {str(s) for s in o4_resolved_symbols if isinstance(s, str) and s}
         )
+    normalized_auth = normalize_pending_authorized_events(authorized_events)
+    if normalized_auth:
+        payload["authorized_events"] = normalized_auth
     return payload
 
 
@@ -2293,6 +2338,7 @@ def save_pending_rejected_state_snapshot(
     next_row_state: dict,
     base_prior_row_state: dict | None = None,
     o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
+    authorized_events: dict | list | None = None,
 ) -> Path:
     """Persist next_row_state (plus session-start baseline) after an O1/O2-rejected evaluation."""
     payload = build_pending_rejected_state_payload(
@@ -2305,6 +2351,7 @@ def save_pending_rejected_state_snapshot(
         next_row_state=next_row_state,
         base_prior_row_state=base_prior_row_state,
         o4_resolved_symbols=o4_resolved_symbols,
+        authorized_events=authorized_events,
     )
     s_dir = Path(snapshots_dir)
     s_dir.mkdir(parents=True, exist_ok=True)
@@ -2341,6 +2388,118 @@ def _max_elapsed_session_steps(
     return max(0, (rej_date - max(parsed_refs)).days)
 
 
+def _parse_valid_ymd(raw: object) -> str | None:
+    """Return stripped YYYY-MM-DD if valid calendar date, else None."""
+    if not isinstance(raw, str):
+        return None
+    cand = raw.strip()
+    if not _DATE_YYYY_MM_DD_RE.fullmatch(cand):
+        return None
+    try:
+        date.fromisoformat(cand)
+    except ValueError:
+        return None
+    return cand
+
+
+def _has_authorized_pending_clear(
+    authorized_events: Sequence[Mapping[str, Any]] | None,
+    *,
+    row_id: str,
+    scope_kind: str,
+    target: str | None = None,
+    rej_ds: str,
+    expected_base_session_date: str | None = None,
+    trip_session: object = None,
+    cooling_off_until: object = None,
+) -> bool:
+    """Validate whether pending authorized_events authorize clearing a committed row latch."""
+    if not authorized_events:
+        return False
+
+    base_ds = _parse_valid_ymd(expected_base_session_date)
+    trip_ds = _parse_valid_ymd(trip_session)
+    cool_ds = _parse_valid_ymd(cooling_off_until) if row_id == "L3" else None
+
+    for ev in authorized_events:
+        if not isinstance(ev, Mapping):
+            continue
+        ev_row = ev.get("row")
+        ev_row_id = ev.get("row_id")
+        if ev_row is not None and ev_row_id is not None and ev_row != ev_row_id:
+            continue
+        target_row = ev_row if ev_row is not None else ev_row_id
+
+        ev_type = ev.get("type")
+        if row_id == "O8":
+            if ev_type == "rearm":
+                if target_row != "O8":
+                    continue
+            elif ev_type == "kill_switch_clear":
+                if (ev_row is not None or ev_row_id is not None) and target_row != "O8":
+                    continue
+            else:
+                continue
+        else:
+            if ev_type != "rearm" or target_row != row_id:
+                continue
+
+        if scope_kind == "account":
+            if ev.get("fund") or ev.get("symbol"):
+                continue
+            if "scope" in ev and ev.get("scope") != "account":
+                continue
+        elif scope_kind == "fund":
+            if not target or ev.get("fund") != target or ev.get("symbol"):
+                continue
+            if "scope" in ev and ev.get("scope") != f"fund:{target}":
+                continue
+        elif scope_kind == "symbol":
+            if not target or ev.get("symbol") != target or ev.get("fund"):
+                continue
+            if "scope" in ev and ev.get("scope") != f"symbol:{target}":
+                continue
+        else:
+            continue
+
+        ev_sess_ds: str | None = None
+        if "session" in ev:
+            ev_sess_ds = _parse_valid_ymd(ev.get("session"))
+            if ev_sess_ds is None:
+                continue
+
+        ev_as_of_ds: str | None = None
+        if "as_of" in ev:
+            raw_as_of = ev.get("as_of")
+            if not isinstance(raw_as_of, str) or len(raw_as_of.strip()) < 10:
+                continue
+            ev_as_of_ds = _parse_valid_ymd(raw_as_of.strip()[:10])
+            if ev_as_of_ds is None:
+                continue
+
+        if ev_sess_ds is not None and ev_as_of_ds is not None and ev_sess_ds != ev_as_of_ds:
+            continue
+        ev_ds = ev_sess_ds if ev_sess_ds is not None else ev_as_of_ds
+        if ev_ds is None:
+            continue
+
+        if ev_ds > rej_ds:
+            continue
+        if base_ds is not None and ev_ds <= base_ds:
+            continue
+        if trip_ds is not None and ev_ds < trip_ds:
+            continue
+        if row_id == "L3":
+            if cool_ds is not None:
+                if ev_ds < cool_ds:
+                    continue
+            elif trip_ds is not None:
+                if (date.fromisoformat(ev_ds) - date.fromisoformat(trip_ds)).days < 30:
+                    continue
+        return True
+    return False
+
+
 def _assert_pending_state_preserves_committed_breakers(
     committed_state: Mapping[str, Any],
     pending_state: Mapping[str, Any],
@@ -2350,6 +2509,7 @@ def _assert_pending_state_preserves_committed_breakers(
     expected_spec_version: str,
     expected_base_session_date: str | None = None,
     allowed_o4_resolved_symbols: set[str] | frozenset[str] | None = None,
+    authorized_events: Sequence[Mapping[str, Any]] | None = None,
 ) -> None:
     """Enforce fail-closed monotonic latch/severity preservation from committed ledger state to pending state."""
     if "engine_hash" in pending_state and pending_state["engine_hash"] != expected_engine_hash:
@@ -2368,6 +2528,18 @@ def _assert_pending_state_preserves_committed_breakers(
         c_entry = committed_state.get(row_id)
         if isinstance(c_entry, Mapping) and c_entry.get("latched") is True:
             p_entry = pending_state.get(row_id)
+            if _has_authorized_pending_clear(
+                authorized_events,
+                row_id=row_id,
+                scope_kind="account",
+                rej_ds=rej_ds,
+                expected_base_session_date=expected_base_session_date,
+                trip_session=c_entry.get("trip_session"),
+                cooling_off_until=c_entry.get("cooling_off_until"),
+            ):
+                if p_entry is not None and not isinstance(p_entry, Mapping):
+                    raise EngineIdentityError(f"Pending state invalid {row_id} entry")
+                continue
             if not isinstance(p_entry, Mapping) or p_entry.get("latched") is not True:
                 raise EngineIdentityError(
                     f"Pending state downgraded or cleared committed {row_id} latch"
@@ -2392,7 +2564,15 @@ def _assert_pending_state_preserves_committed_breakers(
         c_latched = c_o5.get("latched") is True
         c_last_sess = c_o5.get("last_rejection_session")
         p_o5 = pending_state.get("O5")
-        if c_latched:
+        o5_authorized = c_latched and _has_authorized_pending_clear(
+            authorized_events,
+            row_id="O5",
+            scope_kind="account",
+            rej_ds=rej_ds,
+            expected_base_session_date=expected_base_session_date,
+            trip_session=c_o5.get("trip_session"),
+        )
+        if c_latched and not o5_authorized:
             if not isinstance(p_o5, Mapping) or p_o5.get("latched") is not True:
                 raise EngineIdentityError("Pending state cleared committed O5 latch")
         same_o5_session = (
@@ -2401,7 +2581,8 @@ def _assert_pending_state_preserves_committed_breakers(
             or (isinstance(p_o5, Mapping) and p_o5.get("last_rejection_session") == c_last_sess)
         )
         if (
-            (c_latched or same_o5_session)
+            not o5_authorized
+            and (c_latched or same_o5_session)
             and isinstance(c_cnt, int)
             and not isinstance(c_cnt, bool)
             and c_cnt > 0
@@ -2479,6 +2660,18 @@ def _assert_pending_state_preserves_committed_breakers(
             for fund, cf in c_map.items():
                 if isinstance(cf, Mapping) and cf.get("latched") is True:
                     pf = p_map.get(fund) if isinstance(p_map, Mapping) else None
+                    if _has_authorized_pending_clear(
+                        authorized_events,
+                        row_id=row_id,
+                        scope_kind="fund",
+                        target=str(fund),
+                        rej_ds=rej_ds,
+                        expected_base_session_date=expected_base_session_date,
+                        trip_session=cf.get("trip_session"),
+                    ):
+                        if pf is not None and not isinstance(pf, Mapping):
+                            raise EngineIdentityError(f"Pending state invalid {row_id}.{fund} entry")
+                        continue
                     if not isinstance(pf, Mapping) or pf.get("latched") is not True:
                         raise EngineIdentityError(
                             f"Pending state cleared committed {row_id}.{fund} latch"
@@ -2500,7 +2693,15 @@ def _assert_pending_state_preserves_committed_breakers(
         if isinstance(c_latched, Mapping):
             p_latched = p_v2.get("latched_mismatches") if isinstance(p_v2, Mapping) else None
             for fund, val in c_latched.items():
-                if val and (not isinstance(p_latched, Mapping) or not p_latched.get(fund)):
+                if val and not _has_authorized_pending_clear(
+                    authorized_events,
+                    row_id="V2",
+                    scope_kind="fund",
+                    target=str(fund),
+                    rej_ds=rej_ds,
+                    expected_base_session_date=expected_base_session_date,
+                    trip_session=c_v2.get("trip_session"),
+                ) and (not isinstance(p_latched, Mapping) or not p_latched.get(fund)):
                     raise EngineIdentityError(
                         f"Pending state cleared committed V2.latched_mismatches.{fund}"
                     )
@@ -2509,7 +2710,15 @@ def _assert_pending_state_preserves_committed_breakers(
             p_pending = p_v2.get("pending_adjustments") if isinstance(p_v2, Mapping) else None
             latched_map = c_latched if isinstance(c_latched, Mapping) else {}
             for fund, val in c_pending.items():
-                if val and latched_map.get(fund) and (
+                if val and latched_map.get(fund) and not _has_authorized_pending_clear(
+                    authorized_events,
+                    row_id="V2",
+                    scope_kind="fund",
+                    target=str(fund),
+                    rej_ds=rej_ds,
+                    expected_base_session_date=expected_base_session_date,
+                    trip_session=c_v2.get("trip_session"),
+                ) and (
                     not isinstance(p_pending, Mapping) or not p_pending.get(fund)
                 ):
                     raise EngineIdentityError(
@@ -2602,7 +2811,15 @@ def _assert_pending_state_preserves_committed_breakers(
             c_cnt_int = c_cnt if isinstance(c_cnt, int) and not isinstance(c_cnt, bool) else 0
             c_last = cf.get("last_session")
             pf = p_v5.get(fund) if isinstance(p_v5, Mapping) else None
-            if c_esc or c_cnt_int >= 40:
+            if (c_esc or c_cnt_int >= 40) and not _has_authorized_pending_clear(
+                authorized_events,
+                row_id="V5",
+                scope_kind="fund",
+                target=str(fund),
+                rej_ds=rej_ds,
+                expected_base_session_date=expected_base_session_date,
+                trip_session=cf.get("trip_session"),
+            ):
                 p_cnt_val = pf.get("consecutive_beyond_tolerance", 0) if isinstance(pf, Mapping) else -1
                 if (
                     not isinstance(pf, Mapping)
@@ -2636,6 +2853,16 @@ def _assert_pending_state_preserves_committed_breakers(
                 ps = p_o4.get(sym) if isinstance(p_o4, Mapping) else None
                 if ps is None and allowed_o4_resolved_symbols and sym in allowed_o4_resolved_symbols:
                     continue
+                if _has_authorized_pending_clear(
+                    authorized_events,
+                    row_id="O4",
+                    scope_kind="symbol",
+                    target=str(sym),
+                    rej_ds=rej_ds,
+                    expected_base_session_date=expected_base_session_date,
+                    trip_session=cs.get("trip_session"),
+                ):
+                    continue
                 if not isinstance(ps, Mapping) or ps.get("original_order_id") != cs["original_order_id"]:
                     raise EngineIdentityError(f"Pending state altered committed O4.{sym}")
 
@@ -2658,6 +2885,7 @@ def _assert_pending_state_preserves_committed_breakers(
                 expected_spec_version=expected_spec_version,
                 expected_base_session_date=expected_base_session_date,
                 allowed_o4_resolved_symbols=allowed_o4_resolved_symbols,
+                authorized_events=authorized_events,
             )
 
 
@@ -2798,6 +3026,11 @@ def load_pending_rejected_state_snapshot(
     elif expected_base_prior_state_sha256 is not None and base_obj is not None:
         eff_committed = base_obj
 
+    raw_auth = payload.get("authorized_events")
+    if raw_auth is not None:
+        if not isinstance(raw_auth, list) or not all(isinstance(ev, dict) for ev in raw_auth):
+            raise EngineIdentityError("Pending state authorized_events must be a list of dicts")
+
     if eff_committed is not None:
         raw_resolved = payload.get("o4_resolved_symbols")
         allowed_resolved = (
@@ -2813,6 +3046,7 @@ def load_pending_rejected_state_snapshot(
             expected_spec_version=expected_spec_version,
             expected_base_session_date=expected_base_session_date,
             allowed_o4_resolved_symbols=allowed_resolved,
+            authorized_events=raw_auth,
         )
 
     return state_obj, payload

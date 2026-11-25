@@ -73,6 +73,7 @@ from shadow.ledger import (
     is_utc_ms_timestamp,
     load_pending_rejected_state_snapshot,
     load_row_state_snapshot,
+    normalize_pending_authorized_events,
     o1_blocks_session_commit,
     parse_json_no_duplicates,
     save_pending_rejected_state_snapshot,
@@ -1864,6 +1865,7 @@ def run_daily_drill_cycle(
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = True,
     evaluator: object | None = None,
+    authorized_events: dict | list | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None = None,
     _post_record_commit_hook: Callable[[], None] | None = None,
     _post_report_json_hook: Callable[[], None] | None = None,
@@ -1894,6 +1896,7 @@ def run_daily_drill_cycle(
         revision_seq=revision_seq,
         allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
         evaluator=evaluator,
+        authorized_events=authorized_events,
         _post_ledger_commit_hook=_post_ledger_commit_hook,
         _post_record_commit_hook=_post_record_commit_hook,
         _post_report_json_hook=_post_report_json_hook,
@@ -1922,6 +1925,7 @@ def run_production_cycle(
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = False,
     evaluator: object | None = None,
+    authorized_events: dict | list | None = None,
     expected_prior_head_sha256: str | None = None,
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
@@ -1971,6 +1975,7 @@ def run_production_cycle(
         revision_seq=revision_seq,
         allow_unanchored_on_ots_failure=False,
         evaluator=ev,
+        authorized_events=authorized_events,
         expected_prior_head_sha256=expected_prior_head_sha256,
         expected_pending_state_sha256=expected_pending_state_sha256,
         bitcoin_merkle_roots=bitcoin_merkle_roots,
@@ -2003,6 +2008,7 @@ def _execute_cycle_with_config(
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
+    authorized_events: dict | list | None = None,
     expected_prior_head_sha256: str | None = None,
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
@@ -2081,6 +2087,7 @@ def _execute_cycle_with_config(
             revision_seq=revision_seq,
             allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
             evaluator=evaluator,
+            authorized_events=authorized_events,
             expected_prior_head_sha256=expected_prior_head_sha256,
             expected_pending_state_sha256=expected_pending_state_sha256,
             bitcoin_merkle_roots=bitcoin_merkle_roots,
@@ -2332,6 +2339,7 @@ def _reconcile_committed_state_snapshot_if_missing(
             "positions_source_record",
             "broker_reconciliation_source_record",
             "index_one_session_returns",
+            "authorized_events",
         ):
             if ctx_key in fctx and fctx[ctx_key] is not None:
                 rec_inputs[ctx_key] = fctx[ctx_key]
@@ -2972,6 +2980,7 @@ def _run_daily_drill_cycle_locked(
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
+    authorized_events: dict | list | None = None,
     expected_prior_head_sha256: str | None = None,
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
@@ -3601,6 +3610,8 @@ def _run_daily_drill_cycle_locked(
     prior_state: dict = {}
     prior_row_state_used: dict | None = None
     session_base_prior_state: dict = {}
+    prior_o4_resolved_symbols: list[str] = []
+    prior_authorized_events: list[dict] = []
     if not is_stub_evaluator(ev):
         committed_base_state: dict = {}
         expected_base_prior_sha = _sha256_canonical_state_dict({})
@@ -3644,13 +3655,15 @@ def _run_daily_drill_cycle_locked(
             expected_pending_state_sha256=expected_pending_state_sha256,
             require_external_pending_auth=(cfg.mode == "production"),
         )
-        prior_o4_resolved_symbols: list[str] = []
         if pending_rej is not None:
             prior_state = pending_rej[0]
             prior_o4_resolved_symbols = [
                 str(s) for s in (pending_rej[1].get("o4_resolved_symbols") or ())
                 if isinstance(s, str) and s
             ]
+            prior_authorized_events = normalize_pending_authorized_events(
+                pending_rej[1].get("authorized_events")
+            )
             prior_row_state_used = copy.deepcopy(prior_state)
             session_base_prior_state = (
                 copy.deepcopy(committed_base_state) if head_env is not None else {}
@@ -3659,14 +3672,11 @@ def _run_daily_drill_cycle_locked(
             prior_state = committed_base_state
             session_base_prior_state = copy.deepcopy(committed_base_state)
     elif head_env is not None:
-        prior_o4_resolved_symbols = []
         breakers = head_env["record_body"]["evaluator"]["breakers"]
         prior_state = {
             b["id"]: {"state": b["state"], "latched": b["latched"], "reason": b["reason"]}
             for b in breakers
         }
-    else:
-        prior_o4_resolved_symbols = []
 
     decision_utc = _format_utc_ms(clock_fn())
     prior_closes: dict[str, str] = {}
@@ -3724,7 +3734,7 @@ def _run_daily_drill_cycle_locked(
                 mode=ev_mode,
                 validated_inputs=ev_validated,
                 prior_row_state=prior_state,
-                authorized_events=None,
+                authorized_events=authorized_events,
             )
             o4_resolved: list[str] = []
         else:
@@ -3736,7 +3746,7 @@ def _run_daily_drill_cycle_locked(
                 session_date=session_date,
                 decision_timestamp_utc=decision_utc,
                 prior_row_state=prior_state,
-                authorized_events=None,
+                authorized_events=authorized_events,
             )
             rows_by_id = tiered_eval["rows_by_id"]
             eff_scope = tiered_eval["effective_state_by_scope"]
@@ -3766,6 +3776,8 @@ def _run_daily_drill_cycle_locked(
                     **({"prior_closes": prior_closes} if prior_closes else {}),
                 }
             )
+            if authorized_events is not None:
+                cycle_inputs["authorized_events"] = copy.deepcopy(authorized_events)
             cycle_labels = (
                 {
                     "production_chain": True,
@@ -3809,6 +3821,9 @@ def _run_daily_drill_cycle_locked(
                 if isinstance(s, str) and s
             }
         )
+        merged_authorized_events = normalize_pending_authorized_events(
+            prior_authorized_events + normalize_pending_authorized_events(authorized_events)
+        )
         pending_payload = build_pending_rejected_state_payload(
             chain_id=cfg.chain_id,
             base_sequence=seq - 1,
@@ -3819,6 +3834,7 @@ def _run_daily_drill_cycle_locked(
             next_row_state=built["next_row_state"],
             base_prior_row_state=session_base_prior_state,
             o4_resolved_symbols=merged_o4_resolved,
+            authorized_events=merged_authorized_events or None,
         )
         save_pending_rejected_state_snapshot(
             snapshots_dir,
@@ -3831,6 +3847,7 @@ def _run_daily_drill_cycle_locked(
             next_row_state=built["next_row_state"],
             base_prior_row_state=session_base_prior_state,
             o4_resolved_symbols=merged_o4_resolved,
+            authorized_events=merged_authorized_events or None,
         )
         pending_sha_val = compute_pending_rejected_state_sha256(pending_payload)
         if anchor_resolved is not None:
@@ -3947,6 +3964,8 @@ def _run_daily_drill_cycle_locked(
         }
         if prior_row_state_used is not None:
             fctx["prior_row_state_used"] = prior_row_state_used
+        if authorized_events is not None:
+            fctx["authorized_events"] = copy.deepcopy(authorized_events)
         session_entry["fuse_context"] = fctx
     env = _commit_drill_session_atomically(
         ledger=ledger,

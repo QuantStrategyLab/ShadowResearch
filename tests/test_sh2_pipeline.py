@@ -2816,6 +2816,371 @@ class Sh2PipelineTest(unittest.TestCase):
                     expected_base_session_date="2026-01-05",
                 )
 
+    def test_authorized_l4_rearm_during_o1_rejection_persists_and_blocks_forged_clearing(self) -> None:
+        from shadow.ledger import build_pending_rejected_state_payload
+
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal5 = resolve_session("XNYS", "2026-01-05", spec=spec_v2)
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+        cal7 = resolve_session("XNYS", "2026-01-07", spec=spec_v2)
+        cfg = load_scheduler_config(_REPO_ROOT / "config" / "drill-scheduler.json")
+        code_sha = compute_code_manifest_hash()
+
+        def _make_si(ts: str, *, e_val: str, prior_e_val: str, e_star_val: str) -> dict:
+            return {
+                "E": e_val,
+                "E_star": e_star_val,
+                "prior_E": prior_e_val,
+                "H": "0",
+                "L": "0",
+                "positions_source_record": {"as_of": ts, "age_sessions": 0},
+                "broker_reconciliation_source_record": {"as_of": ts, "age_sessions": 0},
+                "index_one_session_returns": {"NDX": 0.0, "SEMI": 0.0},
+                "market_records": [
+                    {
+                        "instrument": inst,
+                        "normalized_value": 50.0,
+                        "calendar_spec_digest": str(cal5["spec_digest"]),
+                        "eligibility": {"eligible": True},
+                    }
+                    for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
+                ],
+                "funds": {
+                    "TQQQ": {
+                        "s": "1",
+                        "close_price": "50",
+                        "q_pre": 100,
+                        "sigma_forecast": "0.24",
+                        "fund_return": 0.0,
+                        "index_return": 0.0,
+                    },
+                    "SOXL": {
+                        "s": "1",
+                        "close_price": "40",
+                        "q_pre": 100,
+                        "sigma_forecast": "0.22",
+                        "fund_return": 0.0,
+                        "index_return": 0.0,
+                    },
+                },
+            }
+
+        # Jan 5: one-session loss >= D/10 (E=48000 vs prior_E=50000 -> -4%) commits L4 latch
+        si5 = _make_si(
+            "2026-01-05T22:00:00.000Z", e_val="48000", prior_e_val="50000", e_star_val="50000"
+        )
+        b0 = build_record_body(
+            chain_id=cfg.chain_id,
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=si5,
+            calendar_session=cal5,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state={},
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(b0["appended"])
+        committed_state = b0["next_row_state"]
+        self.assertTrue(committed_state["L4"]["latched"])
+        committed_sha = _sha256_canonical_state_dict(committed_state)
+        rec0_sha = sha256_canonical(b0["record_body"])
+
+        # Jan 6: missing positions triggers O1 reject while owner rearms L4 (account scope)
+        si6 = _make_si(
+            "2026-01-06T22:00:00.000Z", e_val="48000", prior_e_val="48000", e_star_val="50000"
+        )
+        si6["positions_source_record"] = None
+        valid_rearm = {"account": [{"type": "rearm", "row": "L4", "session": "2026-01-06"}]}
+        si6["authorized_events"] = valid_rearm
+        b1_rej = build_record_body(
+            chain_id=cfg.chain_id,
+            sequence=1,
+            prev_record_sha256=rec0_sha,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=si6,
+            calendar_session=cal6,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state=committed_state,
+            calendar_spec=spec_v2,
+        )
+        self.assertFalse(b1_rej["appended"])
+        self.assertEqual(b1_rej["next_row_state"].get("L4", {}), {})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sdir = Path(tmpdir) / "state_snapshots"
+            pending_payload = build_pending_rejected_state_payload(
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=b1_rej["next_row_state"],
+                base_prior_row_state=committed_state,
+                authorized_events=valid_rearm,
+            )
+            p_path = save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=b1_rej["next_row_state"],
+                base_prior_row_state=committed_state,
+                authorized_events=valid_rearm,
+            )
+            self.assertEqual(
+                compute_pending_rejected_state_sha256(pending_payload),
+                compute_pending_rejected_state_sha256(
+                    json.loads(p_path.read_text(encoding="utf-8"))
+                ),
+            )
+            for cur_ds in ("2026-01-06", "2026-01-07"):
+                loaded_state, loaded_payload = load_pending_rejected_state_snapshot(
+                    sdir,
+                    expected_chain_id=cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=rec0_sha,
+                    current_session_date=cur_ds,
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_base_prior_state_sha256=committed_sha,
+                    committed_base_prior_row_state=committed_state,
+                    expected_base_session_date="2026-01-05",
+                )
+                self.assertFalse(bool(loaded_state.get("L4", {}).get("latched")))
+                self.assertIsInstance(loaded_payload.get("authorized_events"), list)
+
+            # Jan 7 commits cleanly from loaded pending state with L4 cleared
+            si7 = _make_si(
+                "2026-01-07T22:00:00.000Z", e_val="48000", prior_e_val="48000", e_star_val="50000"
+            )
+            b1_ok = build_record_body(
+                chain_id=cfg.chain_id,
+                sequence=1,
+                prev_record_sha256=rec0_sha,
+                mode="drill",
+                session_date="2026-01-07",
+                decision_timestamp_utc="2026-01-07T22:00:00.000Z",
+                session_inputs=si7,
+                calendar_session=cal7,
+                code_version_sha=code_sha,
+                evaluator=ev,
+                prior_row_state=loaded_state,
+                calendar_spec=spec_v2,
+            )
+            self.assertTrue(b1_ok["appended"])
+            self.assertFalse(bool(b1_ok["next_row_state"].get("L4", {}).get("latched")))
+
+            # Fail-closed tamper cases: missing authorized_events, stale session, wrong scope, malformed
+            bad_cases: list[tuple[dict | list | None, str]] = [
+                (None, "Pending state downgraded or cleared committed L4 latch"),
+                (
+                    {"account": [{"type": "rearm", "row": "L4", "session": "2026-01-05"}]},
+                    "Pending state downgraded or cleared committed L4 latch",
+                ),
+                (
+                    {"fund:TQQQ": [{"type": "rearm", "row": "L4", "session": "2026-01-06"}]},
+                    "Pending state downgraded or cleared committed L4 latch",
+                ),
+                (
+                    [{"type": "rearm", "row": "L4", "fund": "TQQQ", "session": "2026-01-06"}],
+                    "Pending state downgraded or cleared committed L4 latch",
+                ),
+            ]
+            for bad_auth, expected_msg in bad_cases:
+                save_pending_rejected_state_snapshot(
+                    sdir,
+                    chain_id=cfg.chain_id,
+                    base_sequence=0,
+                    base_record_sha256=rec0_sha,
+                    rejected_session_date="2026-01-06",
+                    engine_hash=ev.engine_hash,
+                    spec_version=ev.spec_version,
+                    next_row_state=b1_rej["next_row_state"],
+                    base_prior_row_state=committed_state,
+                    authorized_events=bad_auth,
+                )
+                with self.assertRaisesRegex(EngineIdentityError, expected_msg):
+                    load_pending_rejected_state_snapshot(
+                        sdir,
+                        expected_chain_id=cfg.chain_id,
+                        expected_base_sequence=0,
+                        expected_base_record_sha256=rec0_sha,
+                        current_session_date="2026-01-07",
+                        expected_engine_hash=ev.engine_hash,
+                        expected_spec_version=ev.spec_version,
+                        expected_base_prior_state_sha256=committed_sha,
+                        committed_base_prior_row_state=committed_state,
+                        expected_base_session_date="2026-01-05",
+                    )
+
+            # Malformed authorized_events list type in snapshot file rejected cleanly
+            malformed_payload = build_pending_rejected_state_payload(
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=b1_rej["next_row_state"],
+                base_prior_row_state=committed_state,
+            )
+            malformed_payload["authorized_events"] = ["not-a-dict"]
+            (sdir / "pending_rejected_state.json").write_text(
+                json.dumps(malformed_payload) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                EngineIdentityError, "Pending state authorized_events must be a list of dicts"
+            ):
+                load_pending_rejected_state_snapshot(
+                    sdir,
+                    expected_chain_id=cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=rec0_sha,
+                    current_session_date="2026-01-07",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_base_prior_state_sha256=committed_sha,
+                    committed_base_prior_row_state=committed_state,
+                    expected_base_session_date="2026-01-05",
+                )
+
+            # L3 cooling-off enforcement: premature rearm rejected, on/after cooling_off_until allowed
+            l3_committed = {
+                "L3": {
+                    "latched": True,
+                    "trip_session": "2026-01-05",
+                    "cooling_off_until": "2026-02-04",
+                }
+            }
+            l3_committed_sha = _sha256_canonical_state_dict(l3_committed)
+            l3_cleared = {"L3": {"latched": False}}
+            save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-02-03",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=l3_cleared,
+                base_prior_row_state=l3_committed,
+                authorized_events={
+                    "account": [{"type": "rearm", "row": "L3", "session": "2026-02-03"}]
+                },
+            )
+            with self.assertRaisesRegex(
+                EngineIdentityError, "Pending state downgraded or cleared committed L3 latch"
+            ):
+                load_pending_rejected_state_snapshot(
+                    sdir,
+                    expected_chain_id=cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=rec0_sha,
+                    current_session_date="2026-02-03",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_base_prior_state_sha256=l3_committed_sha,
+                    committed_base_prior_row_state=l3_committed,
+                    expected_base_session_date="2026-01-05",
+                )
+
+            save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-02-04",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=l3_cleared,
+                base_prior_row_state=l3_committed,
+                authorized_events={
+                    "account": [{"type": "rearm", "row": "L3", "session": "2026-02-04"}]
+                },
+            )
+            l3_loaded, _ = load_pending_rejected_state_snapshot(
+                sdir,
+                expected_chain_id=cfg.chain_id,
+                expected_base_sequence=0,
+                expected_base_record_sha256=rec0_sha,
+                current_session_date="2026-02-04",
+                expected_engine_hash=ev.engine_hash,
+                expected_spec_version=ev.spec_version,
+                expected_base_prior_state_sha256=l3_committed_sha,
+                committed_base_prior_row_state=l3_committed,
+                expected_base_session_date="2026-01-05",
+            )
+            self.assertFalse(bool(l3_loaded.get("L3", {}).get("latched")))
+
+    def test_scheduler_authorized_events_pending_clear_replays_bit_for_bit(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "sched_auth_clear"
+            f5 = Path(tmpdir) / "f5"
+            _build_session_fixture_files(f5, "2026-01-05")
+            f6_bad = Path(tmpdir) / "f6_bad"
+            _build_session_fixture_files(f6_bad, "2026-01-06")
+            (f6_bad / "treasury_tbill_2026-01-06.csv").unlink()
+            f7 = Path(tmpdir) / "f7"
+            _build_session_fixture_files(f7, "2026-01-07")
+
+            # Jan 5: commit O8 kill_switch latch
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                authorized_events={"account": [{"type": "kill_switch", "session": "2026-01-05"}]},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r0["appended"])
+            recs0 = ShadowLedger(root / "ledger").load_records()
+            b0_o8 = {b["id"]: b for b in recs0[-1]["record_body"]["evaluator"]["breakers"]}["O8"]
+            self.assertTrue(b0_o8["latched"])
+
+            # Jan 6: O1 missing treasury rejection + valid kill_switch_clear clears O8 in pending
+            r1_rej = run_daily_drill_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f6_bad,
+                authorized_events={
+                    "account": [{"type": "kill_switch_clear", "session": "2026-01-06"}]
+                },
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(r1_rej["appended"])
+            self.assertTrue(r1_rej["fail_closed"])
+
+            # Jan 7: clean session loads pending state (preserving prior O8 clear) and replays cleanly
+            r1_ok = run_daily_drill_cycle(
+                session_date="2026-01-07",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f7,
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r1_ok["appended"])
+            recs1 = ShadowLedger(root / "ledger").load_records()
+            self.assertEqual(len(recs1), 2)
+            b1_o8 = {b["id"]: b for b in recs1[-1]["record_body"]["evaluator"]["breakers"]}["O8"]
+            self.assertFalse(b1_o8["latched"])
+
+            rep = replay_window(root / "replay", root / "ledger")
+            self.assertTrue(rep["bit_for_bit_match"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -437,6 +437,7 @@ def replay_window(
                     "positions_source_record",
                     "broker_reconciliation_source_record",
                     "index_one_session_returns",
+                    "authorized_events",
                 ):
                     if ctx_key in fctx and fctx[ctx_key] is not None and ctx_key not in replay_inputs:
                         replay_inputs[ctx_key] = fctx[ctx_key]
