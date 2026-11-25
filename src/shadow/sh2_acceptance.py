@@ -185,6 +185,8 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
         },
     ]
 
+    demo_passed = demo_out.get("passed", 0) if isinstance(demo_out, dict) else 0
+    demo_total = demo_out.get("total", 0) if isinstance(demo_out, dict) else 0
     overall_ok = (
         demo_all_passed
         and spec_digest_ok
@@ -194,7 +196,7 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
     return {
         "schema_version": "sh2-acceptance-report/v1",
         "overall_status": "PASS_OFFLINE" if overall_ok else "FAILED",
-        "demo_cases_passed": f"{demo_out['passed']}/{demo_out['total']}",
+        "demo_cases_passed": f"{demo_passed}/{demo_total}",
         "oa_sh2_2_locked": True,
         "pinned_identities": {
             "fuse_spec_version": PINNED_FUSE_SPEC_VERSION,

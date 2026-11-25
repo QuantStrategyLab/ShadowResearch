@@ -516,6 +516,41 @@ class SizingStackTest(unittest.TestCase):
         bal_trim = _tier(trim_res, "balanced")
         self.assertEqual(_fund(bal_trim, "TQQQ")["delta_q_exec"], -1)
 
+    def test_no_new_risk_clamp_holds_under_j1_trim_and_unknown_state_rejected(self) -> None:
+        # Rank-1 tie: J1_TRIM at tier/account level MUST NOT defeat fund NO-NEW-RISK buy clamp.
+        res = compute_session_sizing(
+            _make_inputs(E="50000", E_star="50000", q_pre_tqqq=0, q_pre_soxl=0),
+            active_control_state="NORMAL",
+            tier_control_states={"balanced": ("J1_TRIM", {"TQQQ": "NO-NEW-RISK", "SOXL": "NORMAL"})},
+        )
+        bal = _tier(res, "balanced")
+        self.assertEqual(_fund(bal, "TQQQ")["q_ideal"], 0)
+        self.assertEqual(_fund(bal, "TQQQ")["delta_q_exec"], 0)
+        self.assertGreater(_fund(bal, "SOXL")["q_ideal"], 0)
+
+        for bad_kwargs in (
+            {"active_control_state": "BOGUS"},
+            {"fund_control_states": {"TQQQ": "NO_NEW_RISK"}},
+            {"tier_control_states": {"balanced": ("NORMAL", {"SOXL": "UNKNOWN"})}},
+        ):
+            with self.assertRaises(SizingInputError):
+                compute_session_sizing(_make_inputs(E="50000", E_star="50000"), **bad_kwargs)  # type: ignore[arg-type]
+
+    def test_code_manifest_hash_distinguishes_same_filename_config_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_repo = Path(tmpdir)
+            (tmp_repo / "dir_a").mkdir()
+            (tmp_repo / "dir_b").mkdir()
+            cfg_a = tmp_repo / "dir_a" / "shared.json"
+            cfg_b = tmp_repo / "dir_b" / "shared.json"
+            payload = '{"calendar_version":"csa22-v2","mode":"drill"}\n'
+            cfg_a.write_text(payload, encoding="utf-8")
+            cfg_b.write_text(payload, encoding="utf-8")
+            self.assertNotEqual(
+                compute_code_manifest_hash(tmp_repo, config_path=cfg_a),
+                compute_code_manifest_hash(tmp_repo, config_path=cfg_b),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

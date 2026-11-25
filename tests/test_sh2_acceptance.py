@@ -70,6 +70,15 @@ class Sh2AcceptanceTest(unittest.TestCase):
         check_a06 = next(c for c in rep["checks"] if c["id"] == "SH2-A06")
         self.assertEqual(check_a06["status"], "FAILED")
 
+    def test_sh2_acceptance_handles_malformed_demo_output_without_keyerror(self) -> None:
+        from unittest import mock
+
+        for malformed in ({}, None):
+            with mock.patch("run_sh2_demo.run_all_demos", return_value=malformed):
+                rep = run_sh2_acceptance(_REPO_ROOT)
+            self.assertEqual(rep["overall_status"], "FAILED")
+            self.assertEqual(rep["demo_cases_passed"], "0/0")
+
 
 if __name__ == "__main__":
     unittest.main()

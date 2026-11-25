@@ -395,12 +395,22 @@ _CONTROL_STATE_RANK = {
 }
 
 
+def _validate_control_state(state: object, field: str) -> str:
+    if not isinstance(state, str) or state not in _CONTROL_STATE_RANK:
+        raise SizingInputError(field, f"Unknown control state for {field}: {state!r}")
+    return state
+
+
 def _most_restrictive_sizing_state(base_state: str, fund_state: str | None) -> str:
-    if fund_state is None or fund_state == base_state:
-        return base_state
-    if _CONTROL_STATE_RANK.get(fund_state, 0) > _CONTROL_STATE_RANK.get(base_state, 0):
-        return fund_state
-    return base_state
+    valid_base = _validate_control_state(base_state, "base_control_state")
+    if fund_state is None:
+        return valid_base
+    valid_fund = _validate_control_state(fund_state, "fund_control_state")
+    if valid_fund == valid_base:
+        return valid_base
+    if _CONTROL_STATE_RANK[valid_fund] > _CONTROL_STATE_RANK[valid_base]:
+        return valid_fund
+    return valid_base
 
 
 def compute_tier_max_loss_fraction(
@@ -512,6 +522,13 @@ def compute_session_sizing(
         ln_one_minus_shock = (Decimal("1") - Decimal("0.83")).ln()
         conv_scale = Decimal("1") + (h_val / e_star)
 
+        _validate_control_state(active_control_state, "active_control_state")
+        if fund_control_states is not None:
+            if not isinstance(fund_control_states, Mapping):
+                raise SizingInputError("fund_control_states", "fund_control_states must be a mapping")
+            for fk, fv in fund_control_states.items():
+                _validate_control_state(fv, f"fund_control_states.{fk}")
+
         tiers_out: list[dict] = []
         for tier_id in TIER_ORDER:
             tc = TIER_CONFIGS[tier_id]
@@ -556,6 +573,15 @@ def compute_session_sizing(
             t_fund_states = fund_control_states
             if tier_control_states is not None and tier_id in tier_control_states:
                 t_acct_state, t_fund_states = tier_control_states[tier_id]
+            _validate_control_state(t_acct_state, f"{tier_id}.control_state")
+            if t_fund_states is not None:
+                if not isinstance(t_fund_states, Mapping):
+                    raise SizingInputError(
+                        f"{tier_id}.fund_control_states",
+                        "tier fund_control_states must be a mapping",
+                    )
+                for fk, fv in t_fund_states.items():
+                    _validate_control_state(fv, f"{tier_id}.fund_control_states.{fk}")
 
             eff_states: dict[str, str] = {
                 inst: _most_restrictive_sizing_state(
@@ -689,7 +715,16 @@ def compute_session_sizing(
                 q_ideal = int((w_tgt_eff * e_val / p_ref).to_integral_value(rounding=ROUND_FLOOR))
                 q_pre_i = q_pre_map[inst]
                 no_new_risk_clamped = False
-                if eff_state == "NO-NEW-RISK" and q_ideal > q_pre_i:
+                no_new_risk_active = (
+                    eff_state == "NO-NEW-RISK"
+                    or t_acct_state == "NO-NEW-RISK"
+                    or (t_fund_states or {}).get(inst) == "NO-NEW-RISK"
+                )
+                if (
+                    no_new_risk_active
+                    and eff_state not in ("HALT", "ORDER-UNKNOWN", "DE-RISK")
+                    and q_ideal > q_pre_i
+                ):
                     q_ideal = q_pre_i
                     no_new_risk_clamped = True
                 w_cur_i = w_cur_map[inst]

@@ -121,7 +121,13 @@ def compute_code_manifest_hash(
     cal_ver = cal_ver or "csa22-v1"
 
     targets: list[tuple[str, Path]] = [(rel, root / rel) for rel in RUNTIME_MODULE_FILES]
-    cfg_rel = "config/drill-scheduler.json" if config_path is None else f"config/{cfg_file.name}"
+    if config_path is None:
+        cfg_rel = "config/drill-scheduler.json"
+    else:
+        try:
+            cfg_rel = cfg_file.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            cfg_rel = f"external/{cfg_file.resolve().as_posix().lstrip('/')}"
     targets.append((cfg_rel, cfg_file))
     targets.append((f"specs/{cal_ver}/manifest.json", root / "specs" / cal_ver / "manifest.json"))
 

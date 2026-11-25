@@ -160,7 +160,7 @@ class CloudRunJobTest(unittest.TestCase):
             )
             # Without fake wall_clock in subprocess, current wall clock (2026-11) exceeds 2026-01-06 cutoff -> fails closed!
             # So invoke run_cloudrun_job via inline script with explicit 2026-01-06 clock for clean restart check:
-            self.assertEqual(proc2.returncode, 0)
+            self.assertEqual(proc2.returncode, 1)
             p2_out = json.loads(proc2.stdout)
             self.assertEqual(p2_out["status"], "fail_closed")
             self.assertFalse(p2_out["appended"])

@@ -348,6 +348,27 @@ class FeederTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_treasury_tbill_row(bad_treasury, "2025-11-21")
 
+    def test_tiingo_rejects_non_utc_midnight_marker_and_naive_publication_timestamp(self) -> None:
+        non_utc_midnight = json.dumps(
+            [{"date": "2025-11-21T00:00:00+09:00", "close": 47.48, "divCash": 0.0, "splitFactor": 1.0}]
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "session_not_in_payload"):
+            select_tiingo_row(non_utc_midnight, "2025-11-21")
+
+        naive_pub = json.dumps(
+            [
+                {
+                    "date": "2025-11-21T00:00:00.000Z",
+                    "close": 47.48,
+                    "divCash": 0.0,
+                    "splitFactor": 1.0,
+                    "publicationTimestamp": "2025-11-21T16:00:00",
+                }
+            ]
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "tiingo_invalid_timestamp"):
+            select_tiingo_row(naive_pub, "2025-11-21")
+
 
 if __name__ == "__main__":
     unittest.main()

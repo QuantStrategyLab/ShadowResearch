@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import math
+import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -322,12 +323,20 @@ def _validate_core_rth_bar_timestamp(
     txt = raw_ts.strip()
     if allow_midnight_date_marker:
         if len(txt) == 10:
+            try:
+                date.fromisoformat(txt)
+            except ValueError as exc:
+                raise ValueError("tiingo_invalid_timestamp") from exc
             if txt > session_date:
                 raise ValueError("next_trade_date_contamination")
             return
-        if "T00:00:00" in txt and (txt.endswith("Z") or "+" in txt or txt.endswith("-00:00")):
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}T00:00:00(?:\.\d+)?(?:Z|[+-]00:00)", txt):
             # Canonical Tiingo midnight-UTC daily session marker ("YYYY-MM-DDT00:00:00.000Z")
             row_d = txt[:10]
+            try:
+                date.fromisoformat(row_d)
+            except ValueError as exc:
+                raise ValueError("tiingo_invalid_timestamp") from exc
             if row_d > session_date:
                 raise ValueError("next_trade_date_contamination")
             return
@@ -402,7 +411,10 @@ def _validate_tiingo_official_close_row(
         pub = str(row["publicationTimestamp"]).strip()
         iso_pub = pub[:-1] + "+00:00" if pub.endswith("Z") else pub
         try:
-            pub_ny = datetime.fromisoformat(iso_pub).astimezone(_NY_TZ)
+            pub_dt = datetime.fromisoformat(iso_pub)
+            if pub_dt.tzinfo is None:
+                raise ValueError("tiingo_invalid_timestamp")
+            pub_ny = pub_dt.astimezone(_NY_TZ)
         except ValueError as exc:
             raise ValueError("tiingo_invalid_timestamp") from exc
         pub_limit = max_publication_date or session_date

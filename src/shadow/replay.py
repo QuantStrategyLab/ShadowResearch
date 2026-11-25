@@ -346,6 +346,9 @@ def replay_window(
             and stored_labels.get("forward_clock_credit_eligible") is False
             and stored_assertions.get("forward_clock_credit_eligible") is False
         )
+        expected_required_series = (
+            Y2_REQUIRED_MARKET_SERIES if is_noncreditable_y2_session else REQUIRED_MARKET_SERIES
+        )
         has_mkt_key = "market_records" in sess
         declared_digest = sess.get("market_records_digest")
         requires_market_records = declared_archive or has_mkt_key or (declared_digest is not None)
@@ -379,9 +382,6 @@ def replay_window(
                         else None
                     )
 
-                expected_required_series = (
-                    Y2_REQUIRED_MARKET_SERIES if is_noncreditable_y2_session else REQUIRED_MARKET_SERIES
-                )
                 by_inst: dict[str, dict] = {}
                 seen_instruments: set[str] = set()
                 for idx, mrec in enumerate(mkt_records):
@@ -487,9 +487,22 @@ def replay_window(
         replay_inputs = dict(sess["inputs"])
         eff_prior_state = prior_state
         if not is_stub_evaluator(ev):
-            if "market_records" in sess and "market_records" not in replay_inputs:
+            if "market_records" in sess:
+                if (
+                    "market_records" in replay_inputs
+                    and replay_inputs["market_records"] != sess["market_records"]
+                ):
+                    archive_errors.append(f"seq_{seq}:shadowed_inputs_market_records")
+                if (
+                    "required_series" in replay_inputs
+                    and (
+                        not isinstance(replay_inputs["required_series"], (list, tuple))
+                        or list(replay_inputs["required_series"]) != list(expected_required_series)
+                    )
+                ):
+                    archive_errors.append(f"seq_{seq}:shadowed_inputs_required_series")
                 replay_inputs["market_records"] = sess["market_records"]
-                replay_inputs.setdefault("required_series", expected_required_series)
+                replay_inputs["required_series"] = expected_required_series
             fctx = sess.get("fuse_context")
             if isinstance(fctx, Mapping):
                 for ctx_key in (
@@ -499,7 +512,7 @@ def replay_window(
                     "index_one_session_returns",
                     "authorized_events",
                 ):
-                    if ctx_key in fctx and fctx[ctx_key] is not None and ctx_key not in replay_inputs:
+                    if ctx_key in fctx and fctx[ctx_key] is not None:
                         replay_inputs[ctx_key] = fctx[ctx_key]
                 apply_fund_long_run_volatility(replay_inputs, fctx.get("long_run_vol_by_inst"))
                 if fctx.get("prior_row_state_used") is not None:

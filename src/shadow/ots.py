@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import struct
 import time
@@ -597,7 +598,7 @@ def urllib_ots_transport(
             deadline_monotonic=eff_deadline,
         )
         return int(exc.code), err_body
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
         raise OtsSubmitError(f"ots_transport_error:{type(exc).__name__}") from exc
 
 

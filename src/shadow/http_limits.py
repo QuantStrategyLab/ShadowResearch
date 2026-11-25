@@ -404,6 +404,9 @@ def read_bounded_http_body(
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
         raise ValueError("chunk_size must be a positive integer")
 
+    non_size_prefix = (
+        error_prefix[: -len("_too_large")] if error_prefix.endswith("_too_large") else error_prefix
+    )
     declared: int | None = None
     is_chunked = bool(getattr(stream, "chunked", False))
     if isinstance(content_length_header, str) and not is_chunked:
@@ -413,10 +416,10 @@ def read_bounded_http_body(
             parsed_lengths: set[int] = set()
             for part in parts:
                 if not part or not part.isascii() or not part.isdigit():
-                    raise error_cls(f"{error_prefix}:invalid_content_length")
+                    raise error_cls(f"{non_size_prefix}:invalid_content_length")
                 parsed_lengths.add(int(part))
             if len(parsed_lengths) != 1:
-                raise error_cls(f"{error_prefix}:invalid_content_length")
+                raise error_cls(f"{non_size_prefix}:invalid_content_length")
             declared = next(iter(parsed_lengths))
             if declared > max_bytes:
                 raise error_cls(f"{error_prefix}:content_length_exceeds_{max_bytes}")
@@ -431,15 +434,15 @@ def read_bounded_http_body(
         if deadline_monotonic is not None:
             rem = _remaining_timeout(deadline_monotonic, clock=clock)
             if rem <= 0:
-                raise error_cls(f"{error_prefix}:deadline_exceeded")
+                raise error_cls(f"{non_size_prefix}:deadline_exceeded")
             _set_stream_socket_timeout(stream, rem)
         to_read = min(chunk_size, (max_bytes - total) + 1)
         try:
             chunk = read_fn(to_read)
         except TimeoutError as exc:
-            raise error_cls(f"{error_prefix}:deadline_exceeded") from exc
+            raise error_cls(f"{non_size_prefix}:deadline_exceeded") from exc
         except http.client.IncompleteRead as exc:
-            raise error_cls(f"{error_prefix}:incomplete_body") from exc
+            raise error_cls(f"{non_size_prefix}:incomplete_body") from exc
         if not chunk:
             break
         chunks.append(chunk)
@@ -447,13 +450,13 @@ def read_bounded_http_body(
         if total > max_bytes:
             raise error_cls(f"{error_prefix}:response_exceeds_{max_bytes}_bytes")
         if deadline_monotonic is not None and clock() > deadline_monotonic:
-            raise error_cls(f"{error_prefix}:deadline_exceeded")
+            raise error_cls(f"{non_size_prefix}:deadline_exceeded")
     if not is_chunked:
         if declared is not None and total < declared:
-            raise error_cls(f"{error_prefix}:incomplete_body:{total}_of_{declared}")
+            raise error_cls(f"{non_size_prefix}:incomplete_body:{total}_of_{declared}")
         remaining = getattr(stream, "length", None)
         if isinstance(remaining, int) and not isinstance(remaining, bool) and remaining > 0:
-            raise error_cls(f"{error_prefix}:incomplete_body:remaining_{remaining}")
+            raise error_cls(f"{non_size_prefix}:incomplete_body:remaining_{remaining}")
     return b"".join(chunks)
 
 

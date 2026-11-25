@@ -113,7 +113,9 @@ def run_cloudrun_job(
     gate_report = verify_f1_entry_gates(require_read_only=False)
     ev = VendoredFuseEvaluator(require_read_only=False)
 
-    raw_cfg = json.loads(eff_config_path.read_text(encoding="utf-8"))
+    raw_cfg = parse_json_no_duplicates(eff_config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_cfg, dict):
+        raise ValueError(f"invalid_runtime_config_type:{type(raw_cfg).__name__}")
     target_mode = mode or env.get("SHADOW_CHAIN_MODE") or str(raw_cfg.get("mode", "drill"))
 
     if target_mode == "production":
@@ -337,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     print(json.dumps(out, indent=2, sort_keys=True))
-    return 0
+    return 1 if out.get("fail_closed") else 0
 
 
 if __name__ == "__main__":

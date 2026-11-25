@@ -342,14 +342,14 @@ def classify_us_equity_session_window(
     local_t = dt_local.time()
     trade_date = str(calendar_session.get("trade_date", ""))
 
-    if local_t >= time(20, 0) or local_t < time(4, 0):
-        return "extended_overnight_open"
     if not calendar_session.get("is_trading_day") or calendar_session.get("blocks_eligibility"):
         return "closed"
     if local_date_str > trade_date:
         return "next_trade_date_window"
     if local_date_str < trade_date:
         return "closed"
+    if local_t >= time(20, 0) or local_t < time(4, 0):
+        return "extended_overnight_open"
 
     close_hhmm = str(calendar_session.get("close_local") or "16:00")
     ch, cm = map(int, close_hhmm.split(":"))

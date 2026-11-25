@@ -2369,6 +2369,30 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(dist_only["type"], "distribution")
         self.assertEqual(dist_only["cash_per_share_usd"], 0.5)
 
+    def test_defensive_bounds_omitted_trade_date_and_clears_stale_max_loss_cap(self) -> None:
+        from decimal import Decimal
+        from shadow.fuse_adapter import (
+            _apply_explicit_payload_tier,
+            _finite_number,
+            _map_calendar_statuses,
+        )
+
+        self.assertIsNone(_finite_number(Decimal("1e400")))
+        self.assertEqual(
+            _map_calendar_statuses(
+                {"session_state": "regular", "is_trading_day": True, "blocks_eligibility": False},
+                session_date="2026-01-05",
+            ),
+            (None, None),
+        )
+        updated = _apply_explicit_payload_tier(
+            {"tier": "aggressive", "max_loss_cap": 12345.0},
+            {"tier": "conservative"},
+            policy_hash="a" * 64,
+        )
+        self.assertEqual(updated["tier"], "conservative")
+        self.assertNotIn("max_loss_cap", updated)
+
 
 if __name__ == "__main__":
     unittest.main()

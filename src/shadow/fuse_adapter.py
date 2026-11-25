@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import marshal
+import math
 import re
 import sys
 import types
@@ -582,6 +583,8 @@ def _finite_number(raw: object) -> float | None:
     if not dec.is_finite():
         return None
     val = float(dec)
+    if not math.isfinite(val):
+        return None
     return val
 
 
@@ -599,7 +602,7 @@ def _map_calendar_statuses(
 ) -> tuple[str | None, str | None]:
     if not isinstance(calendar_session, Mapping):
         return None, None
-    if session_date is not None and "trade_date" in calendar_session:
+    if session_date is not None:
         raw_td = calendar_session.get("trade_date")
         if raw_td is None or str(raw_td) != str(session_date):
             return None, None
@@ -1039,6 +1042,8 @@ def _apply_explicit_payload_tier(
             )
             if derived_cap is not None:
                 payload["max_loss_cap"] = derived_cap
+            else:
+                payload.pop("max_loss_cap", None)
     else:
         payload.setdefault("tier", "balanced")
     payload.setdefault("loaded_policy_hash", policy_hash)
