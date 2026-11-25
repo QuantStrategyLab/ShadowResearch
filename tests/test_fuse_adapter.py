@@ -1508,6 +1508,73 @@ class FuseAdapterTest(unittest.TestCase):
                 self.assertEqual(fdec["q_ideal"], 0)
                 self.assertEqual(fdec["delta_q_exec"], 0)
 
+    def test_v5_and_v7_missing_observations_fail_closed_and_preserve_v5_counter(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-06", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # Resolved v5_tolerance + v7_spread_width with omitted observations MUST fail closed as missing_input
+        si = json.loads(json.dumps(_valid_inputs()))
+        si["positions_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si["broker_reconciliation_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si["funds"]["TQQQ"]["v5_tolerance"] = 0.001
+        si["funds"]["SOXL"]["v5_tolerance"] = 0.001
+        si["funds"]["TQQQ"]["v7_spread_width"] = 0.01
+        si["funds"]["SOXL"]["v7_spread_width"] = 0.01
+        prior_state = {
+            "V5": {
+                "TQQQ": {
+                    "consecutive_beyond_tolerance": 39,
+                    "last_session": "2026-01-05",
+                    "escalated": False,
+                }
+            }
+        }
+        translated = build_fuse_validated_inputs(
+            si,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        for sym in ("TQQQ", "SOXL"):
+            self.assertIsNone(translated["funds"][sym]["shortfall_observed"])
+            self.assertIsNone(translated["funds"][sym]["shortfall_predicted"])
+            self.assertIsNone(translated["funds"][sym]["quote_staleness"])
+            self.assertIsNone(translated["funds"][sym]["spread_width"])
+            self.assertIsNone(translated["funds"][sym]["trading_pause"])
+
+        built = build_record_body(
+            chain_id="drill-v5-v7-missing-obs",
+            sequence=1,
+            prev_record_sha256="a" * 64,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=si,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state=prior_state,
+            calendar_spec=spec,
+        )
+        self.assertTrue(built["appended"])
+        v5_row = next(
+            b for b in built["record_body"]["evaluator"]["breakers"] if b["id"] == "V5"
+        )
+        v7_row = next(
+            b for b in built["record_body"]["evaluator"]["breakers"] if b["id"] == "V7"
+        )
+        self.assertTrue(v5_row["would_have_tripped"])
+        self.assertEqual(v5_row["reason"], "missing_input")
+        self.assertEqual(
+            built["next_row_state"]["V5"]["TQQQ"]["consecutive_beyond_tolerance"],
+            39,
+        )
+        self.assertTrue(v7_row["would_have_tripped"])
+        self.assertEqual(v7_row["reason"], "missing_input")
+
 
 if __name__ == "__main__":
     unittest.main()

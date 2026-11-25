@@ -2554,6 +2554,13 @@ def _load_trusted_head_anchor(
             date.fromisoformat(pend_ds)
         except ValueError as exc:
             raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields") from exc
+    pend_rev = obj.get("pending_rejected_revision")
+    if pend_rev is not None and (
+        isinstance(pend_rev, bool)
+        or not isinstance(pend_rev, int)
+        or pend_rev < 1
+    ):
+        raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
     return obj, raw_bytes
 
 
@@ -2568,6 +2575,7 @@ def _advance_trusted_head_anchor(
     pending_rejected_state_sha256: str,
     now_utc: str,
     pending_rejected_session_date: str | None = None,
+    pending_rejected_revision: int | None = None,
 ) -> dict:
     anchor_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = anchor_path.with_name(f".{anchor_path.name}.lock")
@@ -2603,6 +2611,7 @@ def _advance_trusted_head_anchor(
                 "head_sha256": head_sha256,
                 "pending_rejected_state_sha256": pending_rejected_state_sha256,
                 "pending_rejected_session_date": pending_rejected_session_date,
+                "pending_rejected_revision": pending_rejected_revision,
                 "anchor_version": next_version,
                 "updated_at_utc": now_utc,
             }
@@ -2687,10 +2696,33 @@ def _verify_or_catchup_pending_anchor(
         else NO_PENDING_REJECTED_STATE_SHA256
     )
     anchor_pend_ds = anchor_obj.get("pending_rejected_session_date") if anchor_obj is not None else None
+
+    def _pos_rev(raw: object) -> int | None:
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1 else None
+
+    pend_rev = _pos_rev(auth_pending.get("pending_revision")) if isinstance(auth_pending, Mapping) else None
+    anchor_pend_rev = _pos_rev(anchor_obj.get("pending_rejected_revision")) if anchor_obj is not None else None
+    cross_day_rev_ok = (
+        pend_rev is None
+        or anchor_pend_rev is None
+        or pend_rev > anchor_pend_rev
+    )
     monotonic_forward = (
         anchor_obj is None
         or hmac.compare_digest(exp_anchor_pend, NO_PENDING_REJECTED_STATE_SHA256)
-        or (isinstance(anchor_pend_ds, str) and valid_rej_ds and rej_ds > anchor_pend_ds)
+        or (
+            isinstance(anchor_pend_ds, str)
+            and valid_rej_ds
+            and (
+                (rej_ds > anchor_pend_ds and cross_day_rev_ok)
+                or (
+                    rej_ds == anchor_pend_ds
+                    and pend_rev is not None
+                    and anchor_pend_rev is not None
+                    and pend_rev > anchor_pend_rev
+                )
+            )
+        )
     )
     can_catchup = (
         auth_pending is not None
@@ -2722,6 +2754,7 @@ def _verify_or_catchup_pending_anchor(
         head_sha256=head_sha,
         pending_rejected_state_sha256=actual_pend_sha,
         pending_rejected_session_date=str(rej_ds),
+        pending_rejected_revision=pend_rev,
         now_utc=catchup_now,
     )
     return _load_trusted_head_anchor(anchor_resolved, expected_chain_id=chain_id)
@@ -3627,6 +3660,7 @@ def _run_daily_drill_cycle_locked(
     session_base_prior_state: dict = {}
     prior_o4_resolved_symbols: list[str] = []
     prior_authorized_events: list[dict] = []
+    prior_pending_revision: int = 0
     if not is_stub_evaluator(ev):
         committed_base_state: dict = {}
         expected_base_prior_sha = _sha256_canonical_state_dict({})
@@ -3678,6 +3712,14 @@ def _run_daily_drill_cycle_locked(
             ]
             prior_authorized_events = normalize_pending_authorized_events(
                 pending_rej[1].get("authorized_events")
+            )
+            raw_pend_rev = pending_rej[1].get("pending_revision")
+            prior_pending_revision = (
+                raw_pend_rev
+                if isinstance(raw_pend_rev, int)
+                and not isinstance(raw_pend_rev, bool)
+                and raw_pend_rev >= 1
+                else 1
             )
             prior_row_state_used = copy.deepcopy(prior_state)
             session_base_prior_state = (
@@ -3840,6 +3882,7 @@ def _run_daily_drill_cycle_locked(
         merged_authorized_events = normalize_pending_authorized_events(
             prior_authorized_events + normalize_pending_authorized_events(authorized_events)
         )
+        next_pending_revision = prior_pending_revision + 1
         pending_payload = build_pending_rejected_state_payload(
             chain_id=cfg.chain_id,
             base_sequence=seq - 1,
@@ -3851,6 +3894,7 @@ def _run_daily_drill_cycle_locked(
             base_prior_row_state=session_base_prior_state,
             o4_resolved_symbols=merged_o4_resolved,
             authorized_events=merged_authorized_events or None,
+            pending_revision=next_pending_revision,
         )
         save_pending_rejected_state_snapshot(
             snapshots_dir,
@@ -3864,6 +3908,7 @@ def _run_daily_drill_cycle_locked(
             base_prior_row_state=session_base_prior_state,
             o4_resolved_symbols=merged_o4_resolved,
             authorized_events=merged_authorized_events or None,
+            pending_revision=next_pending_revision,
         )
         pending_sha_val = compute_pending_rejected_state_sha256(pending_payload)
         if anchor_resolved is not None:
@@ -3881,6 +3926,7 @@ def _run_daily_drill_cycle_locked(
                 head_sha256=head_hash,
                 pending_rejected_state_sha256=pending_sha_val,
                 pending_rejected_session_date=session_date,
+                pending_rejected_revision=next_pending_revision,
                 now_utc=_format_utc_ms(clock_fn()),
             )
             anchor_bytes = anchor_resolved.read_bytes()

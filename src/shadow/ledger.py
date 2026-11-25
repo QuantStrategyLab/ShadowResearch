@@ -2296,6 +2296,7 @@ def build_pending_rejected_state_payload(
     base_prior_row_state: dict | None = None,
     o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
     authorized_events: dict | list | None = None,
+    pending_revision: int | None = None,
 ) -> dict:
     """Assemble a canonical c-sh-pending-rejected-state-v1 payload in memory."""
     if not isinstance(next_row_state, dict):
@@ -2303,6 +2304,12 @@ def build_pending_rejected_state_payload(
     eff_base_prior = base_prior_row_state if base_prior_row_state is not None else {}
     if not isinstance(eff_base_prior, dict):
         raise EngineIdentityError("pending rejected base_prior_row_state must be a dict")
+    if pending_revision is not None and (
+        isinstance(pending_revision, bool)
+        or not isinstance(pending_revision, int)
+        or pending_revision < 1
+    ):
+        raise EngineIdentityError("pending rejected pending_revision must be a positive integer")
     payload: dict[str, Any] = {
         "schema_version": "c-sh-pending-rejected-state-v1",
         "chain_id": chain_id,
@@ -2323,6 +2330,8 @@ def build_pending_rejected_state_payload(
     normalized_auth = normalize_pending_authorized_events(authorized_events)
     if normalized_auth:
         payload["authorized_events"] = normalized_auth
+    if pending_revision is not None:
+        payload["pending_revision"] = pending_revision
     return payload
 
 
@@ -2339,6 +2348,7 @@ def save_pending_rejected_state_snapshot(
     base_prior_row_state: dict | None = None,
     o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
     authorized_events: dict | list | None = None,
+    pending_revision: int | None = None,
 ) -> Path:
     """Persist next_row_state (plus session-start baseline) after an O1/O2-rejected evaluation."""
     payload = build_pending_rejected_state_payload(
@@ -2352,6 +2362,7 @@ def save_pending_rejected_state_snapshot(
         base_prior_row_state=base_prior_row_state,
         o4_resolved_symbols=o4_resolved_symbols,
         authorized_events=authorized_events,
+        pending_revision=pending_revision,
     )
     s_dir = Path(snapshots_dir)
     s_dir.mkdir(parents=True, exist_ok=True)
@@ -3025,6 +3036,14 @@ def load_pending_rejected_state_snapshot(
             )
     elif expected_base_prior_state_sha256 is not None and base_obj is not None:
         eff_committed = base_obj
+
+    raw_pend_rev = payload.get("pending_revision")
+    if raw_pend_rev is not None and (
+        isinstance(raw_pend_rev, bool)
+        or not isinstance(raw_pend_rev, int)
+        or raw_pend_rev < 1
+    ):
+        raise EngineIdentityError("Pending state pending_revision must be a positive integer")
 
     raw_auth = payload.get("authorized_events")
     if raw_auth is not None:
