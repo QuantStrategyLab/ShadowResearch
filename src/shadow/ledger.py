@@ -2342,27 +2342,44 @@ class ShadowLedger:
 
             self.assert_active_chain_lease()
             self.root_dir.mkdir(parents=True, exist_ok=True)
-            if allow_unanchored:
-                # Purge any stale orphan .receipt/.ots from an earlier crashed run before committing unanchored.
-                for orphan_path in (rcp_path, ots_path):
-                    if orphan_path.exists():
-                        orphan_path.unlink()
-            elif ots_bytes is None and ots_path.exists():
-                ots_path.unlink()
-
             created_artifacts: list[tuple[Path, bytes]] = []
             try:
                 if before_record_commit is not None:
                     self.assert_active_chain_lease()
                     before_record_commit()
                 self.assert_active_chain_lease()
-                # Commit seq_NNNNNN.record.json BEFORE detached .ots/.receipt; rollback_sequence / except handler cleans up on Python exception.
+                # Commit seq_NNNNNN.record.json exclusively BEFORE detached .ots/.receipt so concurrent writers cannot overwrite a successor commit.
                 rec_bytes = canonical_json_bytes(envelope)
-                _atomic_write_bytes(rec_path, rec_bytes)
+                rec_tmp = rec_path.with_name(f".{rec_path.name}.tmp.{uuid4().hex}")
+                try:
+                    self._publish_exclusive_file(rec_path, rec_tmp, rec_bytes)
+                except FileExistsError as exc:
+                    raise ChainConcurrencyConflictError(
+                        f"target_sequence_already_exists_concurrently: {seq}"
+                    ) from exc
                 created_artifacts.append((rec_path, rec_bytes))
-                for target_path, data in post_marker_writes:
-                    _atomic_write_bytes(target_path, data)
-                    created_artifacts.append((target_path, data))
+
+                if allow_unanchored:
+                    # Purge any stale invalid orphan .receipt/.ots from an earlier crashed run before committing unanchored.
+                    for orphan_path in (rcp_path, ots_path):
+                        if orphan_path.exists():
+                            orphan_path.unlink()
+                else:
+                    if ots_bytes is None and ots_path.exists():
+                        ots_path.unlink()
+                    for target_path, data in post_marker_writes:
+                        if target_path.exists():
+                            target_path.unlink()
+                        target_tmp = target_path.with_name(
+                            f".{target_path.name}.tmp.{uuid4().hex}"
+                        )
+                        try:
+                            self._publish_exclusive_file(target_path, target_tmp, data)
+                        except FileExistsError as exc:
+                            raise ChainConcurrencyConflictError(
+                                f"target_detached_evidence_exists_concurrently: {target_path.name}"
+                            ) from exc
+                        created_artifacts.append((target_path, data))
             except Exception:
                 try:
                     self.assert_active_chain_lease()

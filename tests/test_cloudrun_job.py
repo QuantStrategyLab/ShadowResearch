@@ -2719,6 +2719,137 @@ class CloudRunJobTest(unittest.TestCase):
             finally:
                 ShadowLedger._now_utc = orig_now_desc  # type: ignore[assignment]
 
+    def test_paused_writer_exclusive_record_publish_never_overwrites_successor_commit(self) -> None:
+        import errno
+        import fcntl
+        import os
+        import threading
+        from unittest import mock
+
+        from shadow import scheduler as sched_mod
+        from shadow.fuse_adapter import VendoredFuseEvaluator
+        from shadow.ots import build_synthetic_ots_fixture
+
+        class _FakeOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
+        def _make_fast_clk():
+            box = [1000.0]
+
+            def _clk() -> float:
+                box[0] += 25.0
+                return box[0]
+
+            return _clk
+
+        ev = VendoredFuseEvaluator()
+        cfg = sched_mod.load_scheduler_config(_REPO_ROOT / "config" / "drill-scheduler.json")
+
+        for use_enosys in (False, True):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                ddir = Path(tmpdir) / f"paused_pub_{use_enosys}"
+                base_now = datetime.now(timezone.utc)
+                orig_now_desc = ShadowLedger.__dict__["_now_utc"]
+                orig_pub_desc = ShadowLedger.__dict__["_publish_exclusive_file"]
+                orig_os_link = os.link
+                now_box = [base_now]
+                ShadowLedger._now_utc = staticmethod(lambda: now_box[0])  # type: ignore[method-assign]
+                paused_once = [False]
+                successor_bytes: dict[str, bytes] = {}
+                successor_err: list[BaseException] = []
+
+                @staticmethod
+                def _paused_record_publish(target_path: Path, tmp_path: Path, payload: bytes) -> None:
+                    if target_path.name == "seq_000000.record.json" and not paused_once[0]:
+                        paused_once[0] = True
+                        now_box[0] = base_now + timedelta(seconds=301)
+
+                        def _run_successor() -> None:
+                            try:
+                                res_b = sched_mod.run_daily_drill_cycle(
+                                    session_date="2025-11-21",
+                                    data_dir=ddir,
+                                    config=cfg,
+                                    transport=build_live_mock_transport("2025-11-21"),
+                                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                                    ots_client=_FakeOts(),
+                                    wall_clock=lambda: datetime(
+                                        2025, 11, 21, 22, 31, tzinfo=timezone.utc
+                                    ),
+                                    clock=_make_fast_clk(),
+                                    sleeper=lambda _s: None,
+                                    evaluator=ev,
+                                )
+                                if not res_b.get("appended"):
+                                    raise AssertionError(f"successor failed to append: {res_b}")
+                                successor_bytes["record"] = (
+                                    ddir / "ledger" / "seq_000000.record.json"
+                                ).read_bytes()
+                                successor_bytes["ots"] = (
+                                    ddir / "ledger" / "seq_000000.ots"
+                                ).read_bytes()
+                                successor_bytes["receipt"] = (
+                                    ddir / "ledger" / "seq_000000.receipt.json"
+                                ).read_bytes()
+                            except BaseException as exc:  # pragma: no cover
+                                successor_err.append(exc)
+
+                        t = threading.Thread(target=_run_successor)
+                        t.start()
+                        t.join(timeout=15.0)
+                        if t.is_alive():
+                            raise RuntimeError("successor commit thread timed out")
+                    orig_pub_desc.__func__(target_path, tmp_path, payload)  # type: ignore[attr-defined]
+
+                def _maybe_enosys_link(src: object, dst: object) -> None:
+                    if use_enosys:
+                        raise OSError(errno.ENOSYS, "Function not implemented")
+                    orig_os_link(src, dst)
+
+                ShadowLedger._publish_exclusive_file = _paused_record_publish  # type: ignore[method-assign]
+                try:
+                    with (
+                        mock.patch.object(fcntl, "flock", lambda _fd, _op: None),
+                        mock.patch("os.link", side_effect=_maybe_enosys_link),
+                    ):
+                        with self.assertRaisesRegex(
+                            ChainConcurrencyConflictError, "already_exists_concurrently"
+                        ):
+                            sched_mod.run_daily_drill_cycle(
+                                session_date="2025-11-21",
+                                data_dir=ddir,
+                                config=cfg,
+                                transport=build_live_mock_transport("2025-11-21"),
+                                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                                ots_client=_FakeOts(),
+                                wall_clock=lambda: datetime(
+                                    2025, 11, 21, 22, 30, tzinfo=timezone.utc
+                                ),
+                                clock=_make_fast_clk(),
+                                sleeper=lambda _s: None,
+                                evaluator=ev,
+                            )
+                finally:
+                    ShadowLedger._publish_exclusive_file = orig_pub_desc  # type: ignore[assignment]
+                    ShadowLedger._now_utc = orig_now_desc  # type: ignore[assignment]
+
+                self.assertEqual(successor_err, [])
+                self.assertEqual(
+                    (ddir / "ledger" / "seq_000000.record.json").read_bytes(),
+                    successor_bytes["record"],
+                )
+                self.assertEqual(
+                    (ddir / "ledger" / "seq_000000.ots").read_bytes(),
+                    successor_bytes["ots"],
+                )
+                self.assertEqual(
+                    (ddir / "ledger" / "seq_000000.receipt.json").read_bytes(),
+                    successor_bytes["receipt"],
+                )
+                self.assertTrue(ShadowLedger(ddir / "ledger").verify_chain()[0])
+
 
 if __name__ == "__main__":
     unittest.main()
