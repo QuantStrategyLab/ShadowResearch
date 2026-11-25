@@ -1656,6 +1656,44 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(rows["L6"]["reason"], "index_fall_10pct")
         self.assertTrue(nxt["L6"]["latched"])
 
+    def test_l6_partial_benchmark_crash_latches_halt_when_other_benchmark_missing(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        si = json.loads(json.dumps(_valid_inputs()))
+        si.pop("index_one_session_returns", None)
+        si["prior_closes"] = {"TQQQ": "50", "SOXL": "40", "XNDX": "100", "SEMI": "200"}
+        si["current_index_closes"] = {"XNDX": "90"}  # SEMI missing/ineligible
+
+        vin = build_fuse_validated_inputs(
+            si,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNotNone(vin["index_one_session_returns"])
+        self.assertAlmostEqual(vin["index_one_session_returns"]["NDX"], -0.1, places=6)
+        self.assertNotIn("SEMI", vin["index_one_session_returns"])
+
+        rows, _, nxt = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NO-NEW-RISK")
+        self.assertEqual(rows["L6"]["state"], "HALT")
+        self.assertTrue(rows["L6"]["latched"])
+        self.assertEqual(rows["L6"]["reason"], "index_fall_10pct")
+        self.assertTrue(nxt["L6"]["latched"])
+
 
 if __name__ == "__main__":
     unittest.main()

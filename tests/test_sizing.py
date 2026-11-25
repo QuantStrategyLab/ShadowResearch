@@ -176,6 +176,14 @@ class SizingStackTest(unittest.TestCase):
         self.assertEqual(canonical_decimal_str(Decimal("0.2000")), "0.2")
         with self.assertRaises(ValueError):
             canonical_decimal_str(Decimal("NaN"))
+        self.assertEqual(canonical_decimal_str(Decimal("0E-57")), "0")
+        for extreme in (
+            Decimal("1e200000000"),
+            Decimal("1e-200000000"),
+            Decimal("1." + ("1" * 64)),
+        ):
+            with self.assertRaises(ValueError):
+                canonical_decimal_str(extreme)
 
     def test_missing_input_raises_sizing_error(self) -> None:
         bad = _make_inputs()

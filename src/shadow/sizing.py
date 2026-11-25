@@ -106,6 +106,12 @@ class SizingInputError(ValueError):
         super().__init__(message)
 
 
+_MAX_CANONICAL_DECIMAL_DIGITS = 64
+_MAX_CANONICAL_ABS_ADJUSTED_EXP = 64
+_MIN_CANONICAL_EXPONENT = -128
+_MAX_CANONICAL_EXPONENT = 64
+
+
 def canonical_decimal_str(value: Decimal | int | str) -> str:
     """Format a finite Decimal as an ordinary base-ten canonical string."""
     d = value if isinstance(value, Decimal) else Decimal(str(value))
@@ -113,6 +119,16 @@ def canonical_decimal_str(value: Decimal | int | str) -> str:
         raise ValueError(f"Non-finite decimal disallowed: {value!r}")
     if d == 0:
         return "0"
+    tup = d.as_tuple()
+    exp = tup.exponent
+    if (
+        not isinstance(exp, int)
+        or len(tup.digits) > _MAX_CANONICAL_DECIMAL_DIGITS
+        or exp < _MIN_CANONICAL_EXPONENT
+        or exp > _MAX_CANONICAL_EXPONENT
+        or abs(d.adjusted()) > _MAX_CANONICAL_ABS_ADJUSTED_EXP
+    ):
+        raise ValueError(f"Decimal exponent or precision out of bounds: {value!r}")
     s = format(d, "f")
     if "." in s:
         s = s.rstrip("0").rstrip(".")

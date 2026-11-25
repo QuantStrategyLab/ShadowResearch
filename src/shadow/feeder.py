@@ -237,8 +237,22 @@ def parse_flexible_iso_date(raw: str) -> str:
     raise ValueError(f"invalid_date:{raw!r}")
 
 
-def _parse_finite_decimal(raw: object, field_name: str) -> Decimal:
-    """Parse a finite non-boolean numeric value into Decimal or raise ValueError."""
+_MAX_NUMERIC_TEXT_LEN = 64
+_MAX_DECIMAL_SIGNIFICANT_DIGITS = 32
+_MAX_DECIMAL_ABS_ADJUSTED_EXP = 12
+_MIN_DECIMAL_EXPONENT = -18
+_MAX_DECIMAL_EXPONENT = 12
+_MAX_MARKET_CLOSE_VALUE = Decimal("1000000000")
+
+
+def _parse_finite_decimal(
+    raw: object,
+    field_name: str,
+    *,
+    min_exclusive: Decimal | None = None,
+    max_inclusive: Decimal | None = None,
+) -> Decimal:
+    """Parse a bounded finite non-boolean numeric value into Decimal or raise ValueError."""
     if isinstance(raw, bool) or not isinstance(raw, (int, float, Decimal, str)):
         raise ValueError(f"invalid_numeric:{field_name}")
     if isinstance(raw, float) and not math.isfinite(raw):
@@ -246,12 +260,28 @@ def _parse_finite_decimal(raw: object, field_name: str) -> Decimal:
     text = str(raw).strip()
     if not text:
         raise ValueError(f"invalid_numeric:{field_name}")
+    if len(text) > _MAX_NUMERIC_TEXT_LEN:
+        raise ValueError(f"oversized_numeric:{field_name}")
     try:
         dec = Decimal(text)
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise ValueError(f"invalid_numeric:{field_name}") from exc
     if not dec.is_finite():
         raise ValueError(f"nonfinite_numeric:{field_name}")
+    tup = dec.as_tuple()
+    exp = tup.exponent
+    if (
+        not isinstance(exp, int)
+        or len(tup.digits) > _MAX_DECIMAL_SIGNIFICANT_DIGITS
+        or exp < _MIN_DECIMAL_EXPONENT
+        or exp > _MAX_DECIMAL_EXPONENT
+        or (dec != 0 and abs(dec.adjusted()) > _MAX_DECIMAL_ABS_ADJUSTED_EXP)
+    ):
+        raise ValueError(f"out_of_bounds_numeric:{field_name}")
+    if min_exclusive is not None and dec <= min_exclusive:
+        raise ValueError(f"out_of_range_numeric:{field_name}")
+    if max_inclusive is not None and dec > max_inclusive:
+        raise ValueError(f"out_of_range_numeric:{field_name}")
     return dec
 
 
@@ -401,7 +431,12 @@ def select_tiingo_row(
             continue
         if row.get("divCash") is None or row.get("splitFactor") is None:
             raise ValueError("tiingo_missing_corporate_action_fields")
-        _parse_finite_decimal(row["close"], "tiingo_close")
+        _parse_finite_decimal(
+            row["close"],
+            "tiingo_close",
+            min_exclusive=Decimal("0"),
+            max_inclusive=_MAX_MARKET_CLOSE_VALUE,
+        )
         _parse_finite_decimal(row["divCash"], "tiingo_divCash")
         _parse_finite_decimal(row["splitFactor"], "tiingo_splitFactor")
         return row
@@ -452,7 +487,12 @@ def select_yahoo_close(
             if bar_time < dt_time(9, 30) or bar_time > close_t:
                 extended_err = "extended_hours_overnight_rejected"
                 continue
-            selected = _parse_finite_decimal(close, "yahoo_close")
+            selected = _parse_finite_decimal(
+                close,
+                "yahoo_close",
+                min_exclusive=Decimal("0"),
+                max_inclusive=_MAX_MARKET_CLOSE_VALUE,
+            )
     if selected is not None:
         return selected
     if extended_err is not None:
@@ -1404,7 +1444,12 @@ def extract_prior_close_from_tiingo_bytes(
             continue
         try:
             _validate_tiingo_official_close_row(row, row_d, calendar_session)
-            close_dec = _parse_finite_decimal(row["close"], "tiingo_prior_close")
+            close_dec = _parse_finite_decimal(
+                row["close"],
+                "tiingo_prior_close",
+                min_exclusive=Decimal("0"),
+                max_inclusive=_MAX_MARKET_CLOSE_VALUE,
+            )
         except ValueError:
             continue
         candidates.append((row_d, close_dec))
@@ -1456,7 +1501,12 @@ def extract_prior_close_from_yahoo_bytes(
         if bar_t < dt_time(9, 30) or bar_t > close_t or bar_t >= dt_time(21, 0):
             continue
         try:
-            c_dec = _parse_finite_decimal(close, "yahoo_prior_close")
+            c_dec = _parse_finite_decimal(
+                close,
+                "yahoo_prior_close",
+                min_exclusive=Decimal("0"),
+                max_inclusive=_MAX_MARKET_CLOSE_VALUE,
+            )
         except ValueError:
             continue
         cand = (bar_date, ts_int, c_dec)

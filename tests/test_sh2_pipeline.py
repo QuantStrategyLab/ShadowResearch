@@ -3228,6 +3228,96 @@ class Sh2PipelineTest(unittest.TestCase):
             rep = replay_window(root / "replay", root / "ledger")
             self.assertTrue(rep["bit_for_bit_match"])
 
+    def test_extract_prior_close_rejects_huge_exponents_and_out_of_range_closes(self) -> None:
+        cal_spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal_jan5 = resolve_session("XNYS", "2026-01-05", spec=cal_spec)
+        ts_02 = int(datetime(2026, 1, 2, 16, 0, tzinfo=_NY_TZ).timestamp())
+        ts_05 = int(datetime(2026, 1, 5, 16, 0, tzinfo=_NY_TZ).timestamp())
+
+        for bad_val in ("1e200000000", "1e-200000000", "0e200000000", "0", "-5", "1e10", 0, -5):
+            t_payload = json.dumps(
+                [
+                    {
+                        "date": "2026-01-05T00:00:00.000Z",
+                        "close": bad_val,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "session": "regular",
+                        "session_time": "regular",
+                    }
+                ]
+            ).encode("utf-8")
+            self.assertIsNone(
+                extract_prior_close_from_tiingo_bytes(
+                    t_payload,
+                    "2026-01-06",
+                    calendar_session=cal_jan5,
+                    target_prior_date="2026-01-05",
+                ),
+                f"Tiingo prior close must reject {bad_val!r}",
+            )
+
+            y_payload = json.dumps(
+                {
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {"dataGranularity": "1d"},
+                                "timestamp": [ts_05],
+                                "indicators": {"quote": [{"close": [bad_val]}]},
+                            }
+                        ]
+                    }
+                }
+            ).encode("utf-8")
+            self.assertIsNone(
+                extract_prior_close_from_yahoo_bytes(
+                    y_payload,
+                    "2026-01-06",
+                    calendar_session=cal_jan5,
+                    target_prior_date="2026-01-05",
+                ),
+                f"Yahoo prior close must reject {bad_val!r}",
+            )
+
+        # Raw JSON with unquoted huge JSON number (`1e200000000`) plus an earlier valid row
+        t_mixed = (
+            b'[{"date":"2026-01-02T00:00:00.000Z","close":48.5,"divCash":0.0,"splitFactor":1.0,'
+            b'"session":"regular","session_time":"regular"},'
+            b'{"date":"2026-01-05T00:00:00.000Z","close":"1e200000000","divCash":0.0,"splitFactor":1.0,'
+            b'"session":"regular","session_time":"regular"}]'
+        )
+        self.assertEqual(
+            extract_prior_close_from_tiingo_bytes(
+                t_mixed,
+                "2026-01-06",
+                calendar_session=cal_jan5,
+            ),
+            "48.5",
+        )
+
+        y_mixed = json.dumps(
+            {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {"dataGranularity": "1d"},
+                            "timestamp": [ts_02, ts_05],
+                            "indicators": {"quote": [{"close": [28000.0, "1e200000000"]}]},
+                        }
+                    ]
+                }
+            }
+        ).encode("utf-8")
+        self.assertEqual(
+            extract_prior_close_from_yahoo_bytes(
+                y_mixed,
+                "2026-01-06",
+                calendar_session=cal_jan5,
+            ),
+            "28000",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
