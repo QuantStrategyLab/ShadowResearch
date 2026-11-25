@@ -2497,6 +2497,117 @@ class CloudRunJobTest(unittest.TestCase):
             client.stamp_digest("11" * 32)
         self.assertEqual(ots_calls, [])
 
+    def test_displaced_writer_rollback_preserves_successor_committed_bundle_and_snapshot(self) -> None:
+        import fcntl
+        import threading
+        from unittest import mock
+
+        from shadow import scheduler as sched_mod
+        from shadow.fuse_adapter import VendoredFuseEvaluator
+        from shadow.ots import build_synthetic_ots_fixture
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ddir = Path(tmpdir) / "displaced_rollback"
+            cfg = sched_mod.load_scheduler_config(_REPO_ROOT / "config" / "drill-scheduler.json")
+
+            class _FakeOts(OpenTimestampsClient):
+                def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                    ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                    return ots_b, "https://a.pool.opentimestamps.org"
+
+            def _make_fast_clk():
+                box = [1000.0]
+
+                def _clk() -> float:
+                    box[0] += 25.0
+                    return box[0]
+
+                return _clk
+
+            base_now = datetime.now(timezone.utc)
+            orig_now_desc = ShadowLedger.__dict__["_now_utc"]
+            now_box = [base_now]
+            ShadowLedger._now_utc = staticmethod(lambda: now_box[0])  # type: ignore[method-assign]
+            successor_bytes: dict[str, bytes] = {}
+            successor_err: list[BaseException] = []
+            ev = VendoredFuseEvaluator()
+
+            def _paused_before_commit() -> None:
+                now_box[0] = base_now + timedelta(seconds=301)
+
+                def _run_successor() -> None:
+                    try:
+                        res_b = sched_mod.run_daily_drill_cycle(
+                            session_date="2025-11-21",
+                            data_dir=ddir,
+                            config=cfg,
+                            transport=build_live_mock_transport("2025-11-21"),
+                            environ={"TIINGO_API_KEY": "test-dummy-token"},
+                            ots_client=_FakeOts(),
+                            wall_clock=lambda: datetime(2025, 11, 21, 22, 31, tzinfo=timezone.utc),
+                            clock=_make_fast_clk(),
+                            sleeper=lambda _s: None,
+                            evaluator=ev,
+                        )
+                        if not res_b.get("appended"):
+                            raise AssertionError(f"successor failed to append: {res_b}")
+                        successor_bytes["record"] = (ddir / "ledger" / "seq_000000.record.json").read_bytes()
+                        successor_bytes["seq_snap"] = (
+                            ddir / "state_snapshots" / "seq_000000.state.json"
+                        ).read_bytes()
+                        successor_bytes["latest_snap"] = (
+                            ddir / "state_snapshots" / "latest.state.json"
+                        ).read_bytes()
+                        successor_bytes["bundle"] = (
+                            ddir / "replay" / "replay_bundle.json"
+                        ).read_bytes()
+                    except BaseException as exc:  # pragma: no cover - diagnostic propagation
+                        successor_err.append(exc)
+
+                t = threading.Thread(target=_run_successor)
+                t.start()
+                t.join(timeout=15.0)
+                if t.is_alive():
+                    raise RuntimeError("successor commit thread timed out")
+
+            try:
+                with mock.patch.object(fcntl, "flock", lambda _fd, _op: None):
+                    with self.assertRaises(ChainConcurrencyConflictError):
+                        sched_mod.run_daily_drill_cycle(
+                            session_date="2025-11-21",
+                            data_dir=ddir,
+                            config=cfg,
+                            transport=build_live_mock_transport("2025-11-21"),
+                            environ={"TIINGO_API_KEY": "test-dummy-token"},
+                            ots_client=_FakeOts(),
+                            wall_clock=lambda: datetime(2025, 11, 21, 22, 30, tzinfo=timezone.utc),
+                            clock=_make_fast_clk(),
+                            sleeper=lambda _s: None,
+                            evaluator=ev,
+                            _post_ledger_commit_hook=_paused_before_commit,
+                        )
+            finally:
+                ShadowLedger._now_utc = orig_now_desc  # type: ignore[assignment]
+
+            self.assertEqual(successor_err, [])
+            self.assertEqual(
+                (ddir / "ledger" / "seq_000000.record.json").read_bytes(),
+                successor_bytes["record"],
+            )
+            self.assertEqual(
+                (ddir / "state_snapshots" / "seq_000000.state.json").read_bytes(),
+                successor_bytes["seq_snap"],
+            )
+            self.assertEqual(
+                (ddir / "state_snapshots" / "latest.state.json").read_bytes(),
+                successor_bytes["latest_snap"],
+            )
+            self.assertEqual(
+                (ddir / "replay" / "replay_bundle.json").read_bytes(),
+                successor_bytes["bundle"],
+            )
+            self.assertEqual(ShadowLedger(ddir / "ledger").verify_chain()[0], True)
+
 
 if __name__ == "__main__":
     unittest.main()

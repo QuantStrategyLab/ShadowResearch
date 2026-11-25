@@ -53,6 +53,7 @@ from shadow.fuse_adapter import (
     resolve_aggregate_control_state,
 )
 from shadow.ledger import (
+    ChainConcurrencyConflictError,
     GENESIS_PREV_HASH,
     NO_PENDING_REJECTED_STATE_SHA256,
     ShadowLedger,
@@ -77,6 +78,7 @@ from shadow.ledger import (
     normalize_pending_authorized_events,
     o1_blocks_session_commit,
     parse_json_no_duplicates,
+    resolve_blocking_validation_outputs,
     save_pending_rejected_state_snapshot,
     save_row_state_snapshot,
     sha256_canonical,
@@ -1520,9 +1522,11 @@ def _commit_drill_session_atomically(
         )
         snap_staged = False
         prior_anchor_bytes = expected_prior_anchor_bytes
+        staged_bundle_bytes: bytes | None = None
+        staged_snap_bytes: bytes | None = None
 
         def _stage_bundle_before_marker() -> None:
-            nonlocal bundle_modified, snap_staged, prior_anchor_bytes
+            nonlocal bundle_modified, snap_staged, prior_anchor_bytes, staged_bundle_bytes, staged_snap_bytes
             ledger.assert_active_chain_lease()
             if (
                 seq == 0
@@ -1552,6 +1556,7 @@ def _commit_drill_session_atomically(
                 engine_hash=engine_hash,
                 spec_version=spec_version,
             )
+            staged_bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
             bundle_modified = True
             if should_stage_snap and snapshots_dir is not None:
                 ledger.assert_active_chain_lease()
@@ -1564,6 +1569,11 @@ def _commit_drill_session_atomically(
                     engine_hash=engine_hash,  # type: ignore[arg-type]
                     spec_version=spec_version,  # type: ignore[arg-type]
                     next_row_state=next_row_state,  # type: ignore[arg-type]
+                )
+                staged_snap_bytes = (
+                    seq_snap_path.read_bytes()
+                    if seq_snap_path is not None and seq_snap_path.is_file()
+                    else None
                 )
                 snap_staged = True
             if post_ledger_hook is not None:
@@ -1587,19 +1597,44 @@ def _commit_drill_session_atomically(
             else:
                 raise RuntimeError("OTS receipt missing and unanchored append disabled")
         except Exception:
-            if bundle_modified:
-                if prior_bundle_bytes is not None:
-                    _atomic_write_bytes(bundle_path, prior_bundle_bytes)
-                elif bundle_path.exists():
-                    bundle_path.unlink()
-            if snap_staged:
-                if seq_snap_path is not None and seq_snap_path.exists():
-                    seq_snap_path.unlink()
-                if latest_snap_path is not None:
-                    if prior_latest_bytes is not None:
-                        _atomic_write_bytes(latest_snap_path, prior_latest_bytes)
-                    elif latest_snap_path.exists():
-                        latest_snap_path.unlink()
+            def _still_owns_lease() -> bool:
+                try:
+                    ledger.assert_active_chain_lease()
+                    return True
+                except ChainConcurrencyConflictError:
+                    return False
+
+            rec_path = ledger._record_path(seq)
+            if _still_owns_lease() and not rec_path.exists():
+                if (
+                    bundle_modified
+                    and staged_bundle_bytes is not None
+                    and bundle_path.is_file()
+                    and bundle_path.read_bytes() == staged_bundle_bytes
+                    and _still_owns_lease()
+                ):
+                    if prior_bundle_bytes is not None:
+                        _atomic_write_bytes(bundle_path, prior_bundle_bytes)
+                    else:
+                        bundle_path.unlink()
+                if snap_staged and staged_snap_bytes is not None:
+                    if (
+                        seq_snap_path is not None
+                        and seq_snap_path.is_file()
+                        and seq_snap_path.read_bytes() == staged_snap_bytes
+                        and _still_owns_lease()
+                    ):
+                        seq_snap_path.unlink()
+                    if (
+                        latest_snap_path is not None
+                        and latest_snap_path.is_file()
+                        and latest_snap_path.read_bytes() == staged_snap_bytes
+                        and _still_owns_lease()
+                    ):
+                        if prior_latest_bytes is not None:
+                            _atomic_write_bytes(latest_snap_path, prior_latest_bytes)
+                        else:
+                            latest_snap_path.unlink()
             raise
         if pending_snap_path is not None and pending_snap_path.is_file():
             ledger.assert_active_chain_lease()
@@ -3837,6 +3872,7 @@ def _run_daily_drill_cycle_locked(
             },
         }
     else:
+        rows_by_tier: dict[str, dict] | None = None
         if is_stub_evaluator(ev):
             eval_inputs["calendar"] = cal
             ev_validated = eval_inputs
@@ -3867,13 +3903,17 @@ def _run_daily_drill_cycle_locked(
             rows_by_id = tiered_eval["rows_by_id"]
             eff_scope = tiered_eval["effective_state_by_scope"]
             next_state = tiered_eval["next_row_state"]
+            rows_by_tier = tiered_eval["rows_by_tier"]
             o4_resolved = tiered_eval["o4_resolved_symbols"]
-        if o1_blocks_session_commit(rows_by_id["O1"]) or rows_by_id["O2"]["would_have_tripped"]:
+        blocked, blocking_o1, blocking_o2 = resolve_blocking_validation_outputs(
+            rows_by_id, rows_by_tier
+        )
+        if blocked:
             built = {
                 "appended": False,
                 "fail_closed": True,
-                "o1_output": rows_by_id["O1"],
-                "o2_output": rows_by_id["O2"],
+                "o1_output": blocking_o1,
+                "o2_output": blocking_o2,
                 "effective_state_by_scope": eff_scope,
                 "next_row_state": next_state,
                 "o4_resolved_symbols": o4_resolved,

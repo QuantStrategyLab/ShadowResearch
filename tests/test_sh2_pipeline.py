@@ -3575,6 +3575,31 @@ class Sh2PipelineTest(unittest.TestCase):
                     config=bad_digest,
                 )
 
+    def test_non_primary_tier_invalid_q_pre_fails_closed_with_report_and_pending_snapshot(
+        self,
+    ) -> None:
+        ev = VendoredFuseEvaluator()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ddir = Path(tmpdir) / "non_primary_o1"
+            f5 = Path(tmpdir) / "f5_non_primary_o1"
+            _build_session_fixture_files(f5, "2026-01-05")
+            res = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=ddir,
+                config=_sh2_drill_cfg(),
+                fixtures_dir=f5,
+                evaluator=ev,
+                q_pre_by_inst={"TQQQ": {"balanced": 0, "aggressive": 0, "conservative": 0.0}},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertTrue(res["report_written"])
+            self.assertEqual(res["reason"], "stale_or_missing_input")
+            pending_path = ddir / "state_snapshots" / "pending_rejected_state.json"
+            self.assertTrue(pending_path.is_file())
+            self.assertEqual(ShadowLedger(ddir / "ledger").load_records(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

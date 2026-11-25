@@ -636,6 +636,34 @@ def o1_blocks_session_commit(o1_output: Mapping[str, Any]) -> bool:
     return bool(o1_output.get("would_have_tripped")) and o1_output.get("reason") != "clearing_period"
 
 
+def resolve_blocking_validation_outputs(
+    rows_by_id: Mapping[str, Any],
+    rows_by_tier: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[bool, Mapping[str, Any], Mapping[str, Any]]:
+    """Check primary and every emitted tier for blocking O1/O2 failures before sizing."""
+    primary_o1 = rows_by_id["O1"]
+    primary_o2 = rows_by_id["O2"]
+    primary_o1_blocks = o1_blocks_session_commit(primary_o1)
+    primary_o2_blocks = bool(primary_o2.get("would_have_tripped"))
+    if primary_o1_blocks or primary_o2_blocks:
+        return True, primary_o1, primary_o2
+    if isinstance(rows_by_tier, Mapping):
+        for tier_rows in rows_by_tier.values():
+            if not isinstance(tier_rows, Mapping):
+                continue
+            t_o1 = tier_rows.get("O1")
+            t_o2 = tier_rows.get("O2")
+            t_o1_blocks = isinstance(t_o1, Mapping) and o1_blocks_session_commit(t_o1)
+            t_o2_blocks = isinstance(t_o2, Mapping) and bool(t_o2.get("would_have_tripped"))
+            if t_o1_blocks or t_o2_blocks:
+                return (
+                    True,
+                    t_o1 if t_o1_blocks and isinstance(t_o1, Mapping) else primary_o1,
+                    t_o2 if t_o2_blocks and isinstance(t_o2, Mapping) else primary_o2,
+                )
+    return False, primary_o1, primary_o2
+
+
 def _sha256_canonical_state_dict(state_obj: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -849,12 +877,13 @@ def build_record_body(
         eff_scope_by_tier = tiered_eval["eff_scope_by_tier"]
         o4_resolved_symbols = tiered_eval["o4_resolved_symbols"]
 
-    if o1_blocks_session_commit(rows_by_id["O1"]) or rows_by_id["O2"]["would_have_tripped"]:
+    blocked, blocking_o1, blocking_o2 = resolve_blocking_validation_outputs(rows_by_id, rows_by_tier)
+    if blocked:
         return {
             "appended": False,
             "fail_closed": True,
-            "o1_output": rows_by_id["O1"],
-            "o2_output": rows_by_id["O2"],
+            "o1_output": blocking_o1,
+            "o2_output": blocking_o2,
             "effective_state_by_scope": eff_scope,
             "next_row_state": next_state,
             "o4_resolved_symbols": o4_resolved_symbols,
@@ -2305,22 +2334,29 @@ class ShadowLedger:
             elif ots_bytes is None and ots_path.exists():
                 ots_path.unlink()
 
-            created_paths: list[Path] = []
+            created_artifacts: list[tuple[Path, bytes]] = []
             try:
                 if before_record_commit is not None:
                     self.assert_active_chain_lease()
                     before_record_commit()
                 self.assert_active_chain_lease()
                 # Commit seq_NNNNNN.record.json BEFORE detached .ots/.receipt; rollback_sequence / except handler cleans up on Python exception.
-                _atomic_write_bytes(rec_path, canonical_json_bytes(envelope))
-                created_paths.append(rec_path)
+                rec_bytes = canonical_json_bytes(envelope)
+                _atomic_write_bytes(rec_path, rec_bytes)
+                created_artifacts.append((rec_path, rec_bytes))
                 for target_path, data in post_marker_writes:
                     _atomic_write_bytes(target_path, data)
-                    created_paths.append(target_path)
+                    created_artifacts.append((target_path, data))
             except Exception:
-                for created_path in reversed(created_paths):
-                    if created_path.exists():
-                        created_path.unlink()
+                try:
+                    self.assert_active_chain_lease()
+                    owns_lease = True
+                except ChainConcurrencyConflictError:
+                    owns_lease = False
+                if owns_lease:
+                    for created_path, expected_bytes in reversed(created_artifacts):
+                        if created_path.is_file() and created_path.read_bytes() == expected_bytes:
+                            created_path.unlink()
                 raise
             return envelope
 
