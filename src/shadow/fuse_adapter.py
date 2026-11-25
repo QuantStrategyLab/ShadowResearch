@@ -1118,7 +1118,12 @@ def build_fuse_validated_inputs(
         bench_inst = _FUND_BENCHMARK_INDEX.get(symbol, "XNDX")
         if fdata.get("index_return") is not None:
             idx_ret_val = _finite_number(fdata.get("index_return"))
-        elif bench_inst in prior_closes and bench_inst in cur_closes:
+        elif (
+            not bad_market_payload
+            and bench_inst not in bad_market_insts
+            and bench_inst in prior_closes
+            and bench_inst in cur_closes
+        ):
             idx_ret_val = _compute_return_ratio(cur_closes.get(bench_inst), prior_closes.get(bench_inst))
         else:
             idx_ret_val = None

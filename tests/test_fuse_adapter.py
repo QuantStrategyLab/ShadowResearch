@@ -1935,6 +1935,85 @@ class FuseAdapterTest(unittest.TestCase):
                 )
                 self.assertEqual(rows["O1"]["state"], "NO-NEW-RISK")
 
+    def test_ineligible_benchmark_price_is_excluded_from_v1_return_derivation(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        si = json.loads(json.dumps(_valid_inputs()))
+        si.pop("index_one_session_returns", None)
+        si["funds"]["TQQQ"].pop("index_return", None)
+        si["funds"]["TQQQ"]["fund_return"] = 0.0
+        si["prior_closes"] = {"XNDX": "100", "SEMI": "5000"}
+        si["market_records"] = [
+            {
+                "instrument": "TQQQ",
+                "normalized_value": "50",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "SOXL",
+                "normalized_value": "40",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "QQQ",
+                "normalized_value": "500",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "XNDX",
+                "normalized_value": "90",
+                "eligibility": {"eligible": False, "reason": "stale_benchmark_bar"},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "SEMI",
+                "normalized_value": "5000",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "SOFR",
+                "normalized_value": "0.045",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "TBILL_3M",
+                "normalized_value": "0.042",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+        ]
+
+        vin = build_fuse_validated_inputs(
+            si,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNone(vin["funds"]["TQQQ"]["index_return"])
+        rows, _, nxt = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NO-NEW-RISK")
+        self.assertFalse(rows["V1"].get("latched", False))
+        self.assertFalse(nxt.get("V1", {}).get("latched", False))
+        self.assertNotEqual(rows["V1"].get("reason"), "tracking_deviation_exceeds_0_75pp")
+
 
 if __name__ == "__main__":
     unittest.main()

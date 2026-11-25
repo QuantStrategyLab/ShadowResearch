@@ -3412,6 +3412,58 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertIsNotNone(pending)
             self.assertTrue(pending["L6"]["latched"])
 
+    def test_unlocked_production_fail_closed_report_matches_monitor_scope(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "prod_fail_closed"
+            unlocked_cfg_path = Path(tmpdir) / "unlocked-production.json"
+            unlocked_cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            def _unavailable_transport(url: str, headers: dict) -> tuple[int, bytes]:
+                _ = url, headers
+                return 503, b"service unavailable"
+
+            res = run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config_path=unlocked_cfg_path,
+                transport=_unavailable_transport,
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                evaluator=VendoredFuseEvaluator(),
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "prod_fail_closed_anchor.json",
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertEqual(res["report"]["consecutive_session_scope"], "clk01_forward_clock")
+
+            rep_disk = json.loads(
+                (root / "reports" / "completeness_2026-01-05.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(rep_disk["consecutive_session_scope"], "clk01_forward_clock")
+
+            prod_cfg = load_production_scheduler_config(unlocked_cfg_path)
+            missed = detect_missed_runs(
+                window_start_date="2026-01-05",
+                as_of_utc="2026-01-06T05:00:00.000Z",
+                data_dir=root,
+                config=prod_cfg,
+            )
+            self.assertEqual(missed["silent_missed_days"], [])
+            self.assertEqual(missed["failed_days"], ["2026-01-05"])
+            self.assertEqual(missed["evaluated_trading_days"][0]["status"], "failed_documented")
+            self.assertTrue(
+                str(missed["evaluated_trading_days"][0]["detail"]).startswith("documented_fail_closed:")
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

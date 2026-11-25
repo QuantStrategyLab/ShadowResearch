@@ -1809,7 +1809,9 @@ def _build_fail_closed_result(
             "non_creditable_reasons": receipt_reasons or [fail_reason, "drill_mode"],
         },
         "consecutive_session_count": consecutive_count,
-        "consecutive_session_scope": "drill_only_not_clk01",
+        "consecutive_session_scope": (
+            "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+        ),
         "standing_assertions": {
             "kelly_applied": False,
             "orders_placed": 0,
