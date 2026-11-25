@@ -627,6 +627,45 @@ _FUND_EXPOSURE_BETA = {
 
 _LEVERAGE_MULTIPLE = Decimal("3")
 
+_O5_PASSTHROUGH_KEYS = (
+    "o5_symbol",
+    "symbol",
+    "o5_symbol_whitelist",
+    "o5_order_size",
+    "order_size",
+    "o5_order_qty",
+    "order_qty",
+    "qty",
+    "o5_side",
+    "side",
+    "order_side",
+    "o5_order_value",
+    "order_value",
+    "o5_order_price",
+    "o5_limit_price",
+    "limit_price",
+    "order_price",
+    "unit_price",
+    "o5_unit_price",
+    "price",
+    "o5_reference_price",
+    "reference_price",
+    "account",
+    "o5_account",
+    "o5_account_whitelist",
+    "o5_settled_cash",
+    "o5_max_order_size",
+    "max_order_size",
+    "o5_orders_today",
+    "orders_today",
+    "o5_max_orders_per_session",
+    "max_orders_per_session",
+    "o5_turnover_today",
+    "turnover_today",
+    "o5_max_turnover_per_session",
+    "max_turnover_per_session",
+)
+
 _INDEX_RETURN_LABELS = (
     ("XNDX", "NDX"),
     ("SEMI", "SEMI"),
@@ -1032,6 +1071,9 @@ def build_fuse_validated_inputs(
             fund_entry["v5_tolerance"] = fdata["v5_tolerance"]
         if "v7_spread_width" in fdata:
             fund_entry["v7_spread_width"] = fdata["v7_spread_width"]
+        for v1_key in ("five_session_history", "sessions_window"):
+            if v1_key in fdata:
+                fund_entry[v1_key] = copy.deepcopy(fdata[v1_key])
         fuse_funds[symbol] = fund_entry
 
     idx_returns: dict[str, float] | None
@@ -1117,8 +1159,16 @@ def build_fuse_validated_inputs(
         "broker_cash": _finite_number(session_inputs.get("broker_cash")) if session_inputs.get("broker_cash") is not None else bankroll_val,
         "reconciliation_tolerance": _finite_number(session_inputs.get("reconciliation_tolerance")) if session_inputs.get("reconciliation_tolerance") is not None else 1.0,
         "pending_orders": copy.deepcopy(session_inputs.get("pending_orders", {})),
-        "symbol_whitelist": list(session_inputs.get("symbol_whitelist", ["TQQQ", "SOXL", "BIL"])),
-        "account_whitelist": list(session_inputs.get("account_whitelist", ["stage_n_shadow"])),
+        "symbol_whitelist": (
+            copy.deepcopy(session_inputs["symbol_whitelist"])
+            if "symbol_whitelist" in session_inputs
+            else ["TQQQ", "SOXL", "BIL"]
+        ),
+        "account_whitelist": (
+            copy.deepcopy(session_inputs["account_whitelist"])
+            if "account_whitelist" in session_inputs
+            else ["stage_n_shadow"]
+        ),
         "settled_cash": _finite_number(session_inputs.get("settled_cash")) if session_inputs.get("settled_cash") is not None else bankroll_val,
         "session_order_count": int(session_inputs.get("session_order_count", 0)),
         "session_turnover": _finite_number(session_inputs.get("session_turnover")) if session_inputs.get("session_turnover") is not None else 0.0,
@@ -1138,6 +1188,9 @@ def build_fuse_validated_inputs(
     for o7_key in ("o7_runtime_silent", "o7_monitor_silent"):
         if o7_key in session_inputs:
             out[o7_key] = bool(session_inputs[o7_key])
+    for o5_key in _O5_PASSTHROUGH_KEYS:
+        if o5_key in session_inputs:
+            out[o5_key] = copy.deepcopy(session_inputs[o5_key])
     for key in ("tier_change_event", "o9_change_descriptors"):
         if key in session_inputs:
             out[key] = copy.deepcopy(session_inputs[key])

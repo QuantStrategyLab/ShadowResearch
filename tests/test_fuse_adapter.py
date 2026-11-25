@@ -1128,6 +1128,106 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertTrue(rows_stale_cal["O2"]["would_have_tripped"])
         self.assertTrue(rows_stale_cal["O1"]["would_have_tripped"])
 
+    def test_o5_order_evidence_and_v1_five_session_history_forwarded(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        # 1. Pre-trade O5 order fields trigger violation when violating whitelist & pass when compliant
+        si_o5_bad = _valid_inputs()
+        si_o5_bad.update(
+            {
+                "o5_collar": "0.05",
+                "o5_symbol": "UVXY",
+                "o5_order_size": 10,
+                "o5_side": "buy",
+                "o5_account": "stage_n_shadow",
+            }
+        )
+        rows_o5_bad, _, res_o5_bad = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_o5_bad,
+                cal6,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            {},
+            None,
+        )
+        self.assertTrue(rows_o5_bad["O5"]["would_have_tripped"])
+        self.assertEqual(rows_o5_bad["O5"]["reason"], "pre_trade_limit_violation")
+        self.assertEqual(res_o5_bad["O5"], {"rejection_count": 1, "last_rejection_session": "2026-01-06", "latched": False})
+
+        si_o5_ok = _valid_inputs()
+        si_o5_ok.update(
+            {
+                "o5_collar": "0.05",
+                "o5_symbol": "TQQQ",
+                "o5_order_size": 10,
+                "o5_side": "buy",
+                "o5_limit_price": "50",
+                "o5_reference_price": "50",
+                "o5_account": "stage_n_shadow",
+            }
+        )
+        rows_o5_ok, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_o5_ok,
+                cal6,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            {},
+            None,
+        )
+        self.assertFalse(rows_o5_ok["O5"]["would_have_tripped"])
+
+        # 2. Bootstrapped five_session_history is forwarded to V1 tracking deviation
+        si_v1 = _valid_inputs()
+        si_v1["funds"]["TQQQ"].update(
+            {
+                "fund_return": "0.005",
+                "index_return": "0.0",
+                "five_session_history": [
+                    {"fund_return": 0.005, "index_return": 0.0} for _ in range(4)
+                ],
+            }
+        )
+        rows_v1, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            build_fuse_validated_inputs(
+                si_v1,
+                cal6,
+                policy_hash="p",
+                session_date="2026-01-06",
+                as_of="2026-01-06T22:00:00.000Z",
+            ),
+            {},
+            None,
+        )
+        self.assertEqual(rows_v1["V1"]["state"], "NO-NEW-RISK")
+        self.assertTrue(rows_v1["V1"]["latched"])
+        self.assertEqual(rows_v1["V1"]["reason"], "tracking_deviation_exceeds_2_0pp")
+
 
 if __name__ == "__main__":
     unittest.main()
