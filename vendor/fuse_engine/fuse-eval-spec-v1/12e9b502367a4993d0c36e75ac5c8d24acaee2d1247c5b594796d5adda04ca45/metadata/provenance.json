@@ -1,0 +1,66 @@
+{
+  "schema_version": "fuse-vendor-provenance/v1",
+  "source_repo": "QuantStrategyLab/FuseControl",
+  "source_branch": "main",
+  "source_commit": "46a86eedb0d33f6133a066edeb8c3660cda9097d",
+  "spec_version": "fuse-eval-spec/v1",
+  "engine_hash": "12e9b502367a4993d0c36e75ac5c8d24acaee2d1247c5b594796d5adda04ca45",
+  "bundle_hash": "78fed9dfc9b0b0a618fce6bb5a956063135f34845545e6a5154a32e119354cc9",
+  "freeze_hash": "1da74ca508161ba6d9a424101321381a9f5156d8cb2c84c03be2fd2fe3f22a74",
+  "vendor_relative_root": "vendor/fuse_engine/fuse-eval-spec-v1/12e9b502367a4993d0c36e75ac5c8d24acaee2d1247c5b594796d5adda04ca45",
+  "engine_package_dir": "fuse_engine",
+  "read_only_mode": "0444",
+  "no_pycache_committed": true,
+  "engine_files": {
+    "__init__.py": {
+      "sha256": "0aa1a46b5d14cbe43d4a46dc9ddc2233cb57b5dd6611d1ae6ee7c0a6800dac4c",
+      "bytes": 5875
+    },
+    "canonical.py": {
+      "sha256": "4300826c25d493061b66ae0313f2b9dbc8d7ef2952ed2ef20ac6e90d4578d36f",
+      "bytes": 1145
+    },
+    "canonical_state.py": {
+      "sha256": "854d5a02782a3f0f438c7eb025cce5f3207a9fb5124cd900e52589cf45ee00ee",
+      "bytes": 27333
+    },
+    "evaluator.py": {
+      "sha256": "067f2f666b7637efba6b6a88b387c3129b863fb0e40d6ba0ddf46a0a8238961a",
+      "bytes": 63939
+    },
+    "rows_loss.py": {
+      "sha256": "6ceb7a0309a55fdf592b6c05857ebede9ff637ba28084722ab2670de1d314440",
+      "bytes": 21403
+    },
+    "rows_ops.py": {
+      "sha256": "897226f25b73cfa228146acc2f15b25893d4da82cc0589eaee65bf41159b3472",
+      "bytes": 61890
+    },
+    "rows_vehicle.py": {
+      "sha256": "853a3d57a44d6cafed9bd20b16df27e40b5b57b411605971fc86c34f998c3b96",
+      "bytes": 43151
+    },
+    "state.py": {
+      "sha256": "c9ecdf10e3e0abdc1fe4c098f02b3883930185debb419a01008d2af72d4f6c5c",
+      "bytes": 4286
+    }
+  },
+  "metadata_files": {
+    "FREEZE.json": {
+      "sha256": "2262eabd746d2c6ff9e0e5f49853244d638b550330db049d2af9c41c659dd89d",
+      "bytes": 705
+    },
+    "disposition-register.json": {
+      "sha256": "4f2c497f727f9fa4be43d4aa287ff740f2affe1f602ab8518f10916cbfbe105c",
+      "bytes": 3602
+    },
+    "result-bundle.json": {
+      "sha256": "ca3af33909c2fd5c26364458406de710197dd87dc8c9f1234adef0c1f60cbd42",
+      "bytes": 973
+    },
+    "spec.json": {
+      "sha256": "94b99e5da90ce559c916aba10aca91cf9c370847266da59cd9e441a4c3bb2e1f",
+      "bytes": 14337
+    }
+  }
+}

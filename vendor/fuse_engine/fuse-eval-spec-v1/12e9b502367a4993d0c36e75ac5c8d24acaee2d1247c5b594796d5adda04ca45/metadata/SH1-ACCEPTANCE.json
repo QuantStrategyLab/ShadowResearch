@@ -1,0 +1,25 @@
+{
+  "schema_version": "sh1-entry-gate-record/v1",
+  "source_repo": "QuantStrategyLab/ShadowResearch",
+  "sh1_commit": "20be23f1ce4f4f23bd2f863aef43213894947bf3",
+  "csa22_v2_merge_commit": "204120875403519d10d75d35a5abc17ade71a71a",
+  "policy_id": "policy_v0_pre",
+  "policy_config_hash": "1f4fd701ee63f78b4445e3ece177b854e75618f307491a638c4e3d4546d17ad8",
+  "code_version_sha": "21b828440d46a746301dbe30f897eea5090207a4504f2d49bfe625bb2a2715fc",
+  "stub_engine_hash": "stub-d4dd72fbcf2f8d86",
+  "csa22_v1_spec_digest": "6601c01f2907119c25a2687d4b67210285d3c13ebf2d86a2953745dbd1f6f2af",
+  "csa22_v2_spec_digest": "2ba8cd7684c361209df68bfa2e10004c1f9922a645c7ec55d421fda520561798",
+  "acceptance_pack_path": "docs/sh1-acceptance-pack.md",
+  "acceptance_pack_sha256": "afb88d562b6466191e578587a3e3c072fbc3e9c1b43dea7ae291d63dc8a3dadb",
+  "offline_verification": {
+    "unit_tests_passed": 96,
+    "unit_tests_total": 96,
+    "demo_cases_passed": 8,
+    "demo_cases_total": 8,
+    "acceptance_offline_status": "PASS_OFFLINE"
+  },
+  "runtime_supersession": {
+    "item": "Item 18",
+    "note": "Mac mini runtime/clock topology superseded by secret-free GCP Cloud Run Jobs (us-east1); OA-SH2-2 production unlock remains gated off in repo config."
+  }
+}

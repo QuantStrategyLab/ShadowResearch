@@ -1,0 +1,69 @@
+{
+  "spec_version": "fuse-eval-spec/v1",
+  "register_version": "v1",
+  "frozen_at": "2026-11-23",
+  "entries": [
+    {
+      "parameter": "L6 one-session index fall threshold",
+      "row_id": "L6",
+      "proposal_value": "10% (≈30% in the fund)",
+      "source_reference": "BRIEF-FUSE-1 §4.5, REPORT.md §4.4 Table A",
+      "disposition": "CONFIRMED-AS-SPEC",
+      "rationale": "Market-wide halt Level 3 threshold per [W-MWCB]; 10% index fall ≈30% fund fall for 3× daily-reset",
+      "implementation_note": "Threshold = 0.10 (10% index return fall)"
+    },
+    {
+      "parameter": "V1 tracking deviation thresholds",
+      "row_id": "V1",
+      "proposal_value": "0.75pp (1 session), 2.0pp (5 sessions)",
+      "source_reference": "BRIEF-FUSE-1 §4.5, REPORT.md §4.4 Table B",
+      "disposition": "CONFIRMED-AS-SPEC",
+      "rationale": "Tracking deviation after modelled fee/financing; both 1-session (0.75pp) and 5-session rolling history (2.0pp) thresholds implemented and tested",
+      "implementation_note": "One-session threshold = 0.0075 (0.75pp); five-session rolling threshold = 0.020 (2.0pp)"
+    },
+    {
+      "parameter": "V4 volatility multiple",
+      "row_id": "V4",
+      "proposal_value": "2× long-run (≈48% for Nasdaq-100)",
+      "source_reference": "BRIEF-FUSE-1 §4.5, REPORT.md §4.4 Table B",
+      "disposition": "CONFIRMED-AS-SPEC",
+      "rationale": "Extreme volatility = forecast at or above 2× long-run figure",
+      "implementation_note": "Threshold = 2.0 * long_run_volatility"
+    },
+    {
+      "parameter": "V5 decay tolerance",
+      "row_id": "V5",
+      "proposal_value": "stated tolerance (unspecified)",
+      "source_reference": "BRIEF-FUSE-1 §4.5, U-01 OI-COST-3 unresolved",
+      "disposition": "UNRESOLVED-FAIL-CLOSED",
+      "rationale": "No venue source for tolerance parameter; OI-COST-3 unresolved in U-01",
+      "implementation_note": "v5_tolerance: None → fails closed (diagnostic trips, disposition='UNRESOLVED-FAIL-CLOSED')",
+      "verification": "tests/test_unresolved_fail_closed.py::test_v5_tolerance_unresolved_fails_closed"
+    },
+    {
+      "parameter": "V7 spread width",
+      "row_id": "V7",
+      "proposal_value": "stated width (unspecified)",
+      "source_reference": "BRIEF-FUSE-1 §4.5, U-01 OI-COST-4 unresolved",
+      "disposition": "UNRESOLVED-FAIL-CLOSED",
+      "rationale": "No venue source for spread width limit; OI-COST-4 unresolved in U-01",
+      "implementation_note": "v7_spread_width: None → fails closed (order not sent, reason='unresolved_fail_closed')",
+      "verification": "tests/test_unresolved_fail_closed.py::test_v7_spread_width_unresolved_fails_closed"
+    },
+    {
+      "parameter": "O5 price collar",
+      "row_id": "O5",
+      "proposal_value": "price collar [E1] (unspecified)",
+      "source_reference": "BRIEF-FUSE-1 §4.5, U-01 OI-COST-4 unresolved",
+      "disposition": "UNRESOLVED-FAIL-CLOSED",
+      "rationale": "No venue source for collar bounds; OI-COST-4 unresolved in U-01",
+      "implementation_note": "o5_collar: None → fails closed (order rejected, reason='unresolved_fail_closed')",
+      "verification": "tests/test_unresolved_fail_closed.py::test_o5_collar_unresolved_fails_closed"
+    }
+  ],
+  "grep_verification": {
+    "v5_tolerance": "No numeric default in spec/ or src/ (grep proof: tests/test_unresolved_fail_closed.py)",
+    "v7_spread_width": "No numeric default in spec/ or src/ (grep proof: tests/test_unresolved_fail_closed.py)",
+    "o5_collar": "No numeric default in spec/ or src/ (grep proof: tests/test_unresolved_fail_closed.py)"
+  }
+}
