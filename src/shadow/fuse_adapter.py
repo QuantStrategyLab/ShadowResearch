@@ -853,14 +853,50 @@ def _resolve_sizing_q_pre(raw_val: object, tier: str) -> int | None:
     return val if val >= 0 else None
 
 
+def _sizing_decimal(raw: object) -> Decimal | None:
+    """Parse a finite Decimal matching sizing._to_decimal()'s strict bankroll contract."""
+    if raw is None or isinstance(raw, (bool, float)):
+        return None
+    try:
+        dec = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+    except Exception:
+        return None
+    return dec if dec.is_finite() else None
+
+
+def _has_valid_sizing_bankroll(session_inputs: Mapping[str, Any]) -> bool:
+    """Return True when SHADOW inputs satisfy compute_session_sizing()'s required bankroll contract."""
+    e_dec = _sizing_decimal(session_inputs.get("E"))
+    e_star_dec = _sizing_decimal(session_inputs.get("E_star"))
+    h_dec = _sizing_decimal(session_inputs.get("H", "0"))
+    l_dec = _sizing_decimal(session_inputs.get("L"))
+    if e_dec is None or e_star_dec is None or h_dec is None or l_dec is None:
+        return False
+    if e_dec <= 0 or e_star_dec <= 0 or e_dec > e_star_dec or h_dec < 0 or l_dec < 0:
+        return False
+    raw_w_ref = session_inputs.get("W_ref")
+    if raw_w_ref is not None:
+        w_ref_dec = _sizing_decimal(raw_w_ref)
+        if w_ref_dec is None:
+            return False
+        w_ref_eff = w_ref_dec
+    else:
+        w_ref_eff = e_star_dec + h_dec
+    return w_ref_eff - l_dec > 0
+
+
 def _derive_default_max_loss_cap(
     session_inputs: Mapping[str, Any],
     tier: str,
     bankroll_val: float | None,
     hwm_val: float | None,
+    *,
+    require_sizing_bankroll: bool = True,
 ) -> float | None:
     """Derive L0 max_loss_cap from U-01 sizing Step 3 x_ML(c) * E, failing closed on bad inputs."""
     if bankroll_val is None or bankroll_val <= 0 or tier not in TIER_CONFIGS:
+        return None
+    if require_sizing_bankroll and not _has_valid_sizing_bankroll(session_inputs):
         return None
     try:
         e_dec = Decimal(str(session_inputs["E"]))
@@ -869,10 +905,12 @@ def _derive_default_max_loss_cap(
             if _finite_number(raw_e_star) is None:
                 return None
             e_star_dec = Decimal(str(raw_e_star))
-        elif hwm_val is not None:
+        elif not require_sizing_bankroll and hwm_val is not None:
             e_star_dec = Decimal(str(hwm_val))
-        else:
+        elif not require_sizing_bankroll:
             e_star_dec = e_dec
+        else:
+            return None
 
         raw_h = session_inputs.get("H", "0")
         if raw_h is None or _finite_number(raw_h) is None:
@@ -891,9 +929,11 @@ def _derive_default_max_loss_cap(
             if _finite_number(raw_l) is None:
                 return None
             l_dec = Decimal(str(raw_l))
-        else:
+        elif not require_sizing_bankroll:
             w_ref_eff = w_ref_dec if w_ref_dec is not None else (e_star_dec + h_dec)
             l_dec = max(Decimal("0"), w_ref_eff - (e_dec + h_dec))
+        else:
+            return None
 
         _, _, x_ml = compute_tier_max_loss_fraction(
             tier,
@@ -914,6 +954,7 @@ def _derive_conv_scale(
     hwm_val: float | None,
 ) -> Decimal | None:
     """Compute U-01 Step 6 convexity denominator (1 + H / E*), failing closed on invalid inputs."""
+    del bankroll_val
     try:
         raw_e_star = session_inputs.get("E_star")
         if raw_e_star is not None:
@@ -922,10 +963,8 @@ def _derive_conv_scale(
             e_star_dec = Decimal(str(raw_e_star))
         elif hwm_val is not None:
             e_star_dec = Decimal(str(hwm_val))
-        elif bankroll_val is not None:
-            e_star_dec = Decimal(str(bankroll_val))
         else:
-            return Decimal("1")
+            return None
 
         raw_h = session_inputs.get("H", "0")
         if raw_h is None or _finite_number(raw_h) is None:
@@ -976,7 +1015,11 @@ def _apply_explicit_payload_tier(
                 elif payload.get("one_session_loss") is not None:
                     cap_inputs["L"] = payload["one_session_loss"]
             derived_cap = _derive_default_max_loss_cap(
-                cap_inputs, requested_tier, bankroll_val, hwm_val
+                cap_inputs,
+                requested_tier,
+                bankroll_val,
+                hwm_val,
+                require_sizing_bankroll=("E" in session_inputs),
             )
             if derived_cap is not None:
                 payload["max_loss_cap"] = derived_cap
@@ -1044,7 +1087,7 @@ def build_fuse_validated_inputs(
     elif "E_star" in session_inputs:
         hwm_val = _finite_number(session_inputs.get("E_star"))
     else:
-        hwm_val = bankroll_val
+        hwm_val = None
 
     cal_status, exch_status = _map_calendar_statuses(calendar_session, session_date=session_date)
     if "tier_joint_cap" in session_inputs:
@@ -1053,7 +1096,9 @@ def build_fuse_validated_inputs(
         tier_joint_cap = float(Decimal(str(tier_cfg["x_joint"])) * Decimal(str(bankroll_val)))
     else:
         tier_joint_cap = None
-    if "max_loss_cap" in session_inputs:
+    if not _has_valid_sizing_bankroll(session_inputs):
+        max_loss_cap = None
+    elif "max_loss_cap" in session_inputs:
         max_loss_cap = _finite_number(session_inputs.get("max_loss_cap"))
     else:
         max_loss_cap = _derive_default_max_loss_cap(session_inputs, tier, bankroll_val, hwm_val)
