@@ -783,9 +783,13 @@ def _derive_one_session_loss(session_inputs: Mapping[str, Any]) -> float | None:
 def _map_market_corporate_action(mca: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(mca, Mapping):
         return None
+    raw_split = mca.get("split_ratio")
+    raw_cash = mca.get("cash_per_share_usd")
+    if isinstance(raw_split, bool) or isinstance(raw_cash, bool):
+        return None
     try:
-        split_dec = Decimal(str(mca.get("split_ratio", "1")))
-        cash_dec = Decimal(str(mca.get("cash_per_share_usd", "0")))
+        split_dec = Decimal("1") if raw_split is None else Decimal(str(raw_split))
+        cash_dec = Decimal("0") if raw_cash is None else Decimal(str(raw_cash))
     except Exception:
         return None
     if not split_dec.is_finite() or not cash_dec.is_finite():

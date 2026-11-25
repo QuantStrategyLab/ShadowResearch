@@ -249,7 +249,7 @@ def _require_strict_bool(
 def load_production_scheduler_config(config_path: str | Path | None = None) -> DrillSchedulerConfig:
     """Load and validate production scheduler config with strict boolean and OA-SH2-2 lock checks."""
     path = Path(config_path) if config_path is not None else DEFAULT_PRODUCTION_CONFIG_PATH
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = parse_json_no_duplicates(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("Production scheduler configuration JSON must be an object")
     if raw.get("mode") != "production":
@@ -3813,6 +3813,8 @@ def _run_daily_drill_cycle_locked(
     snapshots_dir = root / "state_snapshots"
     prior_state: dict = {}
     prior_row_state_used: dict | None = None
+    prior_rejected_session_date: str | None = None
+    prior_row_state_base_sha256: str | None = None
     session_base_prior_state: dict = {}
     prior_o4_resolved_symbols: list[str] = []
     prior_authorized_events: list[dict] = []
@@ -3878,6 +3880,10 @@ def _run_daily_drill_cycle_locked(
                 else 1
             )
             prior_row_state_used = copy.deepcopy(prior_state)
+            prior_rejected_session_date = str(
+                pending_rej[1].get("rejected_session_date") or session_date
+            )
+            prior_row_state_base_sha256 = expected_base_prior_sha
             session_base_prior_state = (
                 copy.deepcopy(committed_base_state) if head_env is not None else {}
             )
@@ -4193,6 +4199,14 @@ def _run_daily_drill_cycle_locked(
         }
         if prior_row_state_used is not None:
             fctx["prior_row_state_used"] = prior_row_state_used
+            if prior_row_state_base_sha256 is not None:
+                fctx["prior_row_state_base_sha256"] = prior_row_state_base_sha256
+            if prior_rejected_session_date is not None:
+                fctx["prior_rejected_session_date"] = prior_rejected_session_date
+            if prior_o4_resolved_symbols:
+                fctx["prior_o4_resolved_symbols"] = list(prior_o4_resolved_symbols)
+            if prior_authorized_events:
+                fctx["prior_authorized_events"] = copy.deepcopy(prior_authorized_events)
         if authorized_events is not None:
             fctx["authorized_events"] = copy.deepcopy(authorized_events)
         if lrv_map:

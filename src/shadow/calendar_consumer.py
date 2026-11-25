@@ -334,7 +334,10 @@ def classify_us_equity_session_window(
     """Classify a UTC timestamp into core RTH vs US 23/5 extended/overnight session windows."""
     tz = ZoneInfo(str(calendar_session.get("timezone", "America/New_York")))
     iso_norm = timestamp_utc[:-1] + "+00:00" if timestamp_utc.endswith("Z") else timestamp_utc
-    dt_local = datetime.fromisoformat(iso_norm).astimezone(tz)
+    dt_parsed = datetime.fromisoformat(iso_norm)
+    if dt_parsed.tzinfo is None:
+        raise ValueError(f"timezone_naive_timestamp:{timestamp_utc!r}")
+    dt_local = dt_parsed.astimezone(tz)
     local_date_str = dt_local.date().isoformat()
     local_t = dt_local.time()
     trade_date = str(calendar_session.get("trade_date", ""))
@@ -368,7 +371,10 @@ def is_official_close_bar_timestamp(
     tz = ZoneInfo(str(calendar_session.get("timezone", "America/New_York")))
     iso_norm = timestamp_utc[:-1] + "+00:00" if timestamp_utc.endswith("Z") else timestamp_utc
     try:
-        dt_local = datetime.fromisoformat(iso_norm).astimezone(tz)
+        dt_parsed = datetime.fromisoformat(iso_norm)
+        if dt_parsed.tzinfo is None:
+            return False, "invalid_bar_timestamp"
+        dt_local = dt_parsed.astimezone(tz)
     except ValueError:
         return False, "invalid_bar_timestamp"
 

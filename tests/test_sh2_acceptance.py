@@ -55,6 +55,21 @@ class Sh2AcceptanceTest(unittest.TestCase):
         self.assertIn(PINNED_CSA22_V2_DIGEST, pack_doc)
         self.assertIn("SH2-A14", pack_doc)
 
+    def test_sh2_acceptance_fails_closed_when_demo_case_fails(self) -> None:
+        from unittest import mock
+
+        bad_demo = {
+            "demo_suite": "SH2-D1-D10",
+            "passed": 9,
+            "total": 10,
+            "cases": {f"D{i}": {"status": "FAIL" if i == 6 else "PASS"} for i in range(1, 11)},
+        }
+        with mock.patch("run_sh2_demo.run_all_demos", return_value=bad_demo):
+            rep = run_sh2_acceptance(_REPO_ROOT)
+        self.assertEqual(rep["overall_status"], "FAILED")
+        check_a06 = next(c for c in rep["checks"] if c["id"] == "SH2-A06")
+        self.assertEqual(check_a06["status"], "FAILED")
+
 
 if __name__ == "__main__":
     unittest.main()

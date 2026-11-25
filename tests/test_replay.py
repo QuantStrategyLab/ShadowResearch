@@ -685,6 +685,73 @@ class ReplayTest(unittest.TestCase):
             self.assertFalse(drill_res["bit_for_bit_match"])
             self.assertIn("missing_required_market_series:['QQQ']", "".join(drill_res["archive_errors"]))
 
+    def test_replay_rejects_mismatched_prior_row_state_used_after_seq_zero(self) -> None:
+        import dataclasses
+        from datetime import datetime, timezone
+        from shadow.fuse_adapter import (
+            PINNED_CSA22_V2_DIGEST,
+            PINNED_FUSE_ENGINE_HASH,
+            PINNED_FUSE_SPEC_VERSION,
+        )
+        from shadow.scheduler import REPO_ROOT, load_scheduler_config, run_daily_drill_cycle
+
+        demo_dir = str(REPO_ROOT / "demo")
+        if demo_dir not in sys.path:
+            sys.path.insert(0, demo_dir)
+        from run_sh2_demo import _build_session_fixture_files
+
+        drill_cfg = dataclasses.replace(
+            load_scheduler_config(REPO_ROOT / "config" / "drill-scheduler.json"),
+            chain_id="drill-prior-state-mismatch",
+            calendar_version="csa22-v2",
+            calendar_spec_digest=PINNED_CSA22_V2_DIGEST,
+            fuse_spec_version=PINNED_FUSE_SPEC_VERSION,
+            fuse_engine_hash=PINNED_FUSE_ENGINE_HASH,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fix_root = root / "fixtures"
+            for idx, ds in enumerate(("2026-01-05", "2026-01-06")):
+                _build_session_fixture_files(fix_root / ds, ds)
+                res = run_daily_drill_cycle(
+                    session_date=ds,
+                    data_dir=root,
+                    config=drill_cfg,
+                    fixtures_dir=fix_root / ds,
+                    sigma_by_inst={"TQQQ": "0.50" if idx == 0 else "0.24", "SOXL": "0.24"},
+                    long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                    wall_clock=lambda d=ds: datetime.fromisoformat(f"{d}T22:30:00+00:00"),
+                )
+                self.assertTrue(res["appended"])
+
+            bundle_path = root / "replay" / "replay_bundle.json"
+            orig_bundle_bytes = bundle_path.read_bytes()
+
+            # (a) Unanchored tampered prior_row_state_used
+            bundle_a = json.loads(orig_bundle_bytes.decode("utf-8"))
+            bundle_a["sessions"][1].setdefault("fuse_context", {})["prior_row_state_used"] = {"tampered": True}
+            bundle_path.write_text(json.dumps(bundle_a), encoding="utf-8")
+
+            out_a = replay_window(root / "replay", root / "ledger")
+            self.assertFalse(out_a["bit_for_bit_match"])
+            self.assertTrue(any("seq_1:prior_row_state_used_mismatch" in m for m in out_a["mismatches"]))
+
+            # (b) Forged breaker downgrade (clearing V4) even with matching base SHA256 and valid date
+            snap0 = json.loads((root / "state_snapshots" / "seq_000000.state.json").read_text(encoding="utf-8"))
+            forged_prior = json.loads(json.dumps(snap0["next_row_state"]))
+            forged_prior["V4"] = {}
+            bundle_b = json.loads(orig_bundle_bytes.decode("utf-8"))
+            fctx_b = bundle_b["sessions"][1].setdefault("fuse_context", {})
+            fctx_b["prior_row_state_used"] = forged_prior
+            fctx_b["prior_row_state_base_sha256"] = snap0["state_sha256"]
+            fctx_b["prior_rejected_session_date"] = "2026-01-06"
+            bundle_path.write_text(json.dumps(bundle_b), encoding="utf-8")
+
+            out_b = replay_window(root / "replay", root / "ledger")
+            self.assertFalse(out_b["bit_for_bit_match"])
+            self.assertTrue(any("seq_1:prior_row_state_used_mismatch" in m for m in out_b["mismatches"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2350,6 +2350,25 @@ class FuseAdapterTest(unittest.TestCase):
                 self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input", msg=label)
                 self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=label)
 
+    def test_market_corporate_action_with_none_optional_fields_is_preserved(self) -> None:
+        from shadow.fuse_adapter import _map_market_corporate_action
+
+        split_only = _map_market_corporate_action(
+            {"split_ratio": "2", "cash_per_share_usd": None, "ex_date": "2026-01-05"}
+        )
+        self.assertIsNotNone(split_only)
+        assert split_only is not None
+        self.assertEqual(split_only["type"], "split")
+        self.assertEqual(split_only["ratio"], 2.0)
+
+        dist_only = _map_market_corporate_action(
+            {"split_ratio": None, "cash_per_share_usd": "0.5", "ex_date": "2026-01-05"}
+        )
+        self.assertIsNotNone(dist_only)
+        assert dist_only is not None
+        self.assertEqual(dist_only["type"], "distribution")
+        self.assertEqual(dist_only["cash_per_share_usd"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

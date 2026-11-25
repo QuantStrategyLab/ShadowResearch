@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Mapping
 from datetime import date, datetime, time as dt_time, timezone
@@ -24,6 +25,7 @@ from shadow.feeder import (
     verify_market_record_raw_integrity,
 )
 from shadow.fuse_adapter import (
+    EngineIdentityError,
     PINNED_FUSE_ENGINE_HASH,
     PINNED_FUSE_SPEC_VERSION,
     VendoredFuseEvaluator,
@@ -33,6 +35,8 @@ from shadow.fuse_adapter import (
 from shadow.ledger import (
     GENESIS_PREV_HASH,
     ShadowLedger,
+    _assert_pending_state_preserves_committed_breakers,
+    _sha256_canonical_state_dict,
     build_record_body,
     canonical_json_bytes,
     is_utc_ms_timestamp,
@@ -43,6 +47,60 @@ from shadow.ots import load_trusted_bitcoin_headers
 from shadow.sizing import canonical_decimal_str, policy_config_hash
 
 _NY_TZ = ZoneInfo("America/New_York")
+_DATE_YYYY_MM_DD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_prior_row_state_continuation(
+    fctx: Mapping[str, object],
+    prior_state: dict,
+    *,
+    session_date: str,
+    prev_session_date: str | None,
+    engine_hash: str,
+    spec_version: str,
+) -> dict | None:
+    """Validate optional pending-rejected prior_row_state_used continuity against prior_state."""
+    cand_prior = fctx.get("prior_row_state_used")
+    if not isinstance(cand_prior, Mapping):
+        return None
+    if cand_prior == prior_state:
+        return dict(cand_prior)
+    if fctx.get("prior_row_state_base_sha256") != _sha256_canonical_state_dict(prior_state):
+        return None
+    rej_ds = fctx.get("prior_rejected_session_date")
+    if not isinstance(rej_ds, str) or not _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds):
+        return None
+    try:
+        date.fromisoformat(rej_ds)
+    except ValueError:
+        return None
+    if rej_ds > session_date or (prev_session_date is not None and rej_ds < prev_session_date):
+        return None
+    raw_o4 = fctx.get("prior_o4_resolved_symbols")
+    if raw_o4 is not None and not isinstance(raw_o4, list):
+        return None
+    allowed_o4 = (
+        {str(s) for s in raw_o4 if isinstance(s, str) and s} if isinstance(raw_o4, list) else set()
+    )
+    raw_auth = fctx.get("prior_authorized_events")
+    if raw_auth is not None and (
+        not isinstance(raw_auth, list) or not all(isinstance(x, Mapping) for x in raw_auth)
+    ):
+        return None
+    try:
+        _assert_pending_state_preserves_committed_breakers(
+            prior_state,
+            cand_prior,
+            rej_ds=rej_ds,
+            expected_engine_hash=engine_hash,
+            expected_spec_version=spec_version,
+            expected_base_session_date=prev_session_date,
+            allowed_o4_resolved_symbols=allowed_o4,
+            authorized_events=raw_auth,
+        )
+    except EngineIdentityError:
+        return None
+    return dict(cand_prior)
 
 
 def _resolve_spec_dir(bundle: dict) -> Path:
@@ -254,6 +312,7 @@ def replay_window(
         }
 
     prior_state: dict = {}
+    prev_session_date: str | None = None
     prev_hash = GENESIS_PREV_HASH
     mismatches: list[str] = []
     archive_errors: list[str] = []
@@ -444,7 +503,18 @@ def replay_window(
                         replay_inputs[ctx_key] = fctx[ctx_key]
                 apply_fund_long_run_volatility(replay_inputs, fctx.get("long_run_vol_by_inst"))
                 if fctx.get("prior_row_state_used") is not None:
-                    eff_prior_state = fctx["prior_row_state_used"]
+                    validated_prior = _validate_prior_row_state_continuation(
+                        fctx,
+                        prior_state,
+                        session_date=sess["session_date"],
+                        prev_session_date=prev_session_date,
+                        engine_hash=ev.engine_hash,
+                        spec_version=ev.spec_version,
+                    )
+                    if validated_prior is None:
+                        mismatches.append(f"seq_{seq}:prior_row_state_used_mismatch")
+                    else:
+                        eff_prior_state = validated_prior
 
         res = build_record_body(
             chain_id=bundle["chain_id"],
@@ -486,6 +556,7 @@ def replay_window(
             )
 
         prior_state = res["next_row_state"]
+        prev_session_date = sess["session_date"]
         prev_hash = replayed_hash
 
     archived_inputs_ok = (len(archive_errors) == 0) if any_requires_market_records else False

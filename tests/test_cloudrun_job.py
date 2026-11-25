@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -2989,6 +2990,22 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(reg_obj["sequence"], 1)
             self.assertEqual(reg_obj["anchor_version"], 3)
             self.assertEqual(reg_bytes, peer_v3_bytes[0])
+
+    def test_read_bounded_http_body_converts_socket_timeout_to_deadline_exceeded(self) -> None:
+        from shadow.http_limits import read_bounded_http_body
+
+        class _TimeoutStream:
+            def read1(self, _n: int) -> bytes:
+                raise TimeoutError("timed out inside socket read")
+
+        with self.assertRaisesRegex(SourceUnavailableError, "deadline_exceeded"):
+            read_bounded_http_body(
+                _TimeoutStream(),
+                max_bytes=1024,
+                error_cls=SourceUnavailableError,
+                error_prefix="market",
+                deadline_monotonic=time.monotonic() + 5.0,
+            )
 
 
 if __name__ == "__main__":

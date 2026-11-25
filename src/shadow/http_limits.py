@@ -311,6 +311,8 @@ def read_bounded_http_body(
         to_read = min(chunk_size, (max_bytes - total) + 1)
         try:
             chunk = read_fn(to_read)
+        except TimeoutError as exc:
+            raise error_cls(f"{error_prefix}:deadline_exceeded") from exc
         except http.client.IncompleteRead as exc:
             raise error_cls(f"{error_prefix}:incomplete_body") from exc
         if not chunk:

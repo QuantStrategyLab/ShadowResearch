@@ -485,6 +485,37 @@ class SizingStackTest(unittest.TestCase):
         self.assertLessEqual(total_beta_post, Decimal(bal_part["x_ML"]) + Decimal("0.000002"))
         self.assertEqual(_fund(bal_part, "TQQQ")["delta_q_exec"], 0)
 
+    def test_derisk_excluded_from_cap_without_frozen_and_tier_j1_trim_triggers_bypass(self) -> None:
+        # 1) When TQQQ is DE-RISK and frozen_insts is empty, SOXL keeps full headroom.
+        derisk_res = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                q_pre_tqqq=200,
+                q_pre_soxl=0,
+            ),
+            fund_control_states={"TQQQ": "DE-RISK", "SOXL": "NORMAL"},
+        )
+        bal_derisk = _tier(derisk_res, "balanced")
+        self.assertEqual(_fund(bal_derisk, "TQQQ")["w_target"], "0")
+        self.assertGreater(int(_fund(bal_derisk, "SOXL")["q_ideal"]), 0)
+
+        # 2) Tier-level J1_TRIM triggers mandatory_bypass for a weight-reducing trade even inside +/-20% band.
+        # Compute baseline NORMAL balanced weight/q_pre slightly above target (inside 20% band) then trigger J1_TRIM on balanced tier.
+        base_normal = compute_session_sizing(_make_inputs(E="50000", E_star="50000"))
+        bal_norm = _tier(base_normal, "balanced")
+        q_target_tqqq = _fund(bal_norm, "TQQQ")["q_ideal"]
+        trim_res = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                q_pre_tqqq=int(q_target_tqqq) + 1,
+            ),
+            tier_control_states={"balanced": ("J1_TRIM", None)},
+        )
+        bal_trim = _tier(trim_res, "balanced")
+        self.assertEqual(_fund(bal_trim, "TQQQ")["delta_q_exec"], -1)
+
 
 if __name__ == "__main__":
     unittest.main()

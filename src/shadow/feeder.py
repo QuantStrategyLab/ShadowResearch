@@ -333,7 +333,10 @@ def _validate_core_rth_bar_timestamp(
             return
     iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
     try:
-        dt_ny = datetime.fromisoformat(iso_norm).astimezone(_NY_TZ)
+        dt_parsed = datetime.fromisoformat(iso_norm)
+        if dt_parsed.tzinfo is None:
+            raise ValueError("tiingo_invalid_timestamp")
+        dt_ny = dt_parsed.astimezone(_NY_TZ)
     except ValueError as exc:
         raise ValueError("tiingo_invalid_timestamp") from exc
     dt_d = dt_ny.date().isoformat()

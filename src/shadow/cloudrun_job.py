@@ -147,17 +147,17 @@ def run_cloudrun_job(
 
     if target_mode == "production":
         eff_expected_prior_head = (
-            expected_prior_head_sha256
+            (expected_prior_head_sha256.strip() or None)
             if expected_prior_head_sha256 is not None
             else (env.get("SHADOW_TRUSTED_HEAD_SHA256", "").strip() or None)
         )
         eff_expected_pending_state = (
-            expected_pending_state_sha256
+            (expected_pending_state_sha256.strip() or None)
             if expected_pending_state_sha256 is not None
             else (env.get("SHADOW_TRUSTED_PENDING_STATE_SHA256", "").strip() or None)
         )
         eff_trusted_anchor_path = (
-            trusted_head_anchor_path
+            (str(trusted_head_anchor_path).strip() or None)
             if trusted_head_anchor_path is not None
             else (env.get("SHADOW_TRUSTED_HEAD_ANCHOR_PATH", "").strip() or None)
         )
