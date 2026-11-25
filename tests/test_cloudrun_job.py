@@ -3007,6 +3007,135 @@ class CloudRunJobTest(unittest.TestCase):
                 deadline_monotonic=time.monotonic() + 5.0,
             )
 
+    def test_deadline_http_connect_bounds_multiple_resolved_addresses(self) -> None:
+        import socket
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+        from shadow.http_limits import make_deadline_http_handlers
+
+        addrinfos = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (f"203.0.113.{i}", 443))
+            for i in range(1, 5)
+        ]
+
+        # Part A: deterministic fake clock proves total connect budget is shared across addresses
+        now = [100.0]
+
+        def fake_clock() -> float:
+            return now[0]
+
+        timeouts_seen: list[float | None] = []
+        connected_addrs: list[tuple[str, int]] = []
+        created_sockets: list[object] = []
+
+        class _FakeClockSocket:
+            def __init__(self) -> None:
+                self.timeout: float | None = None
+                self.closed = False
+                created_sockets.append(self)
+
+            def settimeout(self, value: float | None) -> None:
+                self.timeout = value
+                timeouts_seen.append(value)
+
+            def connect(self, addr: tuple[str, int]) -> None:
+                connected_addrs.append(addr)
+                now[0] += 0.041
+                raise TimeoutError("timed out")
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            patch("socket.getaddrinfo", return_value=addrinfos),
+            patch("socket.socket", side_effect=lambda *_a, **_kw: _FakeClockSocket()),
+        ):
+            opener = urllib.request.build_opener(
+                *make_deadline_http_handlers(now[0] + 0.050, clock=fake_clock)
+            )
+            req = urllib.request.Request("https://multi-addr.invalid/")
+            with self.assertRaises(urllib.error.URLError) as cm:
+                opener.open(req, timeout=10.0)
+
+        self.assertIsInstance(cm.exception.reason, TimeoutError)
+        self.assertIn("http_connect_deadline_exceeded", str(cm.exception.reason))
+        self.assertEqual(len(connected_addrs), 2)
+        self.assertEqual(len(timeouts_seen), 2)
+        self.assertIsNotNone(timeouts_seen[0])
+        self.assertIsNotNone(timeouts_seen[1])
+        self.assertAlmostEqual(float(timeouts_seen[0]), 0.050, places=6)
+        self.assertAlmostEqual(float(timeouts_seen[1]), 0.009, places=6)
+        self.assertTrue(all(sock.closed for sock in created_sockets))  # type: ignore[attr-defined]
+
+        # Part B: real monotonic clock bounds wall-clock across 4 slow/blackholed addresses
+        real_sockets: list[object] = []
+
+        class _RealSlowSocket:
+            def __init__(self) -> None:
+                self.timeout: float | None = None
+                self.closed = False
+                real_sockets.append(self)
+
+            def settimeout(self, value: float | None) -> None:
+                self.timeout = value
+
+            def connect(self, _addr: tuple[str, int]) -> None:
+                delay = 0.041 if self.timeout is None else min(float(self.timeout), 0.041)
+                time.sleep(delay)
+                raise TimeoutError("timed out")
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            patch("socket.getaddrinfo", return_value=addrinfos),
+            patch("socket.socket", side_effect=lambda *_a, **_kw: _RealSlowSocket()),
+        ):
+            opener = urllib.request.build_opener(
+                *make_deadline_http_handlers(time.monotonic() + 0.050)
+            )
+            req = urllib.request.Request("https://multi-addr.invalid/")
+            t0 = time.monotonic()
+            with self.assertRaises(urllib.error.URLError) as cm_real:
+                opener.open(req, timeout=10.0)
+            elapsed = time.monotonic() - t0
+
+        self.assertIsInstance(cm_real.exception.reason, TimeoutError)
+        self.assertIn("http_connect_deadline_exceeded", str(cm_real.exception.reason))
+        self.assertLess(elapsed, 0.12)
+        self.assertTrue(all(sock.closed for sock in real_sockets))  # type: ignore[attr-defined]
+
+    def test_deadline_http_connect_bounds_slow_dns_resolution(self) -> None:
+        import threading
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+        from shadow.http_limits import make_deadline_http_handlers
+
+        release_dns = threading.Event()
+
+        def _slow_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+            release_dns.wait(timeout=2.0)
+            return []
+
+        try:
+            with patch("socket.getaddrinfo", side_effect=_slow_getaddrinfo):
+                opener = urllib.request.build_opener(
+                    *make_deadline_http_handlers(time.monotonic() + 0.050)
+                )
+                req = urllib.request.Request("https://slow-dns.invalid/")
+                t0 = time.monotonic()
+                with self.assertRaises(urllib.error.URLError) as cm:
+                    opener.open(req, timeout=10.0)
+                elapsed = time.monotonic() - t0
+        finally:
+            release_dns.set()
+
+        self.assertIsInstance(cm.exception.reason, TimeoutError)
+        self.assertIn("http_dns_deadline_exceeded", str(cm.exception.reason))
+        self.assertLess(elapsed, 0.25)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import io
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -165,11 +166,125 @@ class _DeadlineHTTPResponse(http.client.HTTPResponse):
         super().__init__(wrapped_sock, debuglevel=debuglevel, method=method, url=url)
 
 
+def _resolve_addrinfo_with_deadline(
+    host: str,
+    port: int | str,
+    *,
+    deadline_monotonic: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Any]:
+    rem = _remaining_timeout(deadline_monotonic, clock=clock)
+    if rem <= 0:
+        raise TimeoutError("http_dns_deadline_exceeded")
+
+    result: list[Any] = []
+    err: list[BaseException] = []
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            result.extend(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+        except BaseException as exc:
+            err.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, name="shadow-dns-resolve", daemon=True).start()
+    if not done.wait(timeout=max(0.001, rem)):
+        raise TimeoutError("http_dns_deadline_exceeded")
+    if _remaining_timeout(deadline_monotonic, clock=clock) <= 0:
+        raise TimeoutError("http_dns_deadline_exceeded")
+    if err:
+        raise err[0]
+    return result
+
+
+def _create_connection_with_deadline(
+    address: tuple[str, int],
+    timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: tuple[str, int] | None = None,
+    *,
+    deadline_monotonic: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> socket.socket:
+    host, port = address
+    addrinfos = _resolve_addrinfo_with_deadline(
+        host,
+        port,
+        deadline_monotonic=deadline_monotonic,
+        clock=clock,
+    )
+    if not addrinfos:
+        raise OSError("getaddrinfo returns an empty list")
+
+    last_err: OSError | None = None
+    for af, socktype, proto, _canonname, sa in addrinfos:
+        rem = _remaining_timeout(deadline_monotonic, clock=clock)
+        if rem <= 0:
+            raise TimeoutError("http_connect_deadline_exceeded")
+        eff = (
+            min(float(timeout), rem)
+            if isinstance(timeout, (int, float))
+            and not isinstance(timeout, bool)
+            and timeout > 0
+            else rem
+        )
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(max(0.001, eff))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+        except OSError as exc:
+            last_err = exc
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            if _remaining_timeout(deadline_monotonic, clock=clock) <= 0:
+                raise TimeoutError("http_connect_deadline_exceeded") from exc
+        except BaseException:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            raise
+        else:
+            if _remaining_timeout(deadline_monotonic, clock=clock) <= 0:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise TimeoutError("http_connect_deadline_exceeded")
+            return sock
+
+    if last_err is not None:
+        raise last_err
+    raise OSError("getaddrinfo returns an empty list")
+
+
 class _DeadlineConnectionMixin:
     """Mixin binding connect, TLS, tunnel, send, and response phases to a total monotonic deadline."""
 
     _deadline_monotonic: float
     _deadline_clock: Callable[[], float]
+
+    def _deadline_create_connection(
+        self,
+        address: tuple[str, int],
+        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        return _create_connection_with_deadline(
+            address,
+            timeout,
+            source_address,
+            deadline_monotonic=type(self)._deadline_monotonic,
+            clock=type(self)._deadline_clock,
+        )
 
     def _remaining_or_raise(self, label: str) -> float:
         rem = _remaining_timeout(type(self)._deadline_monotonic, clock=type(self)._deadline_clock)
@@ -205,19 +320,29 @@ class _DeadlineConnectionMixin:
 class _DeadlineHTTPConnection(_DeadlineConnectionMixin, http.client.HTTPConnection):
     def connect(self) -> None:
         self._tighten_timeout("http_connect_deadline_exceeded")
-        super().connect()
-        self._remaining_or_raise("http_connect_deadline_exceeded")
+        self._create_connection = self._deadline_create_connection
+        try:
+            super().connect()
+            self._remaining_or_raise("http_connect_deadline_exceeded")
+        except BaseException:
+            self.close()
+            raise
 
 
 class _DeadlineHTTPSConnection(_DeadlineConnectionMixin, http.client.HTTPSConnection):
     def connect(self) -> None:
         self._tighten_timeout("http_connect_deadline_exceeded")
-        http.client.HTTPConnection.connect(self)
-        rem = self._remaining_or_raise("http_tls_deadline_exceeded")
-        _set_stream_socket_timeout(self.sock, rem)
-        server_hostname = self._tunnel_host if self._tunnel_host else self.host
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
-        self._remaining_or_raise("http_tls_deadline_exceeded")
+        self._create_connection = self._deadline_create_connection
+        try:
+            http.client.HTTPConnection.connect(self)
+            rem = self._remaining_or_raise("http_tls_deadline_exceeded")
+            _set_stream_socket_timeout(self.sock, rem)
+            server_hostname = self._tunnel_host if self._tunnel_host else self.host
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+            self._remaining_or_raise("http_tls_deadline_exceeded")
+        except BaseException:
+            self.close()
+            raise
 
 
 def make_deadline_http_handlers(
