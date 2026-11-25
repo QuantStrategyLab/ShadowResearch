@@ -10,8 +10,8 @@ import marshal
 import re
 import sys
 import types
-from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation
+from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -683,13 +683,8 @@ _INDEX_RETURN_LABELS = (
 
 def _is_valid_sizing_signal(raw: object) -> bool:
     """Return True when raw decodes to a finite Decimal signal within sizing's [0, 1] contract."""
-    if raw is None or isinstance(raw, bool):
-        return False
-    try:
-        dec = Decimal(str(raw))
-    except (InvalidOperation, ValueError, TypeError):
-        return False
-    return dec.is_finite() and Decimal("0") <= dec <= Decimal("1")
+    dec = _sizing_decimal(raw)
+    return dec is not None and Decimal("0") <= dec <= Decimal("1")
 
 
 def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
@@ -882,7 +877,24 @@ def _has_valid_sizing_bankroll(session_inputs: Mapping[str, Any]) -> bool:
         w_ref_eff = w_ref_dec
     else:
         w_ref_eff = e_star_dec + h_dec
-    return w_ref_eff - l_dec > 0
+    if w_ref_eff - l_dec <= 0:
+        return False
+    raw_prior_e = session_inputs.get("prior_E")
+    if raw_prior_e is not None:
+        prior_e_dec = _sizing_decimal(raw_prior_e)
+        if prior_e_dec is None or prior_e_dec <= 0:
+            return False
+    if _sizing_decimal(session_inputs.get("external_flow", "0")) is None:
+        return False
+    monthly_returns = session_inputs.get("monthly_returns")
+    if monthly_returns is not None:
+        if not isinstance(monthly_returns, Sequence) or isinstance(
+            monthly_returns, (str, bytes, bytearray, Mapping)
+        ):
+            return False
+        if any(_sizing_decimal(item) is None for item in monthly_returns):
+            return False
+    return True
 
 
 def _derive_default_max_loss_cap(
@@ -1168,9 +1180,11 @@ def build_fuse_validated_inputs(
         fdata = raw_funds[symbol]
         if not isinstance(fdata, Mapping):
             continue
-        close_val = _finite_number(fdata.get("close_price"))
+        close_dec = _sizing_decimal(fdata.get("close_price"))
+        close_val = float(close_dec) if close_dec is not None else None
         q_pre_val = _resolve_sizing_q_pre(fdata.get("q_pre"), tier)
-        sigma_val = _finite_number(fdata.get("sigma_forecast"))
+        sigma_dec = _sizing_decimal(fdata.get("sigma_forecast"))
+        sigma_val = float(sigma_dec) if sigma_dec is not None else None
         signal_ok = _is_valid_sizing_signal(fdata.get("s"))
         if sigma_val is None or sigma_val <= 0.0:
             vol_ok = False

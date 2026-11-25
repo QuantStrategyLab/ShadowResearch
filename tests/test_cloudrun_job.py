@@ -1721,6 +1721,18 @@ class CloudRunJobTest(unittest.TestCase):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
 
+            def _send_truncated(self, code: int, body: bytes, declared_len: int) -> None:
+                self.send_response(code)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Length", str(declared_len))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                self.close_connection = True
+
             def do_GET(self) -> None:  # noqa: N802
                 if self.path == "/oversized-market":
                     self._send_bytes(200, b"m" * (5 * 1024 * 1024), include_cl=False)
@@ -1728,6 +1740,10 @@ class CloudRunJobTest(unittest.TestCase):
                     self.send_response(200)
                     self.send_header("Content-Length", "536870912")
                     self.end_headers()
+                elif self.path == "/truncated-csv":
+                    full_csv = b"Date,3 Mo\n01/05/2026,4.35\n"
+                    partial_csv = b"Date,3 Mo\n01/05/2026,4"
+                    self._send_truncated(200, partial_csv, len(full_csv))
                 elif self.path == "/oversized-500":
                     self._send_bytes(500, b"e" * (256 * 1024), include_cl=True)
                 elif self.path == "/ok-market":
@@ -1745,6 +1761,8 @@ class CloudRunJobTest(unittest.TestCase):
                     self.send_response(200)
                     self.send_header("Content-Length", "536870912")
                     self.end_headers()
+                elif self.path == "/truncated-ots/digest":
+                    self._send_truncated(200, ots_stamp_body[:8], len(ots_stamp_body))
                 elif self.path == "/oversized-500/digest":
                     self._send_bytes(500, b"e" * (256 * 1024), include_cl=True)
                 elif self.path == "/ok-ots/digest":
@@ -1763,6 +1781,8 @@ class CloudRunJobTest(unittest.TestCase):
                 urllib_fetch_bytes(f"{base}/oversized-market")
             with self.assertRaisesRegex(SourceUnavailableError, "content_length_exceeds_"):
                 urllib_fetch_bytes(f"{base}/oversized-cl")
+            with self.assertRaisesRegex(SourceUnavailableError, "incomplete_body"):
+                urllib_fetch_bytes(f"{base}/truncated-csv")
 
             st_err_m, body_err_m = urllib_fetch_bytes(f"{base}/oversized-500")
             self.assertEqual(st_err_m, 500)
@@ -1776,6 +1796,8 @@ class CloudRunJobTest(unittest.TestCase):
                 urllib_ots_transport("POST", f"{base}/oversized-ots/digest", b"x" * 32, {}, 5.0)
             with self.assertRaisesRegex(OtsSubmitError, "content_length_exceeds_"):
                 urllib_ots_transport("POST", f"{base}/oversized-cl/digest", b"x" * 32, {}, 5.0)
+            with self.assertRaisesRegex(OtsSubmitError, "incomplete_body"):
+                urllib_ots_transport("POST", f"{base}/truncated-ots/digest", b"x" * 32, {}, 5.0)
 
             st_err_o, body_err_o = urllib_ots_transport(
                 "POST", f"{base}/oversized-500/digest", b"x" * 32, {}, 5.0

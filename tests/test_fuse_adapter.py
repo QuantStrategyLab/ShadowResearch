@@ -2309,6 +2309,47 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
         self.assertTrue(built["next_row_state"]["L6"].get("latched"))
 
+    def test_float_sizing_inputs_fail_closed_via_o1_and_preserve_l6_latch(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+
+        cases = [
+            ("float_signal_s", lambda si: si["funds"]["TQQQ"].__setitem__("s", 1.0)),
+            ("float_close_price", lambda si: si["funds"]["TQQQ"].__setitem__("close_price", 50.0)),
+            ("float_sigma_forecast", lambda si: si["funds"]["TQQQ"].__setitem__("sigma_forecast", 0.24)),
+            ("float_prior_e", lambda si: si.__setitem__("prior_E", 50000.0)),
+            ("float_external_flow", lambda si: si.__setitem__("external_flow", 0.0)),
+            ("float_monthly_returns", lambda si: si.__setitem__("monthly_returns", [0.01])),
+        ]
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                si = json.loads(json.dumps(_valid_inputs()))
+                si["index_one_session_returns"] = {"NDX": -0.10, "SEMI": -0.02}
+                mutate(si)
+
+                built = build_record_body(
+                    chain_id="prod-sh2-v1",
+                    sequence=0,
+                    prev_record_sha256="0" * 64,
+                    mode="production",
+                    session_date="2026-01-05",
+                    decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                    session_inputs=si,
+                    calendar_session=cal,
+                    code_version_sha=code_sha,
+                    evaluator=ev,
+                    prior_row_state=None,
+                    calendar_spec=spec,
+                    discipline_labels={"forward_clock_credit_eligible": False},
+                )
+                self.assertFalse(built["appended"], msg=label)
+                self.assertTrue(built["fail_closed"], msg=label)
+                self.assertNotEqual(built["o1_output"]["state"], "NORMAL", msg=label)
+                self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input", msg=label)
+                self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=label)
+
 
 if __name__ == "__main__":
     unittest.main()
