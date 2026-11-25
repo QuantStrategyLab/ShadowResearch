@@ -1528,8 +1528,9 @@ class ShadowLedger:
                     raw_lease_id if isinstance(raw_lease_id, str) and raw_lease_id else None
                 )
                 eff_exp_dt = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
+                is_released = self._is_lease_released(lease_path, lease_id_str)
                 now_chk = self._now_utc()
-                if eff_exp_dt is not None and now_chk < eff_exp_dt:
+                if not is_released and eff_exp_dt is not None and now_chk < eff_exp_dt:
                     raise ChainConcurrencyConflictError(
                         "Chain lease held by active writer: "
                         f"lease_id={existing.get('lease_id')!r}, "
@@ -1653,7 +1654,12 @@ class ShadowLedger:
                             "Chain lease identity changed during stale CAS reclamation"
                         )
                     recheck_exp = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
-                    if recheck_exp is not None and self._now_utc() < recheck_exp:
+                    recheck_released = self._is_lease_released(lease_path, lease_id_str)
+                    if (
+                        not recheck_released
+                        and recheck_exp is not None
+                        and self._now_utc() < recheck_exp
+                    ):
                         raise ChainConcurrencyConflictError(
                             "Chain lease renewed during stale CAS reclamation"
                         )
@@ -1669,11 +1675,35 @@ class ShadowLedger:
                                 renew_file.unlink()
                             except FileNotFoundError:
                                 pass
+                        try:
+                            lease_path.with_name(
+                                f".chain.lease.released.{lease_id_str}.json"
+                            ).unlink()
+                        except FileNotFoundError:
+                            pass
                     continue
                 raise ChainConcurrencyConflictError(
                     "Chain lease creation conflicted after stale reclamation retry"
                 )
         raise ChainConcurrencyConflictError("Failed to acquire cross-instance chain lease")
+
+    @staticmethod
+    def _is_lease_released(lease_path: Path, lease_id: str | None) -> bool:
+        if not isinstance(lease_id, str) or not lease_id:
+            return False
+        released_path = lease_path.with_name(f".chain.lease.released.{lease_id}.json")
+        try:
+            _, raw_bytes = ShadowLedger._read_lease_snapshot(released_path)
+            parsed = parse_json_no_duplicates(raw_bytes.decode("utf-8", errors="replace"))
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+        return (
+            isinstance(parsed, dict)
+            and parsed.get("schema_version") == "c-sh-chain-lease-released-v1"
+            and parsed.get("lease_id") == lease_id
+        )
 
     @staticmethod
     def _effective_lease_expiry(
@@ -1737,9 +1767,10 @@ class ShadowLedger:
             or parsed.get("lease_id") != expected_lease_id
             or eff_exp is None
             or now_utc >= eff_exp
+            or self._is_lease_released(lease_path, expected_lease_id)
         ):
             raise ChainConcurrencyConflictError(
-                "Chain lease expired or displaced before renewal"
+                "Chain lease expired or displaced (or released) before renewal"
             )
 
         expires_utc = now_utc + timedelta(seconds=max(1.0, float(lease_ttl_seconds)))
@@ -1793,6 +1824,8 @@ class ShadowLedger:
         now_post = self._now_utc()
         if now_post >= eff_exp:
             _abort_renew("Chain lease expired during renewal")
+        if self._is_lease_released(lease_path, expected_lease_id):
+            _abort_renew("Chain lease released during renewal")
 
         stale_sha = hashlib.sha256(cur_bytes).hexdigest()
         claim_key = hashlib.sha256(
@@ -1847,18 +1880,22 @@ class ShadowLedger:
                 or parsed.get("lease_id") != lease_id
                 or exp_dt is None
                 or self._now_utc() >= exp_dt
+                or self._is_lease_released(lease_path, lease_id)
             ):
-                entry["lost_error"] = "Chain lease expired or displaced before write"
+                entry["lost_error"] = "Chain lease expired or displaced (or released) before write"
                 raise ChainConcurrencyConflictError(entry["lost_error"])
 
     @staticmethod
     def _release_cross_instance_lease(lease_path: Path, expected_lease_id: str) -> None:
         now_utc = ShadowLedger._now_utc()
+        active_lease_id: str | None = None
         if lease_path.is_file():
             try:
                 parsed = parse_json_no_duplicates(lease_path.read_text(encoding="utf-8"))
             except Exception:
                 parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("lease_id"), str):
+                active_lease_id = parsed["lease_id"]
             if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
                 exp_dt = ShadowLedger._effective_lease_expiry(
                     lease_path,
@@ -1866,9 +1903,32 @@ class ShadowLedger:
                     ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc")),
                 )
                 if exp_dt is None or now_utc < exp_dt:
+                    released_path = lease_path.with_name(
+                        f".chain.lease.released.{expected_lease_id}.json"
+                    )
+                    tmp_path = lease_path.with_name(
+                        f".chain.lease.tmp.released.{expected_lease_id}.{uuid4().hex}.lock"
+                    )
+                    released_bytes = (
+                        json.dumps(
+                            {
+                                "schema_version": "c-sh-chain-lease-released-v1",
+                                "lease_id": expected_lease_id,
+                                "released_at_utc": (
+                                    now_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+                                    + f"{now_utc.microsecond // 1000:03d}Z"
+                                ),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
                     try:
-                        lease_path.unlink()
-                    except FileNotFoundError:
+                        ShadowLedger._publish_exclusive_file(
+                            released_path, tmp_path, released_bytes
+                        )
+                    except FileExistsError:
                         pass
                     for renew_file in lease_path.parent.glob(
                         f".chain.lease.renew.{expected_lease_id}.*.json"
@@ -1884,6 +1944,23 @@ class ShadowLedger:
                     rpath.unlink()
             except Exception:
                 pass
+        for rel_path in lease_path.parent.glob(".chain.lease.released.*.json"):
+            try:
+                _, rel_bytes = ShadowLedger._read_lease_snapshot(rel_path)
+                rel_obj = parse_json_no_duplicates(rel_bytes.decode("utf-8", errors="replace"))
+                rel_id = rel_obj.get("lease_id") if isinstance(rel_obj, dict) else None
+            except Exception:
+                continue
+            if (
+                isinstance(rel_id, str)
+                and rel_id
+                and rel_id != expected_lease_id
+                and rel_id != active_lease_id
+            ):
+                try:
+                    rel_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     @contextmanager
     def chain_lock(

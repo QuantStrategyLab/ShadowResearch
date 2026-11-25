@@ -1106,7 +1106,12 @@ def build_fuse_validated_inputs(
         # Derive 1-session fund and benchmark index returns from real closes when not explicitly given
         if fdata.get("fund_return") is not None:
             fund_ret_val = _finite_number(fdata.get("fund_return"))
-        elif symbol in prior_closes and fdata.get("close_price") is not None:
+        elif (
+            not bad_market_payload
+            and symbol not in bad_market_insts
+            and symbol in prior_closes
+            and fdata.get("close_price") is not None
+        ):
             fund_ret_val = _compute_ca_adjusted_fund_return(
                 fdata.get("close_price"),
                 prior_closes.get(symbol),

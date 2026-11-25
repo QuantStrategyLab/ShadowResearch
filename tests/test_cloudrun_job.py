@@ -328,7 +328,10 @@ class CloudRunJobTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             )
             self.assertEqual(r_ok["status"], "committed")
-            self.assertFalse(lease_path.exists())
+            released_obj = json.loads(lease_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                ShadowLedger._is_lease_released(lease_path, released_obj["lease_id"])
+            )
 
             # 3. Mismatched lease_id overwritten by another writer must NOT be unlinked on exit
             with ledger.chain_lock():
@@ -932,7 +935,7 @@ class CloudRunJobTest(unittest.TestCase):
             active = json.loads(lease_path.read_text(encoding="utf-8"))
             self.assertEqual(active["lease_id"], winners[0])
             ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
-            self.assertFalse(lease_path.exists())
+            self.assertTrue(ShadowLedger._is_lease_released(lease_path, winners[0]))
 
             # Part 2: PRRT_kwDOV2RNAc67qas6 — external monotonic trusted anchor & rollback guards
             raw_cfg = json.loads(
@@ -1864,7 +1867,7 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(g2_payload["generation"], 2)
             self.assertEqual(g2_payload["claimed_by_lease_id"], winners[0])
             ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
-            self.assertFalse(lease_path.exists())
+            self.assertTrue(ShadowLedger._is_lease_released(lease_path, winners[0]))
             self.assertFalse(lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock").exists())
             self.assertFalse(lease_path.with_name(f".chain.lease.reclaim.{claim_key}.g1.lock").exists())
 
@@ -1951,7 +1954,7 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(g1_payload["claimed_by_lease_id"], acquired_id)
 
             ShadowLedger._release_cross_instance_lease(lease_path, acquired_id)
-            self.assertFalse(lease_path.exists())
+            self.assertTrue(ShadowLedger._is_lease_released(lease_path, acquired_id))
             self.assertFalse(empty_claim_path.exists())
 
     def test_chain_lock_renews_lease_and_fences_displaced_or_expired_writer(self) -> None:
@@ -2063,6 +2066,68 @@ class CloudRunJobTest(unittest.TestCase):
                     self.assertEqual(len(fence_ledger.load_records()), 0)
             finally:
                 ShadowLedger._now_utc = orig_now_desc  # type: ignore[assignment]
+
+            # 3. Paused release resuming after expiry/peer acquisition never deletes successor's lease
+            rel_ledger = ShadowLedger(Path(tmpdir) / "release_race" / "ledger")
+            rel_lease = rel_ledger.root_dir / ".chain.lease.json"
+            base_rel = datetime.now(timezone.utc)
+            orig_rel_now = ShadowLedger.__dict__["_now_utc"]
+            orig_rel_pub = ShadowLedger.__dict__["_publish_exclusive_file"]
+            rel_box = [base_rel]
+            ShadowLedger._now_utc = staticmethod(lambda: rel_box[0])  # type: ignore[method-assign]
+            try:
+                first_rel_id = rel_ledger._acquire_cross_instance_lease(
+                    rel_lease, lease_ttl_seconds=300.0
+                )
+                rel_peer = ShadowLedger(rel_ledger.root_dir)
+                rel_peer_box: list[str] = []
+
+                @staticmethod
+                def _paused_release_publish(
+                    dest_path: Path, tmp_path: Path, payload_bytes: bytes
+                ) -> None:
+                    if dest_path.name == f".chain.lease.released.{first_rel_id}.json":
+                        rel_box[0] = base_rel + timedelta(seconds=301)
+                        rel_peer_box.append(
+                            rel_peer._acquire_cross_instance_lease(
+                                rel_lease, lease_ttl_seconds=300.0
+                            )
+                        )
+                    orig_rel_pub.__func__(dest_path, tmp_path, payload_bytes)  # type: ignore[attr-defined]
+
+                ShadowLedger._publish_exclusive_file = _paused_release_publish  # type: ignore[method-assign]
+                ShadowLedger._release_cross_instance_lease(rel_lease, first_rel_id)
+                ShadowLedger._publish_exclusive_file = orig_rel_pub  # type: ignore[assignment]
+
+                cur_rel_obj = json.loads(rel_lease.read_text(encoding="utf-8"))
+                self.assertEqual(len(rel_peer_box), 1)
+                self.assertEqual(cur_rel_obj["lease_id"], rel_peer_box[0])
+                self.assertNotEqual(cur_rel_obj["lease_id"], first_rel_id)
+                self.assertFalse(ShadowLedger._is_lease_released(rel_lease, rel_peer_box[0]))
+
+                third_peer = ShadowLedger(rel_ledger.root_dir)
+                with self.assertRaisesRegex(
+                    ChainConcurrencyConflictError, "held by active writer"
+                ):
+                    third_peer._acquire_cross_instance_lease(rel_lease, lease_ttl_seconds=300.0)
+            finally:
+                ShadowLedger._publish_exclusive_file = orig_rel_pub  # type: ignore[assignment]
+                ShadowLedger._now_utc = orig_rel_now  # type: ignore[assignment]
+
+            # 4. Normal release publishes tombstone and subsequent sequential chain_lock reclaims cleanly
+            seq_ledger = ShadowLedger(Path(tmpdir) / "seq_release" / "ledger")
+            seq_lease = seq_ledger.root_dir / ".chain.lease.json"
+            with seq_ledger.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
+                id1 = json.loads(seq_lease.read_text(encoding="utf-8"))["lease_id"]
+            self.assertTrue(ShadowLedger._is_lease_released(seq_lease, id1))
+            seq_peer = ShadowLedger(seq_ledger.root_dir)
+            with seq_peer.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
+                id2 = json.loads(seq_lease.read_text(encoding="utf-8"))["lease_id"]
+                self.assertNotEqual(id2, id1)
+                seq_peer.assert_active_chain_lease()
+                self.assertFalse(
+                    seq_lease.with_name(f".chain.lease.released.{id1}.json").exists()
+                )
 
 
 if __name__ == "__main__":
