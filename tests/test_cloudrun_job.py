@@ -1770,6 +1770,139 @@ class CloudRunJobTest(unittest.TestCase):
             srv.server_close()
             thread.join(timeout=2.0)
 
+    def test_multi_generation_expired_reclaim_recovery_and_active_higher_gen_guard(self) -> None:
+        import hashlib
+        import threading
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Expired gen=0 and gen=1 claims recover cleanly via gen=2 with single winner
+            rec_dir = Path(tmpdir) / "multi_gen_reclaim"
+            ledger = ShadowLedger(rec_dir / "ledger")
+            lease_path = ledger.root_dir / ".chain.lease.json"
+            past_utc = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"
+            )
+            future_utc = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"
+            )
+            stale_bytes = json.dumps(
+                {
+                    "schema_version": "c-sh-chain-lease-v1",
+                    "lease_id": "stale-crashed-111",
+                    "pid": 777777,
+                    "execution_id": "exec-stale-111",
+                    "expires_at_utc": past_utc,
+                }
+            ).encode("utf-8")
+            lease_path.write_bytes(stale_bytes)
+            stale_sha = hashlib.sha256(stale_bytes).hexdigest()
+            claim_key = hashlib.sha256(
+                f"id:stale-crashed-111:{stale_sha}".encode("utf-8")
+            ).hexdigest()[:32]
+
+            for gen, name in (
+                (0, f".chain.lease.reclaim.{claim_key}.lock"),
+                (1, f".chain.lease.reclaim.{claim_key}.g1.lock"),
+            ):
+                lease_path.with_name(name).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "c-sh-chain-lease-reclaim-v1",
+                            "claim_key": claim_key,
+                            "generation": gen,
+                            "claimed_by_lease_id": f"crashed-reclaimer-{gen}",
+                            "expires_at_utc": past_utc,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            barrier = threading.Barrier(2)
+            tls = threading.local()
+            orig_parse_desc = ShadowLedger.__dict__["_parse_iso_utc"]
+            orig_parse = orig_parse_desc.__func__
+
+            def _sync_parse(raw: object) -> datetime | None:
+                res = orig_parse(raw)
+                if not getattr(tls, "waited", False):
+                    tls.waited = True
+                    barrier.wait(timeout=5.0)
+                return res
+
+            winners: list[str] = []
+            conflicts: list[Exception] = []
+            lock = threading.Lock()
+
+            def _worker() -> None:
+                try:
+                    lid = ledger._acquire_cross_instance_lease(
+                        lease_path, lease_ttl_seconds=300.0
+                    )
+                    with lock:
+                        winners.append(lid)
+                except ChainConcurrencyConflictError as exc:
+                    with lock:
+                        conflicts.append(exc)
+
+            ShadowLedger._parse_iso_utc = staticmethod(_sync_parse)  # type: ignore[method-assign]
+            try:
+                t1 = threading.Thread(target=_worker)
+                t2 = threading.Thread(target=_worker)
+                t1.start()
+                t2.start()
+                t1.join(timeout=10.0)
+                t2.join(timeout=10.0)
+            finally:
+                ShadowLedger._parse_iso_utc = orig_parse_desc  # type: ignore[assignment]
+
+            self.assertEqual(len(winners), 1, f"winners={winners}, conflicts={conflicts}")
+            self.assertEqual(len(conflicts), 1, f"winners={winners}, conflicts={conflicts}")
+            g2_path = lease_path.with_name(f".chain.lease.reclaim.{claim_key}.g2.lock")
+            self.assertTrue(g2_path.is_file())
+            g2_payload = json.loads(g2_path.read_text(encoding="utf-8"))
+            self.assertEqual(g2_payload["generation"], 2)
+            self.assertEqual(g2_payload["claimed_by_lease_id"], winners[0])
+            ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
+            self.assertFalse(lease_path.exists())
+            self.assertFalse(lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock").exists())
+            self.assertFalse(lease_path.with_name(f".chain.lease.reclaim.{claim_key}.g1.lock").exists())
+
+            # 2. Active higher-generation claim blocks reclamation even when gen=0 is absent
+            guard_dir = Path(tmpdir) / "active_higher_gen"
+            guard_ledger = ShadowLedger(guard_dir / "ledger")
+            guard_lease = guard_ledger.root_dir / ".chain.lease.json"
+            stale_guard = json.dumps(
+                {
+                    "schema_version": "c-sh-chain-lease-v1",
+                    "lease_id": "stale-crashed-222",
+                    "pid": 666666,
+                    "execution_id": "exec-stale-222",
+                    "expires_at_utc": past_utc,
+                }
+            ).encode("utf-8")
+            guard_lease.write_bytes(stale_guard)
+            guard_sha = hashlib.sha256(stale_guard).hexdigest()
+            guard_key = hashlib.sha256(
+                f"id:stale-crashed-222:{guard_sha}".encode("utf-8")
+            ).hexdigest()[:32]
+            guard_lease.with_name(f".chain.lease.reclaim.{guard_key}.g1.lock").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-reclaim-v1",
+                        "claim_key": guard_key,
+                        "generation": 1,
+                        "claimed_by_lease_id": "active-reclaimer-g1",
+                        "expires_at_utc": future_utc,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ChainConcurrencyConflictError, "already claimed by peer writer"
+            ):
+                guard_ledger._acquire_cross_instance_lease(guard_lease, lease_ttl_seconds=300.0)
+
 
 if __name__ == "__main__":
     unittest.main()

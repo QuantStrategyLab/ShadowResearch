@@ -1411,6 +1411,8 @@ class ShadowLedger:
         except ValueError:
             return None
 
+    _MAX_RECLAIM_GENERATIONS = 64
+
     @staticmethod
     def _read_lease_snapshot(lease_path: Path) -> tuple[os.stat_result, bytes]:
         rfd = os.open(str(lease_path), os.O_RDONLY)
@@ -1512,77 +1514,58 @@ class ShadowLedger:
                             f"raw:{stale_sha}:{int(orig_st.st_mtime)}:{orig_st.st_size}"
                         )
                     claim_key = hashlib.sha256(claim_basis.encode("utf-8")).hexdigest()[:32]
-                    reclaim_path = lease_path.with_name(
-                        f".chain.lease.reclaim.{claim_key}.lock"
-                    )
                     reclaim_expires = now_chk + timedelta(
                         seconds=max(300.0, float(lease_ttl_seconds))
                     )
-                    reclaim_bytes = (
-                        json.dumps(
-                            {
-                                "schema_version": "c-sh-chain-lease-reclaim-v1",
-                                "claim_key": claim_key,
-                                "reclaimed_lease_id": raw_lease_id,
-                                "claimed_by_lease_id": lease_id,
-                                "claimed_at_utc": now_chk.strftime("%Y-%m-%dT%H:%M:%S.")
-                                + f"{now_chk.microsecond // 1000:03d}Z",
-                                "expires_at_utc": reclaim_expires.strftime("%Y-%m-%dT%H:%M:%S.")
-                                + f"{reclaim_expires.microsecond // 1000:03d}Z",
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                        + "\n"
-                    ).encode("utf-8")
-                    try:
-                        cfd = os.open(
-                            str(reclaim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-                        )
+                    existing_claims = [
+                        lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock"),
+                        *sorted(lease_path.parent.glob(f".chain.lease.reclaim.{claim_key}.g*.lock")),
+                    ]
+                    for existing_claim_path in existing_claims:
                         try:
-                            os.write(cfd, reclaim_bytes)
-                            os.fsync(cfd)
-                        finally:
-                            os.close(cfd)
-                    except FileExistsError as exc:
-                        try:
-                            rc_st, rc_bytes = self._read_lease_snapshot(reclaim_path)
-                            rp = (
-                                parse_json_no_duplicates(
-                                    rc_bytes.decode("utf-8", errors="replace")
-                                )
-                                if rc_bytes.strip()
-                                else {}
-                            )
-                        except FileNotFoundError as fnf:
-                            raise ChainConcurrencyConflictError(
-                                "Stale chain lease reclamation claim vanished during acquisition"
-                            ) from fnf
+                            _, ex_bytes = self._read_lease_snapshot(existing_claim_path)
+                        except FileNotFoundError:
+                            continue
                         except Exception as pexc:
                             raise ChainConcurrencyConflictError(
                                 "Stale chain lease reclamation already claimed by peer writer"
                             ) from pexc
-                        reclaim_exp = (
-                            self._parse_iso_utc(rp.get("expires_at_utc"))
-                            if isinstance(rp, dict)
-                            else None
-                        )
-                        if reclaim_exp is None or now_chk < reclaim_exp:
+                        try:
+                            ex_rp = (
+                                parse_json_no_duplicates(
+                                    ex_bytes.decode("utf-8", errors="replace")
+                                )
+                                if ex_bytes.strip()
+                                else {}
+                            )
+                        except Exception as pexc:
                             raise ChainConcurrencyConflictError(
                                 "Stale chain lease reclamation already claimed by peer writer"
-                            ) from exc
-                        meta_key = hashlib.sha256(b"exp_reclaim:" + rc_bytes).hexdigest()[:32]
-                        meta_path = lease_path.with_name(
-                            f".chain.lease.reclaim.{meta_key}.lock"
+                            ) from pexc
+                        ex_exp = (
+                            self._parse_iso_utc(ex_rp.get("expires_at_utc"))
+                            if isinstance(ex_rp, dict)
+                            else None
                         )
-                        meta_bytes = (
+                        if ex_exp is None or now_chk < ex_exp:
+                            raise ChainConcurrencyConflictError(
+                                "Stale chain lease reclamation already claimed by peer writer"
+                            )
+
+                    won = False
+                    for gen in range(self._MAX_RECLAIM_GENERATIONS):
+                        reclaim_path = lease_path.with_name(
+                            f".chain.lease.reclaim.{claim_key}.lock"
+                            if gen == 0
+                            else f".chain.lease.reclaim.{claim_key}.g{gen}.lock"
+                        )
+                        reclaim_bytes = (
                             json.dumps(
                                 {
                                     "schema_version": "c-sh-chain-lease-reclaim-v1",
-                                    "claim_key": meta_key,
-                                    "reclaimed_claim_by": rp.get("claimed_by_lease_id")
-                                    if isinstance(rp, dict)
-                                    else None,
+                                    "claim_key": claim_key,
+                                    "generation": gen,
+                                    "reclaimed_lease_id": raw_lease_id,
                                     "claimed_by_lease_id": lease_id,
                                     "claimed_at_utc": now_chk.strftime("%Y-%m-%dT%H:%M:%S.")
                                     + f"{now_chk.microsecond // 1000:03d}Z",
@@ -1597,53 +1580,62 @@ class ShadowLedger:
                             + "\n"
                         ).encode("utf-8")
                         try:
-                            mfd = os.open(
-                                str(meta_path),
-                                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                                0o600,
-                            )
-                            try:
-                                os.write(mfd, meta_bytes)
-                                os.fsync(mfd)
-                            finally:
-                                os.close(mfd)
-                        except FileExistsError as mexc:
-                            raise ChainConcurrencyConflictError(
-                                "Expired reclamation claim recovery already claimed by peer writer"
-                            ) from mexc
-                        try:
-                            cur_rc_st, cur_rc_bytes = self._read_lease_snapshot(reclaim_path)
-                        except FileNotFoundError as fnf:
-                            raise ChainConcurrencyConflictError(
-                                "Expired reclamation claim vanished before CAS unlink"
-                            ) from fnf
-                        if (
-                            cur_rc_st.st_dev != rc_st.st_dev
-                            or cur_rc_st.st_ino != rc_st.st_ino
-                            or cur_rc_bytes != rc_bytes
-                        ):
-                            raise ChainConcurrencyConflictError(
-                                "Expired reclamation claim identity changed during recovery"
-                            )
-                        try:
-                            os.unlink(str(reclaim_path))
-                        except FileNotFoundError:
-                            pass
-                        try:
                             cfd = os.open(
-                                str(reclaim_path),
-                                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                                0o600,
+                                str(reclaim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
                             )
                             try:
                                 os.write(cfd, reclaim_bytes)
                                 os.fsync(cfd)
                             finally:
                                 os.close(cfd)
-                        except FileExistsError as exc2:
-                            raise ChainConcurrencyConflictError(
-                                "Stale chain lease reclamation contended after orphan recovery"
-                            ) from exc2
+                            won = True
+                            break
+                        except FileExistsError as exc:
+                            try:
+                                _, rc_bytes = self._read_lease_snapshot(reclaim_path)
+                                rp = (
+                                    parse_json_no_duplicates(
+                                        rc_bytes.decode("utf-8", errors="replace")
+                                    )
+                                    if rc_bytes.strip()
+                                    else {}
+                                )
+                            except FileNotFoundError as fnf:
+                                raise ChainConcurrencyConflictError(
+                                    "Stale chain lease reclamation claim vanished during acquisition"
+                                ) from fnf
+                            except Exception as pexc:
+                                raise ChainConcurrencyConflictError(
+                                    "Stale chain lease reclamation already claimed by peer writer"
+                                ) from pexc
+                            reclaim_exp = (
+                                self._parse_iso_utc(rp.get("expires_at_utc"))
+                                if isinstance(rp, dict)
+                                else None
+                            )
+                            if reclaim_exp is None or now_chk < reclaim_exp:
+                                raise ChainConcurrencyConflictError(
+                                    "Stale chain lease reclamation already claimed by peer writer"
+                                ) from exc
+                            try:
+                                chk_st, chk_bytes = self._read_lease_snapshot(lease_path)
+                            except FileNotFoundError as fnf:
+                                raise ChainConcurrencyConflictError(
+                                    "Chain lease changed before stale CAS reclamation completed"
+                                ) from fnf
+                            if (
+                                chk_st.st_dev != orig_st.st_dev
+                                or chk_st.st_ino != orig_st.st_ino
+                                or chk_bytes != existing_bytes
+                            ):
+                                raise ChainConcurrencyConflictError(
+                                    "Chain lease identity changed during stale CAS reclamation"
+                                )
+                            continue
+                    if not won:
+                        raise ChainConcurrencyConflictError(
+                            "Stale chain lease reclamation generation budget exhausted"
+                        )
 
                     try:
                         cur_st, cur_bytes = self._read_lease_snapshot(lease_path)
