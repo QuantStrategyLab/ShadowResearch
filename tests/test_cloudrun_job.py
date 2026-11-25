@@ -2608,6 +2608,104 @@ class CloudRunJobTest(unittest.TestCase):
             )
             self.assertEqual(ShadowLedger(ddir / "ledger").verify_chain()[0], True)
 
+    def test_partial_lease_and_reclaim_fallback_writes_recover_after_grace_window(self) -> None:
+        import errno
+        import hashlib
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # (a) Synchronous write failure on target lfd under os.link ENOSYS cleans up partial target_path
+            sync_ledger = ShadowLedger(Path(tmpdir) / "sync_fail" / "ledger")
+            sync_lease = sync_ledger.root_dir / ".chain.lease.json"
+            orig_write_all = ShadowLedger.__dict__["_write_all"]
+            write_calls = [0]
+
+            def _enosys_link(_src: object, _dst: object) -> None:
+                raise OSError(errno.ENOSYS, "Function not implemented")
+
+            @staticmethod
+            def _partial_fail_write(fd: int, data: bytes) -> None:
+                write_calls[0] += 1
+                if write_calls[0] == 1:
+                    orig_write_all.__func__(fd, data)  # type: ignore[attr-defined]
+                    return
+                os.write(fd, data[:20])
+                raise OSError(errno.EIO, "simulated partial fallback write")
+
+            with mock.patch("os.link", side_effect=_enosys_link):
+                ShadowLedger._write_all = _partial_fail_write  # type: ignore[method-assign]
+                try:
+                    with self.assertRaises(OSError):
+                        sync_ledger._acquire_cross_instance_lease(
+                            sync_lease, lease_ttl_seconds=300.0
+                        )
+                    self.assertEqual(write_calls[0], 2)
+                    self.assertFalse(sync_lease.exists())
+                finally:
+                    ShadowLedger._write_all = orig_write_all  # type: ignore[assignment]
+
+            # (b) Crashed partial fallback lease blocks within 5s grace, then recovers after grace window
+            base_now = datetime.now(timezone.utc)
+            orig_now_desc = ShadowLedger.__dict__["_now_utc"]
+            now_box = [base_now]
+            ShadowLedger._now_utc = staticmethod(lambda: now_box[0])  # type: ignore[method-assign]
+            try:
+                crash_ledger = ShadowLedger(Path(tmpdir) / "crash_lease" / "ledger")
+                crash_ledger.root_dir.mkdir(parents=True, exist_ok=True)
+                crash_lease = crash_ledger.root_dir / ".chain.lease.json"
+                crash_lease.write_bytes(b'{"acquired_at_utc":"')
+                os.utime(crash_lease, (base_now.timestamp(), base_now.timestamp()))
+
+                with self.assertRaisesRegex(
+                    ChainConcurrencyConflictError, "initializing by peer writer"
+                ):
+                    crash_ledger._acquire_cross_instance_lease(
+                        crash_lease, lease_ttl_seconds=300.0
+                    )
+
+                now_box[0] = base_now + timedelta(days=1)
+                with mock.patch("os.link", side_effect=_enosys_link):
+                    with crash_ledger.chain_lock(
+                        lease_ttl_seconds=300.0, renew_interval_seconds=3600.0
+                    ):
+                        slot = ShadowLedger._latest_lease_slot(crash_lease)
+                        self.assertIsNotNone(slot)
+                        self.assertEqual(slot[0], 1)
+                        crash_ledger.assert_active_chain_lease()
+
+                # (c) Partial reclaim claim blocks within 5s grace, then recovers via next generation
+                reclaim_ledger = ShadowLedger(Path(tmpdir) / "crash_reclaim" / "ledger")
+                reclaim_lease = reclaim_ledger.root_dir / ".chain.lease.json"
+                now_box[0] = base_now
+                reclaim_ledger._acquire_cross_instance_lease(
+                    reclaim_lease, lease_ttl_seconds=1.0
+                )
+                expired_bytes = reclaim_lease.read_bytes()
+                expired_obj = json.loads(expired_bytes.decode("utf-8"))
+                stale_sha = hashlib.sha256(expired_bytes).hexdigest()
+                claim_basis = f"id:{expired_obj['lease_id']}:{stale_sha}"
+                claim_key = hashlib.sha256(claim_basis.encode("utf-8")).hexdigest()[:32]
+                bad_reclaim = reclaim_lease.with_name(f".chain.lease.reclaim.{claim_key}.lock")
+                now_box[0] = base_now + timedelta(seconds=5)
+                bad_reclaim.write_bytes(b'{"claim_key":"partia')
+                os.utime(bad_reclaim, (now_box[0].timestamp(), now_box[0].timestamp()))
+
+                peer = ShadowLedger(reclaim_ledger.root_dir)
+                with self.assertRaisesRegex(
+                    ChainConcurrencyConflictError, "already claimed by peer writer"
+                ):
+                    peer._acquire_cross_instance_lease(reclaim_lease, lease_ttl_seconds=300.0)
+
+                now_box[0] = now_box[0] + timedelta(seconds=6)
+                with peer.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
+                    slot_r = ShadowLedger._latest_lease_slot(reclaim_lease)
+                    self.assertIsNotNone(slot_r)
+                    self.assertEqual(slot_r[0], 1)
+                    peer.assert_active_chain_lease()
+            finally:
+                ShadowLedger._now_utc = orig_now_desc  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

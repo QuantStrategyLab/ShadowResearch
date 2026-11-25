@@ -1482,11 +1482,20 @@ class ShadowLedger:
                 ):
                     raise
                 lfd = os.open(str(target_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                wrote_ok = False
                 try:
                     ShadowLedger._write_all(lfd, payload)
                     os.fsync(lfd)
+                    wrote_ok = True
                 finally:
-                    os.close(lfd)
+                    try:
+                        os.close(lfd)
+                    finally:
+                        if not wrote_ok:
+                            try:
+                                target_path.unlink()
+                            except OSError:
+                                pass
         finally:
             try:
                 tmp_path.unlink()
@@ -1494,22 +1503,33 @@ class ShadowLedger:
                 pass
 
     @staticmethod
+    def _parse_valid_lease_payload(raw_bytes: bytes) -> tuple[dict | None, datetime | None]:
+        """Parse JSON lease/reclaim payload; return (dict, expires_at_utc) or (None, None) if partial/invalid."""
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        if not raw_text.strip():
+            return None, None
+        try:
+            parsed = parse_json_no_duplicates(raw_text)
+        except Exception:
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        exp_dt = ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc"))
+        if exp_dt is None:
+            return None, None
+        return parsed, exp_dt
+
+    @staticmethod
     def _is_reclaim_claim_expired(
         st: os.stat_result,
         raw_bytes: bytes,
         now_chk: datetime,
     ) -> bool:
-        """Return True only when a reclaim claim is expired or an aged (>= 5s) empty stub."""
-        if not raw_bytes.strip():
+        """Return True when a reclaim claim is expired or an aged (>= 5s) empty/partial stub."""
+        rp, reclaim_exp = ShadowLedger._parse_valid_lease_payload(raw_bytes)
+        if rp is None or reclaim_exp is None:
             return (now_chk.timestamp() - st.st_mtime) >= 5.0
-        try:
-            rp = parse_json_no_duplicates(raw_bytes.decode("utf-8", errors="replace"))
-        except Exception:
-            return False
-        if not isinstance(rp, dict):
-            return False
-        reclaim_exp = ShadowLedger._parse_iso_utc(rp.get("expires_at_utc"))
-        return reclaim_exp is not None and now_chk >= reclaim_exp
+        return now_chk >= reclaim_exp
 
     @staticmethod
     def _now_utc() -> datetime:
@@ -1585,20 +1605,6 @@ class ShadowLedger:
         existing: dict = {}
         try:
             orig_st, existing_bytes = self._read_lease_snapshot(cur_slot_path)
-            existing_raw = existing_bytes.decode("utf-8", errors="replace")
-            if not existing_raw.strip():
-                now_init = self._now_utc()
-                if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
-                    raise ChainConcurrencyConflictError(
-                        "Chain lease file initializing by peer writer"
-                    )
-                parsed = {}
-            else:
-                parsed = parse_json_no_duplicates(existing_raw)
-            if isinstance(parsed, dict):
-                existing = parsed
-        except ChainConcurrencyConflictError:
-            raise
         except FileNotFoundError as exc:
             raise ChainConcurrencyConflictError(
                 "Chain lease file vanished during concurrent acquisition"
@@ -1608,7 +1614,17 @@ class ShadowLedger:
                 "Chain lease file unreadable during concurrent acquisition"
             ) from exc
 
-        exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
+        parsed, exp_dt = self._parse_valid_lease_payload(existing_bytes)
+        if parsed is None:
+            now_init = self._now_utc()
+            if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
+                raise ChainConcurrencyConflictError(
+                    "Chain lease file initializing by peer writer"
+                )
+            existing = {}
+        else:
+            existing = parsed
+
         raw_lease_id = existing.get("lease_id") if isinstance(existing, dict) else None
         lease_id_str = (
             raw_lease_id if isinstance(raw_lease_id, str) and raw_lease_id else None
