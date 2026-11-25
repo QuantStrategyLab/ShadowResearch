@@ -1249,6 +1249,13 @@ class ShadowLedger:
         except ValueError:
             return None
 
+    @staticmethod
+    def _read_lease_snapshot(lease_path: Path) -> tuple[os.stat_result, bytes]:
+        rfd = os.open(str(lease_path), os.O_RDONLY)
+        with os.fdopen(rfd, "rb") as rf:
+            st = os.fstat(rf.fileno())
+            return st, rf.read()
+
     def _acquire_cross_instance_lease(
         self,
         lease_path: Path,
@@ -1282,14 +1289,17 @@ class ShadowLedger:
             except FileExistsError:
                 existing: dict = {}
                 try:
-                    existing_raw = lease_path.read_text(encoding="utf-8")
+                    orig_st, existing_bytes = self._read_lease_snapshot(lease_path)
+                    existing_raw = existing_bytes.decode("utf-8", errors="replace")
                     parsed = parse_json_no_duplicates(existing_raw) if existing_raw.strip() else {}
                     if isinstance(parsed, dict):
                         existing = parsed
                 except FileNotFoundError:
                     continue
                 except Exception:
-                    existing = {}
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease file unreadable during concurrent acquisition"
+                    )
 
                 exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
                 now_chk = datetime.now(timezone.utc)
@@ -1301,11 +1311,68 @@ class ShadowLedger:
                         f"execution_id={existing.get('execution_id')!r}"
                     )
                 if attempt == 0:
-                    stale_tmp = lease_path.with_name(f".chain.lease.stale.{uuid4().hex}")
+                    stale_sha = hashlib.sha256(existing_bytes).hexdigest()
+                    raw_lease_id = existing.get("lease_id")
+                    if isinstance(raw_lease_id, str) and raw_lease_id:
+                        claim_basis = f"id:{raw_lease_id}:{stale_sha}"
+                    else:
+                        claim_basis = (
+                            f"raw:{stale_sha}:{int(orig_st.st_mtime)}:{orig_st.st_size}"
+                        )
+                    claim_key = hashlib.sha256(claim_basis.encode("utf-8")).hexdigest()[:32]
+                    reclaim_path = lease_path.with_name(
+                        f".chain.lease.reclaim.{claim_key}.lock"
+                    )
+                    reclaim_expires = now_chk + timedelta(
+                        seconds=max(300.0, float(lease_ttl_seconds))
+                    )
+                    reclaim_bytes = (
+                        json.dumps(
+                            {
+                                "schema_version": "c-sh-chain-lease-reclaim-v1",
+                                "claim_key": claim_key,
+                                "reclaimed_lease_id": raw_lease_id,
+                                "claimed_by_lease_id": lease_id,
+                                "claimed_at_utc": now_chk.strftime("%Y-%m-%dT%H:%M:%S.")
+                                + f"{now_chk.microsecond // 1000:03d}Z",
+                                "expires_at_utc": reclaim_expires.strftime("%Y-%m-%dT%H:%M:%S.")
+                                + f"{reclaim_expires.microsecond // 1000:03d}Z",
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
                     try:
-                        os.replace(str(lease_path), str(stale_tmp))
-                        if stale_tmp.exists():
-                            stale_tmp.unlink()
+                        cfd = os.open(
+                            str(reclaim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                        )
+                        try:
+                            os.write(cfd, reclaim_bytes)
+                            os.fsync(cfd)
+                        finally:
+                            os.close(cfd)
+                    except FileExistsError as exc:
+                        raise ChainConcurrencyConflictError(
+                            "Stale chain lease reclamation already claimed by peer writer"
+                        ) from exc
+
+                    try:
+                        cur_st, cur_bytes = self._read_lease_snapshot(lease_path)
+                    except FileNotFoundError as exc:
+                        raise ChainConcurrencyConflictError(
+                            "Chain lease changed before stale CAS reclamation completed"
+                        ) from exc
+                    if (
+                        cur_st.st_dev != orig_st.st_dev
+                        or cur_st.st_ino != orig_st.st_ino
+                        or cur_bytes != existing_bytes
+                    ):
+                        raise ChainConcurrencyConflictError(
+                            "Chain lease identity changed during stale CAS reclamation"
+                        )
+                    try:
+                        os.unlink(str(lease_path))
                     except FileNotFoundError:
                         pass
                     continue
@@ -1316,16 +1383,30 @@ class ShadowLedger:
 
     @staticmethod
     def _release_cross_instance_lease(lease_path: Path, expected_lease_id: str) -> None:
-        if not lease_path.is_file():
-            return
-        try:
-            parsed = parse_json_no_duplicates(lease_path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
+        now_utc = datetime.now(timezone.utc)
+        if lease_path.is_file():
             try:
-                lease_path.unlink()
-            except FileNotFoundError:
+                parsed = parse_json_no_duplicates(lease_path.read_text(encoding="utf-8"))
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
+                exp_dt = ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc"))
+                if exp_dt is None or now_utc < exp_dt:
+                    try:
+                        lease_path.unlink()
+                    except FileNotFoundError:
+                        pass
+        for rpath in lease_path.parent.glob(".chain.lease.reclaim.*.lock"):
+            try:
+                rparsed = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
+                rexp = (
+                    ShadowLedger._parse_iso_utc(rparsed.get("expires_at_utc"))
+                    if isinstance(rparsed, dict)
+                    else None
+                )
+                if rexp is not None and now_utc >= rexp:
+                    rpath.unlink()
+            except Exception:
                 pass
 
     @contextmanager

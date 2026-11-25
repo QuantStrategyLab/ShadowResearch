@@ -726,6 +726,87 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(ok_after_pend["status"], "committed")
             self.assertEqual(ok_after_pend["sequence"], 1)
 
+    def test_concurrent_stale_lease_reclamation_allows_only_one_winner(self) -> None:
+        import threading
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ddir = Path(tmpdir) / "lease_race"
+            ledger = ShadowLedger(ddir / "ledger")
+            lease_path = ledger.root_dir / ".chain.lease.json"
+            past_utc = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"
+            )
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-v1",
+                        "lease_id": "stale-race-000",
+                        "pid": 888888,
+                        "execution_id": "exec-stale",
+                        "expires_at_utc": past_utc,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            barrier = threading.Barrier(2)
+            tls = threading.local()
+            orig_parse_desc = ShadowLedger.__dict__["_parse_iso_utc"]
+            orig_parse = orig_parse_desc.__func__
+
+            def _sync_parse(raw: object) -> datetime | None:
+                res = orig_parse(raw)
+                if not getattr(tls, "waited", False):
+                    tls.waited = True
+                    barrier.wait(timeout=5.0)
+                return res
+
+            winners: list[str] = []
+            conflicts: list[Exception] = []
+            lock = threading.Lock()
+
+            def _worker() -> None:
+                try:
+                    lid = ledger._acquire_cross_instance_lease(
+                        lease_path, lease_ttl_seconds=300.0
+                    )
+                    with lock:
+                        winners.append(lid)
+                except ChainConcurrencyConflictError as exc:
+                    with lock:
+                        conflicts.append(exc)
+
+            ShadowLedger._parse_iso_utc = staticmethod(_sync_parse)  # type: ignore[method-assign]
+            try:
+                t1 = threading.Thread(target=_worker)
+                t2 = threading.Thread(target=_worker)
+                t1.start()
+                t2.start()
+                t1.join(timeout=10.0)
+                t2.join(timeout=10.0)
+            finally:
+                ShadowLedger._parse_iso_utc = orig_parse_desc  # type: ignore[assignment]
+
+            self.assertEqual(len(winners), 1, f"winners={winners}, conflicts={conflicts}")
+            self.assertEqual(len(conflicts), 1, f"winners={winners}, conflicts={conflicts}")
+            active = json.loads(lease_path.read_text(encoding="utf-8"))
+            self.assertEqual(active["lease_id"], winners[0])
+
+            # Expired lease must NOT be unlinked by its former holder after TTL expiry
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-v1",
+                        "lease_id": winners[0],
+                        "expires_at_utc": past_utc,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
+            self.assertTrue(lease_path.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
