@@ -47,6 +47,7 @@ from shadow.fuse_adapter import (
     PINNED_FUSE_SPEC_VERSION,
     ProductionChainLockedError,
     VendoredFuseEvaluator,
+    apply_fund_long_run_volatility,
     build_fuse_validated_inputs,
     is_stub_evaluator,
     resolve_aggregate_control_state,
@@ -1862,6 +1863,7 @@ def run_daily_drill_cycle(
     yahoo_symbol_map: Mapping[str, str] | None = None,
     q_pre_by_inst: Mapping[str, object] | None = None,
     sigma_by_inst: Mapping[str, str] | None = None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = True,
     evaluator: object | None = None,
@@ -1893,6 +1895,7 @@ def run_daily_drill_cycle(
         yahoo_symbol_map=yahoo_symbol_map,
         q_pre_by_inst=q_pre_by_inst,
         sigma_by_inst=sigma_by_inst,
+        long_run_vol_by_inst=long_run_vol_by_inst,
         revision_seq=revision_seq,
         allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
         evaluator=evaluator,
@@ -1922,6 +1925,7 @@ def run_production_cycle(
     yahoo_symbol_map: Mapping[str, str] | None = None,
     q_pre_by_inst: Mapping[str, object] | None = None,
     sigma_by_inst: Mapping[str, str] | None = None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = False,
     evaluator: object | None = None,
@@ -1972,6 +1976,7 @@ def run_production_cycle(
         yahoo_symbol_map=yahoo_symbol_map,
         q_pre_by_inst=q_pre_by_inst,
         sigma_by_inst=sigma_by_inst,
+        long_run_vol_by_inst=long_run_vol_by_inst,
         revision_seq=revision_seq,
         allow_unanchored_on_ots_failure=False,
         evaluator=ev,
@@ -2005,6 +2010,7 @@ def _execute_cycle_with_config(
     yahoo_symbol_map: Mapping[str, str] | None,
     q_pre_by_inst: Mapping[str, object] | None,
     sigma_by_inst: Mapping[str, str] | None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
@@ -2084,6 +2090,7 @@ def _execute_cycle_with_config(
             yahoo_symbol_map=yahoo_symbol_map,
             q_pre_by_inst=q_pre_by_inst,
             sigma_by_inst=sigma_by_inst,
+            long_run_vol_by_inst=long_run_vol_by_inst,
             revision_seq=revision_seq,
             allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
             evaluator=evaluator,
@@ -2343,6 +2350,7 @@ def _reconcile_committed_state_snapshot_if_missing(
         ):
             if ctx_key in fctx and fctx[ctx_key] is not None:
                 rec_inputs[ctx_key] = fctx[ctx_key]
+        apply_fund_long_run_volatility(rec_inputs, fctx.get("long_run_vol_by_inst"))
 
     ev = VendoredFuseEvaluator()
     ex_cal = cal if str(cal.get("date", "")) == ex_sess_date else resolve_session(cfg.venue, ex_sess_date, spec=spec)
@@ -2977,6 +2985,7 @@ def _run_daily_drill_cycle_locked(
     yahoo_symbol_map: Mapping[str, str] | None,
     q_pre_by_inst: Mapping[str, object] | None,
     sigma_by_inst: Mapping[str, str] | None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
     evaluator: object | None,
@@ -3547,6 +3556,11 @@ def _run_daily_drill_cycle_locked(
     # Step 3: Build notional inputs & evaluate C-FUSE-EVAL (stub or vendored FUSE-1)
     q_pre_map = dict(q_pre_by_inst or {})
     sig_map = dict(sigma_by_inst or {})
+    lrv_map = (
+        {str(k): v for k, v in long_run_vol_by_inst.items() if v is not None}
+        if long_run_vol_by_inst is not None
+        else None
+    )
     tqqq_close = by_inst.get("TQQQ", {}).get("normalized_value")
     soxl_close = by_inst.get("SOXL", {}).get("normalized_value")
 
@@ -3579,6 +3593,7 @@ def _run_daily_drill_cycle_locked(
         if isinstance(prev_bankroll, Mapping) and prev_bankroll.get("E") is not None:
             session_inputs["prior_E"] = str(prev_bankroll["E"])
     eval_inputs = dict(session_inputs)
+    apply_fund_long_run_volatility(eval_inputs, lrv_map)
     eval_inputs["market_records"] = mkt_recs
     eval_inputs["required_series"] = required_for_eval
 
@@ -3778,6 +3793,7 @@ def _run_daily_drill_cycle_locked(
             )
             if authorized_events is not None:
                 cycle_inputs["authorized_events"] = copy.deepcopy(authorized_events)
+            apply_fund_long_run_volatility(cycle_inputs, lrv_map)
             cycle_labels = (
                 {
                     "production_chain": True,
@@ -3966,6 +3982,8 @@ def _run_daily_drill_cycle_locked(
             fctx["prior_row_state_used"] = prior_row_state_used
         if authorized_events is not None:
             fctx["authorized_events"] = copy.deepcopy(authorized_events)
+        if lrv_map:
+            fctx["long_run_vol_by_inst"] = copy.deepcopy(lrv_map)
         session_entry["fuse_context"] = fctx
     env = _commit_drill_session_atomically(
         ledger=ledger,

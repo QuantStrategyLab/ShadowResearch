@@ -938,6 +938,28 @@ def _apply_explicit_payload_tier(
     return payload
 
 
+def apply_fund_long_run_volatility(
+    target_inputs: dict[str, Any],
+    long_run_vol_by_inst: object | None,
+) -> None:
+    """Inject explicit per-fund long_run_volatility observations without mutating shared inputs."""
+    if not isinstance(long_run_vol_by_inst, Mapping):
+        return
+    funds = target_inputs.get("funds")
+    if not isinstance(funds, Mapping):
+        return
+    funds_copy: dict[str, object] = {}
+    for inst, fdata in funds.items():
+        if isinstance(fdata, Mapping):
+            entry = dict(copy.deepcopy(fdata))
+            if inst in long_run_vol_by_inst and long_run_vol_by_inst[inst] is not None:
+                entry["long_run_volatility"] = long_run_vol_by_inst[inst]
+            funds_copy[str(inst)] = entry
+        else:
+            funds_copy[str(inst)] = copy.deepcopy(fdata)
+    target_inputs["funds"] = funds_copy
+
+
 def build_fuse_validated_inputs(
     session_inputs: Mapping[str, Any],
     calendar_session: Mapping[str, Any] | None,
@@ -1057,8 +1079,6 @@ def build_fuse_validated_inputs(
                 _LEVERAGE_MULTIPLE * beta_dec * Decimal(str(pos_val))
             ) / conv_scale
         long_run_vol = _finite_number(fdata.get("long_run_volatility"))
-        if long_run_vol is None:
-            long_run_vol = 0.24
 
         # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
         ca_obj = copy.deepcopy(fdata.get("corporate_action"))

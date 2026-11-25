@@ -56,6 +56,7 @@ def _valid_inputs() -> dict:
                 "close_price": "50",
                 "q_pre": 100,
                 "sigma_forecast": "0.24",
+                "long_run_volatility": "0.24",
                 "fund_return": 0.0,
                 "index_return": 0.0,
             },
@@ -64,6 +65,7 @@ def _valid_inputs() -> dict:
                 "close_price": "40",
                 "q_pre": 100,
                 "sigma_forecast": "0.22",
+                "long_run_volatility": "0.24",
                 "fund_return": 0.0,
                 "index_return": 0.0,
             },
@@ -1452,6 +1454,59 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertGreater(int(bal_funds["TQQQ"]["q_ideal"]), 0)
         self.assertEqual(int(con_funds["TQQQ"]["q_ideal"]), 0)
         self.assertEqual(int(con_funds["SOXL"]["q_ideal"]), 0)
+
+    def test_v4_missing_or_invalid_long_run_volatility_fails_closed_and_blocks_increases(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # Omitted long_run_volatility with zero holdings MUST fail closed V4 (NO-NEW-RISK, missing_input) and block buys
+        for bad_lrv in (None, "bad", float("nan"), 0, "-0.1"):
+            si = json.loads(json.dumps(_valid_inputs()))
+            for sym in ("TQQQ", "SOXL"):
+                si["funds"][sym]["q_pre"] = 0
+                if bad_lrv is None:
+                    si["funds"][sym].pop("long_run_volatility", None)
+                else:
+                    si["funds"][sym]["long_run_volatility"] = bad_lrv
+            translated = build_fuse_validated_inputs(
+                si,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-05",
+                as_of="2026-01-05T22:00:00.000Z",
+            )
+            if bad_lrv is None or bad_lrv in ("bad",) or (isinstance(bad_lrv, float) and bad_lrv != bad_lrv):
+                self.assertIsNone(translated["funds"]["TQQQ"]["long_run_volatility"])
+                self.assertIsNone(translated["funds"]["SOXL"]["long_run_volatility"])
+            else:
+                self.assertLessEqual(float(translated["funds"]["TQQQ"]["long_run_volatility"]), 0.0)
+
+            built = build_record_body(
+                chain_id="drill-v4-missing-lrv",
+                sequence=0,
+                prev_record_sha256=GENESIS_PREV_HASH,
+                mode="drill",
+                session_date="2026-01-05",
+                decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                session_inputs=si,
+                calendar_session=cal,
+                code_version_sha=code_sha,
+                evaluator=ev,
+                prior_row_state={},
+                calendar_spec=spec,
+            )
+            self.assertTrue(built["appended"])
+            rec = built["record_body"]
+            v4_row = next(b for b in rec["evaluator"]["breakers"] if b["id"] == "V4")
+            self.assertEqual(v4_row["state"], "NO-NEW-RISK")
+            self.assertEqual(v4_row["reason"], "missing_input")
+            self.assertTrue(v4_row["would_have_tripped"])
+            balanced_rec = next(t for t in rec["tiers"] if t["tier_id"] == "balanced")
+            for fdec in balanced_rec["funds"]:
+                self.assertEqual(fdec["q_ideal"], 0)
+                self.assertEqual(fdec["delta_q_exec"], 0)
 
 
 if __name__ == "__main__":

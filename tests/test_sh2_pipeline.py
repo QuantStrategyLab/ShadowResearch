@@ -472,6 +472,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=fdir_bad,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             )
             self.assertFalse(r_rej["appended"])
@@ -499,6 +500,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=fdir_good,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
             )
             self.assertTrue(r_ok["appended"])
@@ -781,6 +783,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=fdir_day0,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             )
             self.assertTrue(r_d0["appended"])
@@ -800,6 +803,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     config=drill_cfg,
                     fixtures_dir=fdir_d1_bad,
                     sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                    long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                     wall_clock=lambda m=minute: datetime(2026, 1, 6, 22, m, tzinfo=timezone.utc),
                 )
                 self.assertFalse(rf["appended"])
@@ -824,6 +828,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=fdir_d1_good,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 40, tzinfo=timezone.utc),
             )
             self.assertTrue(r_ok["appended"])
@@ -1074,6 +1079,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f5,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             )
             self.assertTrue(r0["appended"])
@@ -1092,6 +1098,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     data_dir=root,
                     config=drill_cfg,
                     fixtures_dir=f6,
+                    long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                 )
             self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 1)
@@ -1102,6 +1109,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 data_dir=root,
                 config=drill_cfg,
                 fixtures_dir=f5,
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
             )
             self.assertEqual(r0_heal["reason"], "already_committed_session_preserved")
@@ -1115,6 +1123,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f6_bad,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 20, tzinfo=timezone.utc),
             )
             self.assertFalse(r1_rej["appended"])
@@ -1154,6 +1163,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f5,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             )
             self.assertTrue(r0["appended"])
@@ -1178,6 +1188,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f6_bad,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 20, tzinfo=timezone.utc),
             )
             self.assertFalse(r1_rej["appended"])
@@ -1190,6 +1201,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f7_bad,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 7, 22, 20, tzinfo=timezone.utc),
             )
             self.assertFalse(r2_rej["appended"])
@@ -1242,6 +1254,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f7_good,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 7, 22, 35, tzinfo=timezone.utc),
             )
             self.assertTrue(r2_ok["appended"])
@@ -1279,6 +1292,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     config=drill_cfg,
                     fixtures_dir=fix_root / ds,
                     sigma_by_inst={"TQQQ": sig, "SOXL": "0.24"},
+                    long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                     wall_clock=lambda d=ds: datetime.fromisoformat(f"{d}T22:30:00+00:00"),
                 )
                 self.assertTrue(res["appended"])
@@ -1336,6 +1350,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=fix_root / d9,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda d=d9: datetime.fromisoformat(f"{d}T22:30:00+00:00"),
             )
             self.assertTrue(r9["appended"])
@@ -1351,6 +1366,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=bad_d10,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda d=d10: datetime.fromisoformat(f"{d}T22:20:00+00:00"),
             )
             self.assertFalse(r10_rej["appended"])
@@ -1363,6 +1379,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=fix_root / d10,
                 sigma_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda d=d10: datetime.fromisoformat(f"{d}T22:35:00+00:00"),
             )
             self.assertTrue(r10_ok["appended"])
@@ -1394,6 +1411,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 fixtures_dir=f5_bad,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 20, tzinfo=timezone.utc),
             )
             self.assertFalse(r5["appended"])
@@ -2018,6 +2036,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 expected_prior_head_sha256=seq0_sha,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                 trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
@@ -2124,6 +2143,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 expected_prior_head_sha256=seq0_sha,
                 expected_pending_state_sha256=pending_sha,
                 trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
@@ -2189,6 +2209,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     clock=_fast_clock(),
                     sleeper=lambda _s: None,
                     sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                    long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                     expected_prior_head_sha256=GENESIS_PREV_HASH,
                     expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                     trusted_head_anchor_path=Path(tmpdir) / "ots_anchor.json",
@@ -2215,6 +2236,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
                 sigma_by_inst={"TQQQ": "0.22", "SOXL": "0.22"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=pend_ots_sha,
                 trusted_head_anchor_path=Path(tmpdir) / "ots_anchor.json",
@@ -2254,6 +2276,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                 trusted_head_anchor_path=Path(tmpdir) / "dl_anchor.json",
@@ -2274,6 +2297,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 clock=_fast_clock(),
                 sleeper=lambda _s: None,
                 sigma_by_inst={"TQQQ": "0.22", "SOXL": "0.22"},
+                long_run_vol_by_inst={"TQQQ": "0.24", "SOXL": "0.24"},
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=pend_dl_sha,
                 trusted_head_anchor_path=Path(tmpdir) / "dl_anchor.json",
@@ -3178,6 +3202,29 @@ class Sh2PipelineTest(unittest.TestCase):
             b1_o8 = {b["id"]: b for b in recs1[-1]["record_body"]["evaluator"]["breakers"]}["O8"]
             self.assertFalse(b1_o8["latched"])
 
+            rep = replay_window(root / "replay", root / "ledger")
+            self.assertTrue(rep["bit_for_bit_match"])
+
+    def test_scheduler_default_omits_long_run_volatility_v4_fails_closed(self) -> None:
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "sched_missing_lrv"
+            f5 = Path(tmpdir) / "f5"
+            _build_session_fixture_files(f5, "2026-01-05")
+            res = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(res["appended"])
+            recs = ShadowLedger(root / "ledger").load_records()
+            v4_row = next(
+                b for b in recs[-1]["record_body"]["evaluator"]["breakers"] if b["id"] == "V4"
+            )
+            self.assertEqual(v4_row["state"], "NO-NEW-RISK")
+            self.assertEqual(v4_row["reason"], "missing_input")
             rep = replay_window(root / "replay", root / "ledger")
             self.assertTrue(rep["bit_for_bit_match"])
 

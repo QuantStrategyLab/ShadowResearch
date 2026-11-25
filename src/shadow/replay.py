@@ -27,6 +27,7 @@ from shadow.fuse_adapter import (
     PINNED_FUSE_ENGINE_HASH,
     PINNED_FUSE_SPEC_VERSION,
     VendoredFuseEvaluator,
+    apply_fund_long_run_volatility,
     is_stub_evaluator,
 )
 from shadow.ledger import (
@@ -441,6 +442,7 @@ def replay_window(
                 ):
                     if ctx_key in fctx and fctx[ctx_key] is not None and ctx_key not in replay_inputs:
                         replay_inputs[ctx_key] = fctx[ctx_key]
+                apply_fund_long_run_volatility(replay_inputs, fctx.get("long_run_vol_by_inst"))
                 if fctx.get("prior_row_state_used") is not None:
                     eff_prior_state = fctx["prior_row_state_used"]
 
