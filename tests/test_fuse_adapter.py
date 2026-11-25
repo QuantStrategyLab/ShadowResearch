@@ -1784,6 +1784,157 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertFalse(rows["V1"]["latched"])
         self.assertFalse(nxt.get("V1", {}).get("latched", False))
 
+    def test_invalid_or_null_high_water_mark_remains_missing_and_rejects_via_o1(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT)
+
+        for bad_hwm in ("bad", None):
+            with self.subTest(bad_hwm=bad_hwm):
+                si = json.loads(json.dumps(_valid_inputs()))
+                si["E"] = "44000"
+                si["E_star"] = "50000"
+                si["high_water_mark"] = bad_hwm
+                si["prior_bankroll"] = "44000"
+                si["L"] = "6000"
+                for sym in ("TQQQ", "SOXL"):
+                    si["funds"][sym]["q_pre"] = 0
+                vin = build_fuse_validated_inputs(
+                    si,
+                    cal,
+                    policy_hash="p",
+                    session_date="2026-01-05",
+                    as_of="2026-01-05T22:00:00.000Z",
+                )
+                self.assertIsNone(vin["high_water_mark"])
+                built = build_record_body(
+                    chain_id="drill-bad-hwm",
+                    sequence=1,
+                    prev_record_sha256="a" * 64,
+                    mode="drill",
+                    session_date="2026-01-05",
+                    decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                    session_inputs=si,
+                    calendar_session=cal,
+                    code_version_sha=code_sha,
+                    evaluator=ev,
+                    prior_row_state={},
+                    calendar_spec=spec,
+                )
+                self.assertFalse(built["appended"])
+                self.assertTrue(built["fail_closed"])
+                self.assertEqual(built["o1_output"]["state"], "NO-NEW-RISK")
+                self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
+
+    def test_qqq_forward_split_does_not_leak_into_l6_index_crash_inputs(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        si = json.loads(json.dumps(_valid_inputs()))
+        si.pop("index_one_session_returns", None)
+        si["prior_closes"] = {"XNDX": "20000", "SEMI": "5000", "QQQ": "100"}
+        si["market_records"] = [
+            {
+                "instrument": "TQQQ",
+                "normalized_value": "50",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "SOXL",
+                "normalized_value": "40",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "QQQ",
+                "normalized_value": "50",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+                "corporate_action": {"split_ratio": "2", "ex_date": "2026-01-05"},
+            },
+            {
+                "instrument": "XNDX",
+                "normalized_value": "20000",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "SEMI",
+                "normalized_value": "5000",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "SOFR",
+                "normalized_value": "0.045",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+            {
+                "instrument": "TBILL_3M",
+                "normalized_value": "0.042",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal["spec_digest"],
+            },
+        ]
+        vin = build_fuse_validated_inputs(
+            si,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNotNone(vin["index_one_session_returns"])
+        self.assertNotIn("QQQ", vin["index_one_session_returns"])
+        rows, _, nxt = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NORMAL")
+        self.assertEqual(rows["L6"]["state"], "NORMAL")
+        self.assertFalse(nxt.get("L6", {}).get("latched", False))
+
+    def test_nonpositive_sigma_forecast_marks_vol_invalid_for_o1_rejection(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        for bad_sigma in ("0", "-0.1"):
+            with self.subTest(bad_sigma=bad_sigma):
+                si = json.loads(json.dumps(_valid_inputs()))
+                si["funds"]["TQQQ"]["sigma_forecast"] = bad_sigma
+                vin = build_fuse_validated_inputs(
+                    si,
+                    cal,
+                    policy_hash="p",
+                    session_date="2026-01-05",
+                    as_of="2026-01-05T22:00:00.000Z",
+                )
+                self.assertNotIn("volatility", vin["source_records"])
+                self.assertNotIn("market_data", vin["source_records"])
+                rows, _, _ = ev.evaluate(
+                    ev.spec_version,
+                    ev.engine_hash,
+                    "p",
+                    "2026-01-05",
+                    "2026-01-05T22:00:00.000Z",
+                    "shadow",
+                    vin,
+                    {},
+                    None,
+                )
+                self.assertEqual(rows["O1"]["state"], "NO-NEW-RISK")
+
 
 if __name__ == "__main__":
     unittest.main()

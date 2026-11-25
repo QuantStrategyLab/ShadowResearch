@@ -676,7 +676,6 @@ _O5_PASSTHROUGH_KEYS = (
 _INDEX_RETURN_LABELS = (
     ("XNDX", "NDX"),
     ("SEMI", "SEMI"),
-    ("QQQ", "QQQ"),
     ("SPX", "SPX"),
 )
 
@@ -1001,9 +1000,11 @@ def build_fuse_validated_inputs(
     tier = str(session_inputs.get("tier", "balanced"))
     tier_cfg = TIER_CONFIGS.get(tier, TIER_CONFIGS["balanced"])
     bankroll_val = _finite_number(session_inputs.get("E"))
-    hwm_raw = session_inputs.get("high_water_mark", session_inputs.get("E_star", session_inputs.get("E")))
-    hwm_val = _finite_number(hwm_raw)
-    if hwm_val is None and bankroll_val is not None:
+    if "high_water_mark" in session_inputs:
+        hwm_val = _finite_number(session_inputs.get("high_water_mark"))
+    elif "E_star" in session_inputs:
+        hwm_val = _finite_number(session_inputs.get("E_star"))
+    else:
         hwm_val = bankroll_val
 
     cal_status, exch_status = _map_calendar_statuses(calendar_session, session_date=session_date)
@@ -1083,7 +1084,7 @@ def build_fuse_validated_inputs(
         close_val = _finite_number(fdata.get("close_price"))
         q_pre_val = _resolve_tier_quantity(fdata.get("q_pre", 0), tier)
         sigma_val = _finite_number(fdata.get("sigma_forecast"))
-        if sigma_val is None:
+        if sigma_val is None or sigma_val <= 0.0:
             vol_ok = False
         if close_val is None or q_pre_val is None:
             mkt_ok = False

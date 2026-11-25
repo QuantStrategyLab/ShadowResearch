@@ -3380,6 +3380,38 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertTrue(res["fail_closed"])
             self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 0)
 
+    def test_nonpositive_sigma_forecast_rejects_cleanly_via_o1_and_persists_pending_l6_latch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "bad_sigma_drill"
+            f5 = Path(tmpdir) / "f5_bad_sigma"
+            _build_session_fixture_files(f5, "2026-01-05")
+            y5 = json.loads((f5 / "yahoo_xndx_2026-01-05.json").read_text(encoding="utf-8"))
+            y5["chart"]["result"][0]["indicators"]["quote"][0]["close"] = [33000.0, 29500.0]
+            (f5 / "yahoo_xndx_2026-01-05.json").write_text(json.dumps(y5), encoding="utf-8")
+
+            res = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=_sh2_drill_cfg(),
+                fixtures_dir=f5,
+                sigma_by_inst={"TQQQ": "0", "SOXL": "0.24"},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 0)
+            pending, _ = load_pending_rejected_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id="drill-v0",
+                expected_base_sequence=-1,
+                expected_base_record_sha256=GENESIS_PREV_HASH,
+                current_session_date="2026-01-05",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+            )
+            self.assertIsNotNone(pending)
+            self.assertTrue(pending["L6"]["latched"])
+
 
 if __name__ == "__main__":
     unittest.main()
