@@ -1523,8 +1523,13 @@ class ShadowLedger:
                     )
 
                 exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
+                raw_lease_id = existing.get("lease_id") if isinstance(existing, dict) else None
+                lease_id_str = (
+                    raw_lease_id if isinstance(raw_lease_id, str) and raw_lease_id else None
+                )
+                eff_exp_dt = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
                 now_chk = self._now_utc()
-                if exp_dt is not None and now_chk < exp_dt:
+                if eff_exp_dt is not None and now_chk < eff_exp_dt:
                     raise ChainConcurrencyConflictError(
                         "Chain lease held by active writer: "
                         f"lease_id={existing.get('lease_id')!r}, "
@@ -1647,15 +1652,54 @@ class ShadowLedger:
                         raise ChainConcurrencyConflictError(
                             "Chain lease identity changed during stale CAS reclamation"
                         )
+                    recheck_exp = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
+                    if recheck_exp is not None and self._now_utc() < recheck_exp:
+                        raise ChainConcurrencyConflictError(
+                            "Chain lease renewed during stale CAS reclamation"
+                        )
                     try:
                         os.unlink(str(lease_path))
                     except FileNotFoundError:
                         pass
+                    if lease_id_str:
+                        for renew_file in lease_path.parent.glob(
+                            f".chain.lease.renew.{lease_id_str}.*.json"
+                        ):
+                            try:
+                                renew_file.unlink()
+                            except FileNotFoundError:
+                                pass
                     continue
                 raise ChainConcurrencyConflictError(
                     "Chain lease creation conflicted after stale reclamation retry"
                 )
         raise ChainConcurrencyConflictError("Failed to acquire cross-instance chain lease")
+
+    @staticmethod
+    def _effective_lease_expiry(
+        lease_path: Path,
+        lease_id: str | None,
+        base_exp: datetime | None,
+    ) -> datetime | None:
+        eff = base_exp
+        if not isinstance(lease_id, str) or not lease_id:
+            return eff
+        for renew_path in sorted(lease_path.parent.glob(f".chain.lease.renew.{lease_id}.*.json")):
+            try:
+                _, raw_bytes = ShadowLedger._read_lease_snapshot(renew_path)
+                parsed = parse_json_no_duplicates(raw_bytes.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("schema_version") != "c-sh-chain-lease-renew-v1"
+                or parsed.get("lease_id") != lease_id
+            ):
+                continue
+            cand = ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc"))
+            if cand is not None and (eff is None or cand > eff):
+                eff = cand
+        return eff
 
     def _renew_cross_instance_lease(
         self,
@@ -1664,7 +1708,7 @@ class ShadowLedger:
         *,
         lease_ttl_seconds: float,
     ) -> None:
-        """Atomically renew an unexpired owned .chain.lease.json without clobbering displaced leases."""
+        """Extend an active owned lease via an immutable sidecar without overwriting displaced leases."""
         try:
             cur_st, cur_bytes = self._read_lease_snapshot(lease_path)
             parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
@@ -1678,71 +1722,95 @@ class ShadowLedger:
             ) from exc
 
         now_utc = self._now_utc()
-        exp_dt = (
+        base_exp = (
             self._parse_iso_utc(parsed.get("expires_at_utc"))
             if isinstance(parsed, dict)
+            else None
+        )
+        eff_exp = (
+            self._effective_lease_expiry(lease_path, expected_lease_id, base_exp)
+            if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id
             else None
         )
         if (
             not isinstance(parsed, dict)
             or parsed.get("lease_id") != expected_lease_id
-            or exp_dt is None
-            or now_utc >= exp_dt
+            or eff_exp is None
+            or now_utc >= eff_exp
         ):
             raise ChainConcurrencyConflictError(
                 "Chain lease expired or displaced before renewal"
             )
 
         expires_utc = now_utc + timedelta(seconds=max(1.0, float(lease_ttl_seconds)))
-        renewed_payload = dict(parsed)
-        renewed_payload["renewed_at_utc"] = (
-            now_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_utc.microsecond // 1000:03d}Z"
-        )
-        renewed_payload["expires_at_utc"] = (
-            expires_utc.strftime("%Y-%m-%dT%H:%M:%S.")
-            + f"{expires_utc.microsecond // 1000:03d}Z"
-        )
-        renewed_bytes = (
-            json.dumps(renewed_payload, sort_keys=True, separators=(",", ":")) + "\n"
+        renew_bytes = (
+            json.dumps(
+                {
+                    "schema_version": "c-sh-chain-lease-renew-v1",
+                    "lease_id": expected_lease_id,
+                    "renewed_at_utc": (
+                        now_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{now_utc.microsecond // 1000:03d}Z"
+                    ),
+                    "expires_at_utc": (
+                        expires_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{expires_utc.microsecond // 1000:03d}Z"
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
         ).encode("utf-8")
 
-        tmp_path = lease_path.with_name(f".chain.lease.tmp.renew.{expected_lease_id}.{uuid4().hex}.lock")
-        try:
-            tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            try:
-                os.write(tfd, renewed_bytes)
-                os.fsync(tfd)
-            finally:
-                os.close(tfd)
+        renew_id = uuid4().hex
+        renew_path = lease_path.with_name(f".chain.lease.renew.{expected_lease_id}.{renew_id}.json")
+        tmp_path = lease_path.with_name(f".chain.lease.tmp.renew.{expected_lease_id}.{renew_id}.lock")
+        self._publish_exclusive_file(renew_path, tmp_path, renew_bytes)
 
-            chk_st, chk_bytes = self._read_lease_snapshot(lease_path)
-            if (
-                chk_st.st_dev != cur_st.st_dev
-                or chk_st.st_ino != cur_st.st_ino
-                or chk_bytes != cur_bytes
-                or self._now_utc() >= exp_dt
-            ):
-                raise ChainConcurrencyConflictError(
-                    "Chain lease identity changed or expired during renewal"
-                )
-            os.replace(str(tmp_path), str(lease_path))
-        finally:
+        def _abort_renew(msg: str, cause: Exception | None = None) -> None:
             try:
-                tmp_path.unlink()
+                renew_path.unlink()
             except FileNotFoundError:
                 pass
+            if cause is not None:
+                raise ChainConcurrencyConflictError(msg) from cause
+            raise ChainConcurrencyConflictError(msg)
 
         try:
-            _, verify_bytes = self._read_lease_snapshot(lease_path)
+            chk_st, verify_bytes = self._read_lease_snapshot(lease_path)
             verify_obj = parse_json_no_duplicates(verify_bytes.decode("utf-8", errors="replace"))
         except Exception as exc:
-            raise ChainConcurrencyConflictError(
-                "Chain lease unreadable after renewal"
-            ) from exc
-        if not isinstance(verify_obj, dict) or verify_obj.get("lease_id") != expected_lease_id:
-            raise ChainConcurrencyConflictError(
-                "Chain lease displaced during renewal"
-            )
+            _abort_renew("Chain lease unreadable after renewal", exc)
+        if (
+            chk_st.st_dev != cur_st.st_dev
+            or chk_st.st_ino != cur_st.st_ino
+            or verify_bytes != cur_bytes
+            or not isinstance(verify_obj, dict)
+            or verify_obj.get("lease_id") != expected_lease_id
+        ):
+            _abort_renew("Chain lease displaced during renewal")
+        now_post = self._now_utc()
+        if now_post >= eff_exp:
+            _abort_renew("Chain lease expired during renewal")
+
+        stale_sha = hashlib.sha256(cur_bytes).hexdigest()
+        claim_key = hashlib.sha256(
+            f"id:{expected_lease_id}:{stale_sha}".encode("utf-8")
+        ).hexdigest()[:32]
+        claim_paths = [
+            lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock"),
+            *sorted(lease_path.parent.glob(f".chain.lease.reclaim.{claim_key}.g*.lock")),
+        ]
+        for claim_path in claim_paths:
+            try:
+                rc_st, rc_bytes = self._read_lease_snapshot(claim_path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                _abort_renew("Chain lease reclamation in progress during renewal", exc)
+            if not self._is_reclaim_claim_expired(rc_st, rc_bytes, now_post):
+                _abort_renew("Chain lease reclamation in progress during renewal")
 
     def assert_active_chain_lease(self) -> None:
         """Fail closed if caller lacks or has lost its active unexpired cross-instance lease."""
@@ -1766,8 +1834,12 @@ class ShadowLedger:
                 entry["lost_error"] = "Chain lease unreadable before write"
                 raise ChainConcurrencyConflictError(entry["lost_error"]) from exc
             exp_dt = (
-                self._parse_iso_utc(parsed.get("expires_at_utc"))
-                if isinstance(parsed, dict)
+                self._effective_lease_expiry(
+                    lease_path,
+                    lease_id,
+                    self._parse_iso_utc(parsed.get("expires_at_utc")),
+                )
+                if isinstance(parsed, dict) and parsed.get("lease_id") == lease_id
                 else None
             )
             if (
@@ -1788,12 +1860,23 @@ class ShadowLedger:
             except Exception:
                 parsed = None
             if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
-                exp_dt = ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc"))
+                exp_dt = ShadowLedger._effective_lease_expiry(
+                    lease_path,
+                    expected_lease_id,
+                    ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc")),
+                )
                 if exp_dt is None or now_utc < exp_dt:
                     try:
                         lease_path.unlink()
                     except FileNotFoundError:
                         pass
+                    for renew_file in lease_path.parent.glob(
+                        f".chain.lease.renew.{expected_lease_id}.*.json"
+                    ):
+                        try:
+                            renew_file.unlink()
+                        except FileNotFoundError:
+                            pass
         for rpath in lease_path.parent.glob(".chain.lease.reclaim.*.lock"):
             try:
                 rst, rbytes = ShadowLedger._read_lease_snapshot(rpath)

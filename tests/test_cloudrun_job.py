@@ -1964,16 +1964,75 @@ class CloudRunJobTest(unittest.TestCase):
             with ledger.chain_lock(lease_ttl_seconds=1.0, renew_interval_seconds=0.15):
                 initial_obj = json.loads(lease_path.read_text(encoding="utf-8"))
                 time.sleep(1.3)
-                renewed_obj = json.loads(lease_path.read_text(encoding="utf-8"))
-                self.assertEqual(renewed_obj["lease_id"], initial_obj["lease_id"])
-                self.assertIn("renewed_at_utc", renewed_obj)
-                self.assertGreater(renewed_obj["expires_at_utc"], initial_obj["expires_at_utc"])
+                lease_obj = json.loads(lease_path.read_text(encoding="utf-8"))
+                self.assertEqual(lease_obj["lease_id"], initial_obj["lease_id"])
+                renew_files = list(
+                    ledger.root_dir.glob(f".chain.lease.renew.{initial_obj['lease_id']}.*.json")
+                )
+                self.assertGreaterEqual(len(renew_files), 1)
+                eff_exp = ShadowLedger._effective_lease_expiry(
+                    lease_path,
+                    initial_obj["lease_id"],
+                    ShadowLedger._parse_iso_utc(initial_obj["expires_at_utc"]),
+                )
+                self.assertIsNotNone(eff_exp)
+                self.assertGreater(
+                    eff_exp, ShadowLedger._parse_iso_utc(initial_obj["expires_at_utc"])
+                )
                 ledger.assert_active_chain_lease()
                 peer = ShadowLedger(ledger.root_dir)
                 with self.assertRaisesRegex(
                     ChainConcurrencyConflictError, "held by active writer"
                 ):
                     peer._acquire_cross_instance_lease(lease_path, lease_ttl_seconds=300.0)
+
+            self.assertEqual(
+                list(ledger.root_dir.glob(f".chain.lease.renew.{initial_obj['lease_id']}.*.json")),
+                [],
+            )
+
+            # 2. Paused renewal resuming after expiry/peer acquisition never clobbers peer's lease
+            race_ledger = ShadowLedger(Path(tmpdir) / "renew_race" / "ledger")
+            race_lease = race_ledger.root_dir / ".chain.lease.json"
+            base_race = datetime.now(timezone.utc)
+            orig_race_now = ShadowLedger.__dict__["_now_utc"]
+            orig_pub = ShadowLedger.__dict__["_publish_exclusive_file"]
+            race_box = [base_race]
+            ShadowLedger._now_utc = staticmethod(lambda: race_box[0])  # type: ignore[method-assign]
+            try:
+                first_id = race_ledger._acquire_cross_instance_lease(
+                    race_lease, lease_ttl_seconds=300.0
+                )
+                race_peer = ShadowLedger(race_ledger.root_dir)
+                peer_id_box: list[str] = []
+
+                @staticmethod
+                def _paused_publish(dest_path: Path, tmp_path: Path, payload_bytes: bytes) -> None:
+                    if dest_path.name.startswith(f".chain.lease.renew.{first_id}."):
+                        race_box[0] = base_race + timedelta(seconds=301)
+                        peer_id_box.append(
+                            race_peer._acquire_cross_instance_lease(
+                                race_lease, lease_ttl_seconds=300.0
+                            )
+                        )
+                    orig_pub.__func__(dest_path, tmp_path, payload_bytes)  # type: ignore[attr-defined]
+
+                ShadowLedger._publish_exclusive_file = _paused_publish  # type: ignore[method-assign]
+                with self.assertRaisesRegex(
+                    ChainConcurrencyConflictError, "displaced during renewal"
+                ):
+                    race_ledger._renew_cross_instance_lease(
+                        race_lease, first_id, lease_ttl_seconds=300.0
+                    )
+                cur_obj = json.loads(race_lease.read_text(encoding="utf-8"))
+                self.assertEqual(cur_obj["lease_id"], peer_id_box[0])
+                self.assertNotEqual(cur_obj["lease_id"], first_id)
+                self.assertEqual(
+                    list(race_ledger.root_dir.glob(f".chain.lease.renew.{first_id}.*.json")), []
+                )
+            finally:
+                ShadowLedger._publish_exclusive_file = orig_pub  # type: ignore[assignment]
+                ShadowLedger._now_utc = orig_race_now  # type: ignore[assignment]
 
             # 2. Displaced/expired lease fences assert_active_chain_lease and append_record (0 writes)
             fence_ledger = ShadowLedger(Path(tmpdir) / "fence" / "ledger")
