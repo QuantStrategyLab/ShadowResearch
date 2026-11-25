@@ -1519,10 +1519,27 @@ def _commit_drill_session_atomically(
             else None
         )
         snap_staged = False
+        prior_anchor_bytes = expected_prior_anchor_bytes
 
         def _stage_bundle_before_marker() -> None:
-            nonlocal bundle_modified, snap_staged
+            nonlocal bundle_modified, snap_staged, prior_anchor_bytes
             ledger.assert_active_chain_lease()
+            if (
+                seq == 0
+                and trusted_head_anchor_path is not None
+                and prior_anchor_bytes is None
+            ):
+                _advance_trusted_head_anchor(
+                    trusted_head_anchor_path,
+                    chain_id=cfg.chain_id,
+                    expected_prior_bytes=None,
+                    sequence=-1,
+                    session_date=None,
+                    head_sha256=GENESIS_PREV_HASH,
+                    pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    now_utc=anchor_updated_at_utc or rcp_obtained_utc,
+                )
+                prior_anchor_bytes = trusted_head_anchor_path.read_bytes()
             _update_replay_bundle(
                 bundle_dir,
                 cfg=cfg,
@@ -1592,7 +1609,7 @@ def _commit_drill_session_atomically(
             _advance_trusted_head_anchor(
                 trusted_head_anchor_path,
                 chain_id=cfg.chain_id,
-                expected_prior_bytes=expected_prior_anchor_bytes,
+                expected_prior_bytes=prior_anchor_bytes,
                 sequence=seq,
                 session_date=str(body["session_date"]),
                 head_sha256=env["record_sha256"],

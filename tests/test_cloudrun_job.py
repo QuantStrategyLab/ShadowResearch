@@ -2206,6 +2206,134 @@ class CloudRunJobTest(unittest.TestCase):
                 ShadowLedger._publish_exclusive_file = orig_rc_pub  # type: ignore[assignment]
                 ShadowLedger._now_utc = orig_rc_now  # type: ignore[assignment]
 
+    def test_interrupted_genesis_production_commit_recovers_via_prepersisted_anchor(self) -> None:
+        from unittest import mock
+
+        import shadow.scheduler as sched_mod
+        from shadow.fuse_adapter import VendoredFuseEvaluator
+
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+        ev = VendoredFuseEvaluator()
+
+        t_box = [1000.0]
+
+        def _fast_clk() -> float:
+            t_box[0] += 25.0
+            return t_box[0]
+
+        class _FakeOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ddir = Path(tmpdir) / "genesis_anchor_rec"
+            unlocked_cfg = Path(tmpdir) / "unlocked-production.json"
+            unlocked_cfg.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            anchor_path = Path(tmpdir) / "genesis_anchor.json"
+
+            orig_advance = sched_mod._advance_trusted_head_anchor
+
+            def _fail_seq0_advance(*args, **kwargs):
+                if kwargs.get("sequence") == 0:
+                    raise OSError("simulated_interruption_after_seq0_commit")
+                return orig_advance(*args, **kwargs)
+
+            with mock.patch.object(
+                sched_mod, "_advance_trusted_head_anchor", side_effect=_fail_seq0_advance
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "simulated_interruption_after_seq0_commit"
+                ):
+                    sched_mod.run_production_cycle(
+                        session_date="2026-01-05",
+                        data_dir=ddir,
+                        config_path=unlocked_cfg,
+                        transport=build_live_mock_transport("2026-01-05"),
+                        environ={"TIINGO_API_KEY": "test-dummy-token"},
+                        ots_client=_FakeOts(),
+                        wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                        clock=_fast_clk,
+                        sleeper=lambda _s: None,
+                        evaluator=ev,
+                        expected_prior_head_sha256=GENESIS_PREV_HASH,
+                        expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                        trusted_head_anchor_path=anchor_path,
+                    )
+
+            recs = ShadowLedger(ddir / "ledger").load_records()
+            self.assertEqual(len(recs), 1)
+            head_0 = str(recs[0]["record_sha256"])
+            pre_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            self.assertEqual(pre_anchor["sequence"], -1)
+            self.assertEqual(pre_anchor["head_sha256"], GENESIS_PREV_HASH)
+
+            retry_res = sched_mod.run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                evaluator=ev,
+                expected_prior_head_sha256=head_0,
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertFalse(retry_res["appended"])
+            self.assertFalse(retry_res["fail_closed"])
+            self.assertTrue(retry_res["recovered_missing_report"])
+            self.assertTrue(retry_res["report_written"])
+            caught_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            self.assertEqual(caught_anchor["sequence"], 0)
+            self.assertEqual(caught_anchor["head_sha256"], head_0)
+
+            retry_idempotent = sched_mod.run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 36, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                evaluator=ev,
+                expected_prior_head_sha256=head_0,
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertFalse(retry_idempotent["appended"])
+            self.assertEqual(retry_idempotent["reason"], "already_committed_session_preserved")
+
+            # Deleting trusted_head_anchor_path on a non-empty ledger still fails closed
+            anchor_path.unlink()
+            with self.assertRaisesRegex(
+                EngineIdentityError, "production_trusted_head_anchor_missing"
+            ):
+                sched_mod.run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_FakeOts(),
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clk,
+                    sleeper=lambda _s: None,
+                    evaluator=ev,
+                    expected_prior_head_sha256=head_0,
+                    expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    trusted_head_anchor_path=anchor_path,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
