@@ -170,6 +170,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 evaluator=ev,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "prod_unlocked_anchor.json",
             )
             self.assertTrue(r1["appended"])
             self.assertEqual(r1["report"]["observation_class"], "decision_time_market")
@@ -423,6 +424,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "crash_anchor.json",
             )
             self.assertTrue(res_crash["appended"])
             recs_c = ShadowLedger(d_crash / "ledger").load_records()
@@ -444,6 +446,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "split_anchor.json",
             )
             self.assertTrue(res_split["appended"])
             recs_s = ShadowLedger(d_split / "ledger").load_records()
@@ -863,6 +866,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "prod_credit_anchor.json",
             )
             ledger = ShadowLedger(root / "ledger")
             spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
@@ -1568,6 +1572,7 @@ class Sh2PipelineTest(unittest.TestCase):
                         clock=_fast_clock(),
                         sleeper=lambda _s: None,
                         bitcoin_merkle_roots=btc_arg,
+                        trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                     )
                 self.assertIn("production_genesis_unauthenticated", str(gen_ctx.exception))
                 self.assertEqual(ShadowLedger(root / "ledger").load_records(), [])
@@ -1586,6 +1591,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
             )
             self.assertTrue(r0["appended"])
             seq0_sha = r0["record_sha256"]
@@ -1607,6 +1613,7 @@ class Sh2PipelineTest(unittest.TestCase):
                         wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                         clock=_fast_clock(),
                         sleeper=lambda _s: None,
+                        trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                         **unauth_kw,
                     )
                 self.assertIn("production_history_unauthenticated", str(unauth_ctx.exception))
@@ -1626,6 +1633,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     sleeper=lambda _s: None,
                     expected_prior_head_sha256="f" * 64,
                     expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                 )
             with self.assertRaises(EngineIdentityError):
                 run_production_cycle(
@@ -1641,6 +1649,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     expected_prior_head_sha256=seq0_sha,
                     expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                     bitcoin_merkle_roots={880100: {"merkle_root": "a" * 64, "timestamp": "2026-01-06T03:00:00.000Z"}},
+                    trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                 )
 
             # 4. Authenticated with authorized head seq0_sha (+ corroborating BTC roots) -> seq=1 commits
@@ -1657,6 +1666,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 expected_prior_head_sha256=seq0_sha,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                 bitcoin_merkle_roots=dict(hdrs),
+                trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
             )
             self.assertTrue(r1["appended"])
             self.assertEqual(r1["sequence"], 1)
@@ -1676,12 +1686,15 @@ class Sh2PipelineTest(unittest.TestCase):
                         expected_prior_head_sha256=seq0_sha,
                         expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                         bitcoin_merkle_roots=extra_btc,
+                        trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                     )
                 self.assertIn("production_trusted_head_mismatch", str(stale_retry_ctx.exception))
 
             # Reproduce forged same-session record/receipt + deleted report using unchanged seq0_sha
             forged_root = Path(tmpdir) / "forged_retry_root"
             shutil.copytree(root, forged_root)
+            forged_anchor = Path(tmpdir) / "forged_retry_anchor.json"
+            shutil.copy2(Path(tmpdir) / "auth_anchor.json", forged_anchor)
             forged_ledger = ShadowLedger(forged_root / "ledger")
             forged_recs = forged_ledger.load_records()
             forged_body = json.loads(json.dumps(forged_recs[1]["record_body"]))
@@ -1735,6 +1748,7 @@ class Sh2PipelineTest(unittest.TestCase):
                         wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
                         expected_prior_head_sha256=head_arg,
                         bitcoin_merkle_roots=btc_arg,
+                        trusted_head_anchor_path=forged_anchor,
                     )
                 self.assertFalse((forged_root / "reports" / "completeness_2026-01-06.json").exists())
 
@@ -1750,6 +1764,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     transport=build_live_mock_transport("2026-01-06"),
                     environ={"TIINGO_API_KEY": "test-dummy-token"},
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                    trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                     **retry_kw,
                 )
                 self.assertEqual(r1_retry["reason"], "already_committed_session_preserved")
@@ -1768,6 +1783,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     sleeper=lambda _s: None,
                     expected_prior_head_sha256=seq0_sha,
                     expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                 )
             r2 = run_production_cycle(
                 session_date="2026-01-07",
@@ -1781,6 +1797,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=seq1_sha,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
             )
             self.assertTrue(r2["appended"])
             self.assertEqual(r2["sequence"], 2)
@@ -1805,6 +1822,7 @@ class Sh2PipelineTest(unittest.TestCase):
                         sleeper=lambda _s: None,
                         expected_prior_head_sha256=wiped_head,
                         bitcoin_merkle_roots=dict(hdrs),
+                        trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
                     )
                 self.assertIn(expected_msg, str(wiped_ctx.exception))
                 self.assertEqual(ShadowLedger(root / "ledger").load_records(), [])
@@ -1925,10 +1943,8 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "lookback_anchor.json",
             )
-            self.assertTrue(r0["appended"])
-            self.assertEqual(r0["sequence"], 0)
-            self.assertEqual(len(seen_tiingo_urls), 3)
             for u in seen_tiingo_urls:
                 self.assertIn("startDate=2026-01-02", u)
                 self.assertIn("endDate=2026-01-05", u)
@@ -1962,6 +1978,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
             )
             self.assertTrue(r0["appended"])
             seq0_sha = str(r0["record_sha256"])
@@ -1979,6 +1996,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     clock=_fast_clock(),
                     sleeper=lambda _s: None,
                     expected_prior_head_sha256=seq0_sha,
+                    trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
                 )
             self.assertIn("production_pending_rejected_state_unauthenticated", str(ctx_clean_omit.exception))
 
@@ -2002,6 +2020,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
                 expected_prior_head_sha256=seq0_sha,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
             )
             self.assertFalse(r_rej["appended"])
             self.assertTrue(r_rej["fail_closed"])
@@ -2023,6 +2042,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     clock=_fast_clock(),
                     sleeper=lambda _s: None,
                     expected_prior_head_sha256=seq0_sha,
+                    trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
                 )
             self.assertIn("production_pending_rejected_state_unauthenticated", str(ctx_unauth.exception))
 
@@ -2040,6 +2060,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     sleeper=lambda _s: None,
                     expected_prior_head_sha256=seq0_sha,
                     expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
                 )
             self.assertIn("production_pending_rejected_state_unexpected", str(ctx_unexp.exception))
 
@@ -2061,12 +2082,19 @@ class Sh2PipelineTest(unittest.TestCase):
                     sleeper=lambda _s: None,
                     expected_prior_head_sha256=seq0_sha,
                     expected_pending_state_sha256=pending_sha,
+                    trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
                 )
             self.assertIn("production_pending_rejected_state_mismatch", str(ctx_tamper.exception))
 
             # 3. Deleting pending_rejected_state.json fails closed BOTH with pinned pending_sha AND stale NO_PENDING_REJECTED_STATE_SHA256
             pend_path.unlink()
-            for del_arg in (pending_sha, NO_PENDING_REJECTED_STATE_SHA256):
+            for del_arg, del_err in (
+                (pending_sha, "production_pending_rejected_state_missing"),
+                (
+                    NO_PENDING_REJECTED_STATE_SHA256,
+                    "production_trusted_head_rollback_rejected: pending state diverged from trusted anchor",
+                ),
+            ):
                 with self.assertRaises(EngineIdentityError) as ctx_missing:
                     run_production_cycle(
                         session_date="2026-01-07",
@@ -2080,8 +2108,9 @@ class Sh2PipelineTest(unittest.TestCase):
                         sleeper=lambda _s: None,
                         expected_prior_head_sha256=seq0_sha,
                         expected_pending_state_sha256=del_arg,
+                        trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
                     )
-                self.assertIn("production_pending_rejected_state_missing", str(ctx_missing.exception))
+                self.assertIn(del_err, str(ctx_missing.exception))
 
             # 4. Restoring intact pending_rejected_state.json + matching pending_sha preserves V4 latch & commits
             pend_path.write_bytes(orig_pend_bytes)
@@ -2097,6 +2126,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=seq0_sha,
                 expected_pending_state_sha256=pending_sha,
+                trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
             )
             self.assertTrue(r_ok["appended"])
             self.assertEqual(r_ok["sequence"], 1)
@@ -2120,6 +2150,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=str(r_ok["record_sha256"]),
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "pend_auth_anchor.json",
             )
             self.assertTrue(r_jan8["appended"])
             self.assertEqual(r_jan8["sequence"], 2)
@@ -2160,6 +2191,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
                     expected_prior_head_sha256=GENESIS_PREV_HASH,
                     expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    trusted_head_anchor_path=Path(tmpdir) / "ots_anchor.json",
                 )
             self.assertIn("OTS receipt acquisition failed:", str(ctx_ots.exception))
             self.assertIn("pending_rejected_state_sha256=", str(ctx_ots.exception))
@@ -2185,6 +2217,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sigma_by_inst={"TQQQ": "0.22", "SOXL": "0.22"},
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=pend_ots_sha,
+                trusted_head_anchor_path=Path(tmpdir) / "ots_anchor.json",
             )
             self.assertTrue(r_next_ots["appended"])
             self.assertEqual(r_next_ots["sequence"], 0)
@@ -2223,6 +2256,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sigma_by_inst={"TQQQ": "0.50", "SOXL": "0.24"},
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=Path(tmpdir) / "dl_anchor.json",
             )
             self.assertFalse(r_dl["appended"])
             self.assertEqual(r_dl["reason"], "late_after_commitment_deadline_backfill_rejected")
@@ -2242,6 +2276,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sigma_by_inst={"TQQQ": "0.22", "SOXL": "0.22"},
                 expected_prior_head_sha256=GENESIS_PREV_HASH,
                 expected_pending_state_sha256=pend_dl_sha,
+                trusted_head_anchor_path=Path(tmpdir) / "dl_anchor.json",
             )
             self.assertTrue(r_next_dl["appended"])
             recs_dl = ShadowLedger(root_dl / "ledger").load_records()

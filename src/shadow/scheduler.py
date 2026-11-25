@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import hmac
 import json
 import os
@@ -1489,6 +1490,9 @@ def _commit_drill_session_atomically(
     next_row_state: dict | None = None,
     engine_hash: str | None = None,
     spec_version: str | None = None,
+    trusted_head_anchor_path: Path | None = None,
+    expected_prior_anchor_bytes: bytes | None = None,
+    anchor_updated_at_utc: str | None = None,
 ) -> dict:
     """Serialize via chain_lock, stage replay_bundle + state snapshot before seq_NNNNNN.record.json commit."""
     with ledger.chain_lock():
@@ -1576,6 +1580,17 @@ def _commit_drill_session_atomically(
             raise
         if pending_snap_path is not None and pending_snap_path.is_file():
             pending_snap_path.unlink()
+        if trusted_head_anchor_path is not None:
+            _advance_trusted_head_anchor(
+                trusted_head_anchor_path,
+                chain_id=cfg.chain_id,
+                expected_prior_bytes=expected_prior_anchor_bytes,
+                sequence=seq,
+                session_date=str(body["session_date"]),
+                head_sha256=env["record_sha256"],
+                pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                now_utc=anchor_updated_at_utc or rcp_obtained_utc,
+            )
         return env
 
 
@@ -1908,6 +1923,7 @@ def run_production_cycle(
     expected_prior_head_sha256: str | None = None,
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
 ) -> dict:
     """Execute one CLK-01 production cycle ONLY when OA-SH2-2 lock is explicitly unlocked."""
     t_start = time.monotonic()
@@ -1956,6 +1972,7 @@ def run_production_cycle(
         expected_prior_head_sha256=expected_prior_head_sha256,
         expected_pending_state_sha256=expected_pending_state_sha256,
         bitcoin_merkle_roots=bitcoin_merkle_roots,
+        trusted_head_anchor_path=trusted_head_anchor_path,
         _post_ledger_commit_hook=None,
         _post_record_commit_hook=None,
         _post_report_json_hook=None,
@@ -1987,6 +2004,7 @@ def _execute_cycle_with_config(
     expected_prior_head_sha256: str | None = None,
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
     _post_report_json_hook: Callable[[], None] | None,
@@ -2064,6 +2082,7 @@ def _execute_cycle_with_config(
             expected_prior_head_sha256=expected_prior_head_sha256,
             expected_pending_state_sha256=expected_pending_state_sha256,
             bitcoin_merkle_roots=bitcoin_merkle_roots,
+            trusted_head_anchor_path=trusted_head_anchor_path,
             _post_ledger_commit_hook=_post_ledger_commit_hook,
             _post_record_commit_hook=_post_record_commit_hook,
             _post_report_json_hook=_post_report_json_hook,
@@ -2448,6 +2467,142 @@ def _check_no_unconsumed_pending_rejected_reports(
                 )
 
 
+def _validate_trusted_head_anchor_path(
+    anchor_path: str | Path | None,
+    data_dir: str | Path,
+) -> Path:
+    if anchor_path is None or not str(anchor_path).strip():
+        raise EngineIdentityError(
+            "production_trusted_head_anchor_required: require external trusted_head_anchor_path"
+        )
+    resolved_anchor = Path(anchor_path).resolve()
+    resolved_data = Path(data_dir).resolve()
+    try:
+        resolved_anchor.relative_to(resolved_data)
+        inside_data = True
+    except ValueError:
+        inside_data = False
+    if inside_data:
+        raise EngineIdentityError(
+            "production_trusted_head_anchor_inside_data_dir: anchor must reside outside SHADOW_DATA_DIR"
+        )
+    if resolved_anchor.exists() and resolved_anchor.is_dir():
+        raise EngineIdentityError("production_trusted_head_anchor_is_directory")
+    return resolved_anchor
+
+
+def _load_trusted_head_anchor(
+    anchor_path: Path,
+    *,
+    expected_chain_id: str,
+) -> tuple[dict | None, bytes | None]:
+    if not anchor_path.exists():
+        return None, None
+    try:
+        raw_bytes = anchor_path.read_bytes()
+        obj = parse_json_no_duplicates(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
+    if not isinstance(obj, dict):
+        raise EngineIdentityError("invalid_trusted_head_anchor:not_dict")
+    if obj.get("schema_version") != "c-sh-trusted-head-anchor-v1":
+        raise EngineIdentityError("invalid_trusted_head_anchor:schema_version")
+    if obj.get("chain_id") != expected_chain_id:
+        raise EngineIdentityError("invalid_trusted_head_anchor:chain_id_mismatch")
+    seq = obj.get("sequence")
+    anchor_ver = obj.get("anchor_version")
+    head_sha = obj.get("head_sha256")
+    pend_sha = obj.get("pending_rejected_state_sha256")
+    if (
+        isinstance(seq, bool)
+        or not isinstance(seq, int)
+        or seq < -1
+        or isinstance(anchor_ver, bool)
+        or not isinstance(anchor_ver, int)
+        or anchor_ver < 1
+        or not isinstance(head_sha, str)
+        or not _HEX64_RE.fullmatch(head_sha)
+        or not isinstance(pend_sha, str)
+        or not _HEX64_RE.fullmatch(pend_sha)
+    ):
+        raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
+    if seq == -1 and not hmac.compare_digest(head_sha, GENESIS_PREV_HASH):
+        raise EngineIdentityError("invalid_trusted_head_anchor:genesis_seq_head_mismatch")
+    return obj, raw_bytes
+
+
+def _advance_trusted_head_anchor(
+    anchor_path: Path,
+    *,
+    chain_id: str,
+    expected_prior_bytes: bytes | None,
+    sequence: int,
+    session_date: str | None,
+    head_sha256: str,
+    pending_rejected_state_sha256: str,
+    now_utc: str,
+) -> dict:
+    anchor_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = anchor_path.with_name(f".{anchor_path.name}.lock")
+    lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        try:
+            cur_obj, cur_bytes = _load_trusted_head_anchor(
+                anchor_path, expected_chain_id=chain_id
+            )
+            if expected_prior_bytes is None:
+                if cur_bytes is not None:
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: anchor appeared concurrently"
+                    )
+                next_version = 1
+            else:
+                if cur_bytes != expected_prior_bytes or cur_obj is None:
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: anchor modified concurrently"
+                    )
+                if sequence < int(cur_obj["sequence"]):
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: anchor sequence regression"
+                    )
+                next_version = int(cur_obj["anchor_version"]) + 1
+
+            new_obj: dict[str, object] = {
+                "schema_version": "c-sh-trusted-head-anchor-v1",
+                "chain_id": chain_id,
+                "sequence": sequence,
+                "session_date": session_date,
+                "head_sha256": head_sha256,
+                "pending_rejected_state_sha256": pending_rejected_state_sha256,
+                "anchor_version": next_version,
+                "updated_at_utc": now_utc,
+            }
+            new_bytes = (
+                json.dumps(new_obj, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            tmp_path = anchor_path.with_name(
+                f".{anchor_path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+            )
+            tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(tfd, new_bytes)
+                os.fsync(tfd)
+            finally:
+                os.close(tfd)
+            os.replace(tmp_path, anchor_path)
+            dfd = os.open(str(anchor_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return new_obj
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+    finally:
+        os.close(lfd)
+
+
 def _authenticate_production_history(
     *,
     ledger: ShadowLedger,
@@ -2459,10 +2614,19 @@ def _authenticate_production_history(
     snapshots_dir: Path | None = None,
     reports_dir: Path | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None,
-) -> None:
+    data_dir: Path | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
+) -> tuple[Path | None, bytes | None]:
     """Fail closed if persisted production history or pending state is unauthenticated before reuse."""
     if cfg.mode != "production":
-        return
+        return None, None
+    anchor_resolved = _validate_trusted_head_anchor_path(
+        trusted_head_anchor_path,
+        data_dir if data_dir is not None else ledger.root_dir.parent,
+    )
+    anchor_obj, anchor_bytes = _load_trusted_head_anchor(
+        anchor_resolved, expected_chain_id=cfg.chain_id
+    )
     if expected_prior_head_sha256 is not None:
         if not isinstance(expected_prior_head_sha256, str) or not _HEX64_RE.fullmatch(
             expected_prior_head_sha256
@@ -2477,19 +2641,48 @@ def _authenticate_production_history(
             )
         if not hmac.compare_digest(expected_prior_head_sha256, GENESIS_PREV_HASH):
             raise EngineIdentityError("production_trusted_head_mismatch:empty_ledger")
+        if anchor_obj is not None:
+            if int(anchor_obj["sequence"]) >= 0:
+                raise EngineIdentityError(
+                    "production_trusted_head_rollback_rejected: empty ledger behind monotonic trusted head anchor"
+                )
+            if not hmac.compare_digest(str(anchor_obj["head_sha256"]), GENESIS_PREV_HASH):
+                raise EngineIdentityError("production_trusted_head_rollback_rejected")
         if snapshots_dir is not None:
             auth_pending = authenticate_pending_rejected_state_snapshot(
                 snapshots_dir,
                 expected_pending_state_sha256=expected_pending_state_sha256,
                 require_external_pending_auth=True,
             )
+            actual_pend_sha = (
+                compute_pending_rejected_state_sha256(
+                    parse_json_no_duplicates(
+                        (snapshots_dir / "pending_rejected_state.json").read_text(encoding="utf-8")
+                    )
+                )
+                if auth_pending is not None
+                else NO_PENDING_REJECTED_STATE_SHA256
+            )
+            if anchor_obj is not None:
+                exp_anchor_pend = str(anchor_obj["pending_rejected_state_sha256"])
+                if not hmac.compare_digest(actual_pend_sha, exp_anchor_pend) or (
+                    expected_pending_state_sha256 is not None
+                    and not hmac.compare_digest(expected_pending_state_sha256, exp_anchor_pend)
+                ):
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: pending state behind trusted anchor"
+                    )
             if auth_pending is None and reports_dir is not None:
                 _check_no_unconsumed_pending_rejected_reports(
                     reports_dir,
                     head_session_date=None,
                 )
-        return
+        return anchor_resolved, anchor_bytes
 
+    if anchor_obj is None:
+        raise EngineIdentityError(
+            "production_trusted_head_anchor_missing: non-empty production ledger requires existing trusted head anchor"
+        )
     if expected_prior_head_sha256 is None:
         raise EngineIdentityError(
             "production_history_unauthenticated: require expected_prior_head_sha256"
@@ -2505,27 +2698,58 @@ def _authenticate_production_history(
         ),
         None,
     )
+    actual_seq = int(prior_records[-1]["record_body"]["sequence"])
     head_rec_sha = prior_records[-1]["record_sha256"]
     if existing_env is not None and existing_env["record_body"]["sequence"] != len(prior_records) - 1:
         raise EngineIdentityError("production_trusted_head_mismatch")
-    if not isinstance(head_rec_sha, str) or not hmac.compare_digest(
+    if actual_seq < int(anchor_obj["sequence"]):
+        raise EngineIdentityError(
+            f"production_trusted_head_rollback_rejected: ledger sequence {actual_seq} < trusted anchor sequence {anchor_obj['sequence']}"
+        )
+    if actual_seq > int(anchor_obj["sequence"]) or not isinstance(head_rec_sha, str) or not hmac.compare_digest(
         head_rec_sha,
-        expected_prior_head_sha256,
+        str(anchor_obj["head_sha256"]),
     ):
+        raise EngineIdentityError("production_trusted_head_mismatch:diverges_from_anchor")
+    if not hmac.compare_digest(head_rec_sha, expected_prior_head_sha256):
         raise EngineIdentityError("production_trusted_head_mismatch")
 
-    if existing_env is None and snapshots_dir is not None:
-        auth_pending = authenticate_pending_rejected_state_snapshot(
-            snapshots_dir,
-            expected_pending_state_sha256=expected_pending_state_sha256,
-            require_external_pending_auth=True,
-        )
-        if auth_pending is None and reports_dir is not None:
-            head_body = prior_records[-1].get("record_body") if isinstance(prior_records[-1], Mapping) else None
-            head_ds = str(head_body.get("session_date")) if isinstance(head_body, Mapping) and head_body.get("session_date") else None
-            _check_no_unconsumed_pending_rejected_reports(
-                reports_dir,
-                head_session_date=head_ds,
+    if snapshots_dir is not None:
+        pend_path = snapshots_dir / "pending_rejected_state.json"
+        if existing_env is None:
+            auth_pending = authenticate_pending_rejected_state_snapshot(
+                snapshots_dir,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                require_external_pending_auth=True,
+            )
+            actual_pend_sha = (
+                compute_pending_rejected_state_sha256(
+                    parse_json_no_duplicates(pend_path.read_text(encoding="utf-8"))
+                )
+                if auth_pending is not None
+                else NO_PENDING_REJECTED_STATE_SHA256
+            )
+            exp_anchor_pend = str(anchor_obj["pending_rejected_state_sha256"])
+            if not hmac.compare_digest(actual_pend_sha, exp_anchor_pend) or (
+                expected_pending_state_sha256 is not None
+                and not hmac.compare_digest(expected_pending_state_sha256, exp_anchor_pend)
+            ):
+                raise EngineIdentityError(
+                    "production_trusted_head_rollback_rejected: pending state diverged from trusted anchor"
+                )
+            if auth_pending is None and reports_dir is not None:
+                head_body = prior_records[-1].get("record_body") if isinstance(prior_records[-1], Mapping) else None
+                head_ds = str(head_body.get("session_date")) if isinstance(head_body, Mapping) and head_body.get("session_date") else None
+                _check_no_unconsumed_pending_rejected_reports(
+                    reports_dir,
+                    head_session_date=head_ds,
+                )
+        elif not hmac.compare_digest(
+            str(anchor_obj["pending_rejected_state_sha256"]),
+            NO_PENDING_REJECTED_STATE_SHA256,
+        ):
+            raise EngineIdentityError(
+                "production_trusted_head_rollback_rejected: unexpected pending digest on committed anchor"
             )
 
     if bitcoin_merkle_roots is not None:
@@ -2536,6 +2760,8 @@ def _authenticate_production_history(
         )
         if not ok_credit:
             raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
+
+    return anchor_resolved, anchor_bytes
 
 
 def _run_daily_drill_cycle_locked(
@@ -2570,6 +2796,7 @@ def _run_daily_drill_cycle_locked(
     expected_prior_head_sha256: str | None = None,
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
     _post_report_json_hook: Callable[[], None] | None,
@@ -2624,7 +2851,7 @@ def _run_daily_drill_cycle_locked(
     head_env = ledger.head()
     head_hash = head_env["record_sha256"] if head_env is not None else GENESIS_PREV_HASH
     prior_records = ledger.load_records()
-    _authenticate_production_history(
+    anchor_resolved, anchor_bytes = _authenticate_production_history(
         ledger=ledger,
         cfg=cfg,
         prior_records=prior_records,
@@ -2634,6 +2861,8 @@ def _run_daily_drill_cycle_locked(
         snapshots_dir=root / "state_snapshots",
         reports_dir=reports_dir,
         bitcoin_merkle_roots=bitcoin_merkle_roots,
+        data_dir=root,
+        trusted_head_anchor_path=trusted_head_anchor_path,
     )
     prior_streak = _count_consecutive_trading_sessions(
         prior_records,
@@ -3373,6 +3602,7 @@ def _run_daily_drill_cycle_locked(
             )
 
     def _persist_pending_rejected_state() -> str | None:
+        nonlocal anchor_bytes
         if is_stub_evaluator(ev) or not isinstance(built.get("next_row_state"), dict):
             return None
         pending_path = save_pending_rejected_state_snapshot(
@@ -3386,9 +3616,27 @@ def _run_daily_drill_cycle_locked(
             next_row_state=built["next_row_state"],
             base_prior_row_state=session_base_prior_state,
         )
-        return compute_pending_rejected_state_sha256(
+        pending_sha_val = compute_pending_rejected_state_sha256(
             parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
         )
+        if anchor_resolved is not None:
+            prior_head_ds = (
+                str(prior_records[-1]["record_body"]["session_date"])
+                if prior_records
+                else None
+            )
+            _advance_trusted_head_anchor(
+                anchor_resolved,
+                chain_id=cfg.chain_id,
+                expected_prior_bytes=anchor_bytes,
+                sequence=seq - 1,
+                session_date=prior_head_ds,
+                head_sha256=head_hash,
+                pending_rejected_state_sha256=pending_sha_val,
+                now_utc=_format_utc_ms(clock_fn()),
+            )
+            anchor_bytes = anchor_resolved.read_bytes()
+        return pending_sha_val
 
     if not built["appended"]:
         pending_sha = _persist_pending_rejected_state()
@@ -3505,6 +3753,11 @@ def _run_daily_drill_cycle_locked(
         next_row_state=None if is_stub_evaluator(ev) else built["next_row_state"],
         engine_hash=None if is_stub_evaluator(ev) else ev.engine_hash,
         spec_version=None if is_stub_evaluator(ev) else ev.spec_version,
+        trusted_head_anchor_path=anchor_resolved,
+        expected_prior_anchor_bytes=anchor_bytes,
+        anchor_updated_at_utc=(
+            _format_utc_ms(clock_fn()) if anchor_resolved is not None else None
+        ),
     )
     if _post_record_commit_hook is not None:
         _post_record_commit_hook()

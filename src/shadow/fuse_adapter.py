@@ -584,6 +584,13 @@ def _finite_number(raw: object) -> float | None:
     return val
 
 
+def _preserve_numeric_quantity(val: float | None) -> int | float | None:
+    if val is None:
+        return None
+    fval = float(val)
+    return int(fval) if fval.is_integer() else fval
+
+
 def _map_calendar_statuses(
     calendar_session: Mapping[str, Any] | None,
     *,
@@ -1058,9 +1065,9 @@ def build_fuse_validated_inputs(
             "spread_width": _finite_number(fdata.get("spread_width")) if fdata.get("spread_width") is not None else 0.0,
             "trading_pause": bool(fdata.get("trading_pause", False)),
             "session_time": str(fdata.get("session_time", "regular")),
-            "share_count": int(q_pre_val) if q_pre_val is not None else 0,
+            "share_count": _preserve_numeric_quantity(q_pre_val) if q_pre_val is not None else 0,
             "ledger_value": _finite_number(fdata.get("ledger_value")) if fdata.get("ledger_value") is not None else pos_val,
-            "broker_position": int(broker_pos_val) if broker_pos_val is not None else None,
+            "broker_position": _preserve_numeric_quantity(broker_pos_val),
             "broker_value": _finite_number(fdata.get("broker_value")) if fdata.get("broker_value") is not None else pos_val,
             "corporate_action": ca_obj,
             "fund_event": copy.deepcopy(fdata.get("fund_event")),
@@ -1122,9 +1129,13 @@ def build_fuse_validated_inputs(
         else caller_sources.get("broker_reconciliation")
     )
     raw_source_records: dict[str, dict[str, Any] | None] = {
-        "market_data": caller_sources.get("market_data")
-        if "market_data" in caller_sources
-        else ({"as_of": as_of, "age_sessions": 0} if mkt_ok else None),
+        "market_data": (
+            copy.deepcopy(caller_sources.get("market_data"))
+            if "market_data" in caller_sources
+            else {"as_of": as_of, "age_sessions": 0}
+        )
+        if (mkt_ok and idx_ok and vol_ok)
+        else None,
         "index_returns": caller_sources.get("index_returns")
         if "index_returns" in caller_sources
         else ({"as_of": as_of, "age_sessions": 0} if (idx_ok and idx_returns is not None) else None),
@@ -1133,9 +1144,13 @@ def build_fuse_validated_inputs(
         else ({"as_of": as_of, "age_sessions": 0} if vol_ok else None),
         "positions": copy.deepcopy(pos_rec) if isinstance(pos_rec, Mapping) else None,
         "broker_reconciliation": copy.deepcopy(brk_rec) if isinstance(brk_rec, Mapping) else None,
-        "session_calendar": caller_sources.get("session_calendar")
-        if "session_calendar" in caller_sources
-        else ({"as_of": as_of, "age_sessions": 0} if cal_ok else None),
+        "session_calendar": (
+            copy.deepcopy(caller_sources.get("session_calendar"))
+            if "session_calendar" in caller_sources
+            else {"as_of": as_of, "age_sessions": 0}
+        )
+        if cal_ok
+        else None,
     }
     source_records = {k: v for k, v in raw_source_records.items() if v is not None}
 

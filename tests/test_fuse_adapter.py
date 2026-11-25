@@ -1228,6 +1228,74 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertTrue(rows_v1["V1"]["latched"])
         self.assertEqual(rows_v1["V1"]["reason"], "tracking_deviation_exceeds_2_0pp")
 
+    def test_fractional_broker_position_and_market_data_validation_preserved(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        # 1. Fractional broker_position is preserved (not truncated to int) so O3 catches mismatch
+        si_frac = _valid_inputs()
+        si_frac["funds"]["TQQQ"]["broker_position"] = "100.9"
+        vin_frac = build_fuse_validated_inputs(
+            si_frac,
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertEqual(vin_frac["funds"]["TQQQ"]["share_count"], 100)
+        self.assertAlmostEqual(vin_frac["funds"]["TQQQ"]["broker_position"], 100.9, places=6)
+        rows_frac, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            vin_frac,
+            {},
+            None,
+        )
+        self.assertEqual(rows_frac["O3"]["state"], "HALT")
+        self.assertEqual(rows_frac["O3"]["reason"], "reconciliation_mismatch")
+
+        # 2. Missing required market_record fails O1 closed even when caller supplies source_records.market_data
+        si_mkt = _valid_inputs()
+        cal_digest = str(cal6["spec_digest"])
+        si_mkt["market_records"] = [
+            {
+                "instrument": inst,
+                "normalized_value": 50.0,
+                "calendar_spec_digest": cal_digest,
+                "eligibility": {"eligible": True},
+            }
+            for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR")
+        ]
+        si_mkt["source_records"] = {
+            "market_data": {"as_of": "2026-01-06T22:00:00.000Z", "age_sessions": 0},
+            "session_calendar": {"as_of": "2026-01-06T22:00:00.000Z", "age_sessions": 0},
+        }
+        vin_mkt = build_fuse_validated_inputs(
+            si_mkt,
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertNotIn("market_data", vin_mkt["source_records"])
+        rows_mkt, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            vin_mkt,
+            {},
+            None,
+        )
+        self.assertTrue(rows_mkt["O1"]["would_have_tripped"])
+
 
 if __name__ == "__main__":
     unittest.main()

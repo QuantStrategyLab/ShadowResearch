@@ -87,6 +87,7 @@ def run_cloudrun_job(
     expected_pending_state_sha256: str | None = None,
     bitcoin_merkle_roots: Mapping[int, object] | None = None,
     bitcoin_merkle_roots_path: str | Path | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Execute one idempotent Cloud Run Job task against vendored FUSE-1 + csa22-v2."""
     env = dict(os.environ) if environ is None else dict(environ)
@@ -155,6 +156,11 @@ def run_cloudrun_job(
             if expected_pending_state_sha256 is not None
             else (env.get("SHADOW_TRUSTED_PENDING_STATE_SHA256", "").strip() or None)
         )
+        eff_trusted_anchor_path = (
+            trusted_head_anchor_path
+            if trusted_head_anchor_path is not None
+            else (env.get("SHADOW_TRUSTED_HEAD_ANCHOR_PATH", "").strip() or None)
+        )
         eff_roots: Mapping[int, object] | None = bitcoin_merkle_roots
         if eff_roots is None:
             roots_path_raw = (
@@ -182,6 +188,7 @@ def run_cloudrun_job(
             expected_prior_head_sha256=eff_expected_prior_head,
             expected_pending_state_sha256=eff_expected_pending_state,
             bitcoin_merkle_roots=eff_roots,
+            trusted_head_anchor_path=eff_trusted_anchor_path,
         )
     else:
         allow_unanchored = (
@@ -277,6 +284,10 @@ def main(argv: list[str] | None = None) -> int:
         "--bitcoin-merkle-roots-path",
         help="Path to trusted Bitcoin merkle roots JSON (overrides SHADOW_BITCOIN_MERKLE_ROOTS_PATH)",
     )
+    parser.add_argument(
+        "--trusted-head-anchor-path",
+        help="Path to external monotonic trusted head anchor JSON outside data_dir (overrides SHADOW_TRUSTED_HEAD_ANCHOR_PATH)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -290,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_prior_head_sha256=args.expected_prior_head_sha256,
             expected_pending_state_sha256=args.expected_pending_state_sha256,
             bitcoin_merkle_roots_path=args.bitcoin_merkle_roots_path,
+            trusted_head_anchor_path=args.trusted_head_anchor_path,
         )
     except ProductionChainLockedError as exc:
         err_payload = {

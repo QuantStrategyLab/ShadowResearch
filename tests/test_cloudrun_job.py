@@ -226,6 +226,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(Path(tmpdir) / "smoke_anchor.json"),
                 },
                 ots_client=_FakeOts(),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
@@ -371,6 +372,7 @@ class CloudRunJobTest(unittest.TestCase):
                 tick[0] += 25.0
                 return tick[0]
 
+            prod_auth_anchor = Path(tmpdir) / "prod_auth_anchor.json"
             # Empty bucket without SHADOW_TRUSTED_HEAD_SHA256=GENESIS_PREV_HASH MUST fail (with or without BTC roots)
             dummy_roots_file = Path(tmpdir) / "pre-genesis-roots.json"
             dummy_roots_file.write_text(
@@ -378,10 +380,14 @@ class CloudRunJobTest(unittest.TestCase):
                 encoding="utf-8",
             )
             for empty_env in (
-                {"TIINGO_API_KEY": "test-dummy-token"},
+                {
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
+                },
                 {
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(dummy_roots_file),
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
                 },
             ):
                 with self.assertRaises(EngineIdentityError) as gen_err:
@@ -421,6 +427,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "PYTHONPATH": _SRC,
                     "PATH": "/usr/local/bin:/usr/bin:/bin",
                     "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(dummy_roots_file),
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
                 },
                 capture_output=True,
                 text=True,
@@ -441,6 +448,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
                 },
                 ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
@@ -458,7 +466,10 @@ class CloudRunJobTest(unittest.TestCase):
                     mode="production",
                     session_date="2026-01-06",
                     transport=build_live_mock_transport("2026-01-06"),
-                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
+                    },
                     ots_client=_make_ots("2026-01-06", "2026-01-07T03:00:00.000Z"),
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                     clock=_fast_clk,
@@ -481,7 +492,11 @@ class CloudRunJobTest(unittest.TestCase):
                     "2026-01-06",
                 ],
                 cwd=_REPO_ROOT,
-                env={"PYTHONPATH": _SRC, "PATH": "/usr/local/bin:/usr/bin:/bin"},
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
+                },
                 capture_output=True,
                 text=True,
             )
@@ -502,6 +517,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
                 },
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
             )
@@ -522,6 +538,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
                     "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
                 },
                 ots_client=_make_ots("2026-01-06", "2026-01-07T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
@@ -536,13 +553,17 @@ class CloudRunJobTest(unittest.TestCase):
             shutil.rmtree(ddir)
             for wiped_env, expected_err in (
                 (
-                    {"SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file)},
+                    {
+                        "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                        "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
+                    },
                     "production_genesis_unauthenticated",
                 ),
                 (
                     {
                         "SHADOW_TRUSTED_HEAD_SHA256": seq0_sha,
                         "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                        "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(prod_auth_anchor),
                     },
                     "production_trusted_head_mismatch:empty_ledger",
                 ),
@@ -588,6 +609,7 @@ class CloudRunJobTest(unittest.TestCase):
 
             # BTC roots without SHADOW_TRUSTED_HEAD_SHA256 must fail closed with exit 3 on fresh copy
             reauth_dir = Path(tmpdir) / "reauth_prod_data"
+            reauth_anchor = Path(tmpdir) / "reauth_prod_anchor.json"
             r_init = run_cloudrun_job(
                 data_dir=reauth_dir,
                 config_path=unlocked_cfg,
@@ -598,6 +620,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(reauth_anchor),
                 },
                 ots_client=_make_ots("2026-01-05", "2026-01-06T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
@@ -616,6 +639,7 @@ class CloudRunJobTest(unittest.TestCase):
                     environ={
                         "TIINGO_API_KEY": "test-dummy-token",
                         "SHADOW_BITCOIN_MERKLE_ROOTS_PATH": str(roots_file),
+                        "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(reauth_anchor),
                     },
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                 )
@@ -639,6 +663,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(reauth_anchor),
                 },
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clk,
@@ -668,6 +693,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "PYTHONPATH": _SRC,
                     "PATH": "/usr/local/bin:/usr/bin:/bin",
                     "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(reauth_anchor),
                 },
                 capture_output=True,
                 text=True,
@@ -675,37 +701,45 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(proc_pend_unauth.returncode, 3)
             self.assertIn("production_pending_rejected_state_unauthenticated", proc_pend_unauth.stdout)
 
-            # Deleting pending_rejected_state.json while passing NO_PENDING_REJECTED_STATE_SHA256 fails closed exit 3
+            # Deleting pending_rejected_state.json fails closed exit 3 (both with pend_digest and stale NO_PENDING_REJECTED_STATE_SHA256)
             deleted_pend_dir = Path(tmpdir) / "deleted_pend_copy"
             shutil.copytree(reauth_dir, deleted_pend_dir)
             (deleted_pend_dir / "state_snapshots" / "pending_rejected_state.json").unlink()
-            proc_pend_deleted = subprocess.run(
-                [
-                    sys.executable,
-                    "-B",
-                    "-m",
-                    "shadow.cloudrun_job",
-                    "--data-dir",
-                    str(deleted_pend_dir),
-                    "--config",
-                    str(unlocked_cfg),
-                    "--mode",
-                    "production",
-                    "--session-date",
-                    "2026-01-07",
-                ],
-                cwd=_REPO_ROOT,
-                env={
-                    "PYTHONPATH": _SRC,
-                    "PATH": "/usr/local/bin:/usr/bin:/bin",
-                    "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
-                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
-                },
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(proc_pend_deleted.returncode, 3)
-            self.assertIn("production_pending_rejected_state_missing", proc_pend_deleted.stdout)
+            for del_pend_sha, del_pend_err in (
+                (pend_digest, "production_pending_rejected_state_missing"),
+                (
+                    NO_PENDING_REJECTED_STATE_SHA256,
+                    "production_trusted_head_rollback_rejected: pending state diverged from trusted anchor",
+                ),
+            ):
+                proc_pend_deleted = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-m",
+                        "shadow.cloudrun_job",
+                        "--data-dir",
+                        str(deleted_pend_dir),
+                        "--config",
+                        str(unlocked_cfg),
+                        "--mode",
+                        "production",
+                        "--session-date",
+                        "2026-01-07",
+                    ],
+                    cwd=_REPO_ROOT,
+                    env={
+                        "PYTHONPATH": _SRC,
+                        "PATH": "/usr/local/bin:/usr/bin:/bin",
+                        "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": del_pend_sha,
+                        "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(reauth_anchor),
+                    },
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc_pend_deleted.returncode, 3)
+                self.assertIn(del_pend_err, proc_pend_deleted.stdout)
 
             ok_after_pend = run_cloudrun_job(
                 data_dir=reauth_dir,
@@ -717,6 +751,7 @@ class CloudRunJobTest(unittest.TestCase):
                     "TIINGO_API_KEY": "test-dummy-token",
                     "SHADOW_TRUSTED_HEAD_SHA256": init_sha,
                     "SHADOW_TRUSTED_PENDING_STATE_SHA256": pend_digest,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(reauth_anchor),
                 },
                 ots_client=_make_ots("2026-01-07", "2026-01-08T03:00:00.000Z"),
                 wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
@@ -806,6 +841,362 @@ class CloudRunJobTest(unittest.TestCase):
             )
             ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
             self.assertTrue(lease_path.is_file())
+
+    def test_expired_reclaim_claim_recovery_and_trusted_anchor_rollback_rejected(self) -> None:
+        import hashlib
+        import threading
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Part 1: PRRT_kwDOV2RNAc67qYmN — expired .chain.lease.reclaim.<claim_key>.lock recovers cleanly
+            rec_dir = Path(tmpdir) / "expired_reclaim"
+            ledger = ShadowLedger(rec_dir / "ledger")
+            lease_path = ledger.root_dir / ".chain.lease.json"
+            past_utc = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"
+            )
+            stale_bytes = json.dumps(
+                {
+                    "schema_version": "c-sh-chain-lease-v1",
+                    "lease_id": "stale-crashed-000",
+                    "pid": 888888,
+                    "execution_id": "exec-stale",
+                    "expires_at_utc": past_utc,
+                }
+            ).encode("utf-8")
+            lease_path.write_bytes(stale_bytes)
+            stale_sha = hashlib.sha256(stale_bytes).hexdigest()
+            claim_key = hashlib.sha256(
+                f"id:stale-crashed-000:{stale_sha}".encode("utf-8")
+            ).hexdigest()[:32]
+            reclaim_path = lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock")
+            reclaim_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-reclaim-v1",
+                        "claim_key": claim_key,
+                        "claimed_by_lease_id": "crashed-reclaimer-000",
+                        "expires_at_utc": past_utc,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            barrier = threading.Barrier(2)
+            tls = threading.local()
+            orig_parse_desc = ShadowLedger.__dict__["_parse_iso_utc"]
+            orig_parse = orig_parse_desc.__func__
+
+            def _sync_parse(raw: object) -> datetime | None:
+                res = orig_parse(raw)
+                if not getattr(tls, "waited", False):
+                    tls.waited = True
+                    barrier.wait(timeout=5.0)
+                return res
+
+            winners: list[str] = []
+            conflicts: list[Exception] = []
+            lock = threading.Lock()
+
+            def _worker() -> None:
+                try:
+                    lid = ledger._acquire_cross_instance_lease(
+                        lease_path, lease_ttl_seconds=300.0
+                    )
+                    with lock:
+                        winners.append(lid)
+                except ChainConcurrencyConflictError as exc:
+                    with lock:
+                        conflicts.append(exc)
+
+            ShadowLedger._parse_iso_utc = staticmethod(_sync_parse)  # type: ignore[method-assign]
+            try:
+                t1 = threading.Thread(target=_worker)
+                t2 = threading.Thread(target=_worker)
+                t1.start()
+                t2.start()
+                t1.join(timeout=10.0)
+                t2.join(timeout=10.0)
+            finally:
+                ShadowLedger._parse_iso_utc = orig_parse_desc  # type: ignore[assignment]
+
+            self.assertEqual(len(winners), 1, f"winners={winners}, conflicts={conflicts}")
+            self.assertEqual(len(conflicts), 1, f"winners={winners}, conflicts={conflicts}")
+            active = json.loads(lease_path.read_text(encoding="utf-8"))
+            self.assertEqual(active["lease_id"], winners[0])
+            ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
+            self.assertFalse(lease_path.exists())
+
+            # Part 2: PRRT_kwDOV2RNAc67qas6 — external monotonic trusted anchor & rollback guards
+            raw_cfg = json.loads(
+                (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+            )
+            raw_cfg["production_chain_locked"] = False
+            raw_cfg["clk01_active"] = True
+            unlocked_cfg = Path(tmpdir) / "unlocked-production.json"
+            unlocked_cfg.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            heights = {"2026-01-05": 880100, "2026-01-06": 880101, "2026-01-07": 880102}
+
+            def _make_ots(session_date: str):
+                class _Ots(OpenTimestampsClient):
+                    def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                        ots_b, _ = build_synthetic_ots_fixture(
+                            sha256_hex, bitcoin_height=heights[session_date]
+                        )
+                        return ots_b, "https://a.pool.opentimestamps.org"
+
+                return _Ots()
+
+            tick = [2000.0]
+
+            def _fast_clk() -> float:
+                tick[0] += 25.0
+                return tick[0]
+
+            ddir = Path(tmpdir) / "anchor_prod_data"
+            anchor_path = Path(tmpdir) / "external_trusted_anchor.json"
+
+            # 2a. Missing trusted_head_anchor_path fails closed (EngineIdentityError / CLI exit 3)
+            with self.assertRaises(EngineIdentityError) as req_ctx:
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-05",
+                    transport=build_live_mock_transport("2026-01-05"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    },
+                    ots_client=_make_ots("2026-01-05"),
+                    wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clk,
+                    sleeper=lambda _s: None,
+                )
+            self.assertIn("production_trusted_head_anchor_required", str(req_ctx.exception))
+            self.assertEqual(ShadowLedger(ddir / "ledger").load_records(), [])
+
+            proc_req = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(ddir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-05",
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_req.returncode, 3)
+            self.assertIn("production_trusted_head_anchor_required", proc_req.stdout)
+
+            # 2b. Anchor path inside data_dir fails closed (EngineIdentityError / CLI exit 3)
+            inside_anchor = ddir / "inside_anchor.json"
+            with self.assertRaises(EngineIdentityError) as in_ctx:
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-05",
+                    transport=build_live_mock_transport("2026-01-05"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    },
+                    ots_client=_make_ots("2026-01-05"),
+                    wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clk,
+                    sleeper=lambda _s: None,
+                    trusted_head_anchor_path=inside_anchor,
+                )
+            self.assertIn("production_trusted_head_anchor_inside_data_dir", str(in_ctx.exception))
+
+            proc_inside = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(ddir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-05",
+                    "--trusted-head-anchor-path",
+                    str(inside_anchor),
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_inside.returncode, 3)
+            self.assertIn("production_trusted_head_anchor_inside_data_dir", proc_inside.stdout)
+
+            # 2c. Commit seq 0 (2026-01-05), snapshot ddir, then advance to seq 1 (2026-01-06)
+            r0 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                ots_client=_make_ots("2026-01-05"),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(r0["status"], "committed")
+            head_0 = str(r0["record_sha256"])
+
+            seq0_backup = Path(tmpdir) / "seq0_backup"
+            shutil.copytree(ddir, seq0_backup)
+
+            r1 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-06",
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    "SHADOW_TRUSTED_HEAD_ANCHOR_PATH": str(anchor_path),
+                },
+                ots_client=_make_ots("2026-01-06"),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+            )
+            self.assertEqual(r1["status"], "committed")
+            self.assertEqual(r1["sequence"], 1)
+            head_1 = str(r1["record_sha256"])
+            anchor_state = json.loads(anchor_path.read_text(encoding="utf-8"))
+            self.assertEqual(anchor_state["sequence"], 1)
+            self.assertEqual(anchor_state["head_sha256"], head_1)
+
+            # 2d. Rollback ddir to seq 0 while anchor remains at seq 1 + pass stale head_0 -> rejected
+            shutil.rmtree(ddir)
+            shutil.copytree(seq0_backup, ddir)
+            with self.assertRaises(EngineIdentityError) as rb_ctx:
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-07",
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    },
+                    ots_client=_make_ots("2026-01-07"),
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clk,
+                    sleeper=lambda _s: None,
+                    trusted_head_anchor_path=anchor_path,
+                )
+            self.assertIn("production_trusted_head_rollback_rejected", str(rb_ctx.exception))
+            self.assertEqual(len(ShadowLedger(ddir / "ledger").load_records()), 1)
+
+            proc_rb = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(ddir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-07",
+                    "--trusted-head-anchor-path",
+                    str(anchor_path),
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_rb.returncode, 3)
+            rb_out = json.loads(proc_rb.stdout)
+            self.assertFalse(rb_out["appended"])
+            self.assertIn("production_trusted_head_rollback_rejected", rb_out["reason"])
+            self.assertEqual(len(ShadowLedger(ddir / "ledger").load_records()), 1)
+
+            # 2e. Deleting anchor on non-empty bucket fails closed (CLI exit 3, 0 writes)
+            anchor_path.unlink()
+            proc_missing = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "shadow.cloudrun_job",
+                    "--data-dir",
+                    str(ddir),
+                    "--config",
+                    str(unlocked_cfg),
+                    "--mode",
+                    "production",
+                    "--session-date",
+                    "2026-01-07",
+                    "--trusted-head-anchor-path",
+                    str(anchor_path),
+                ],
+                cwd=_REPO_ROOT,
+                env={
+                    "PYTHONPATH": _SRC,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_missing.returncode, 3)
+            miss_out = json.loads(proc_missing.stdout)
+            self.assertFalse(miss_out["appended"])
+            self.assertIn("production_trusted_head_anchor_missing", miss_out["reason"])
+            self.assertEqual(len(ShadowLedger(ddir / "ledger").load_records()), 1)
 
 
 if __name__ == "__main__":
