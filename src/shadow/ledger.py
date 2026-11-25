@@ -1420,6 +1420,53 @@ class ShadowLedger:
             st = os.fstat(rf.fileno())
             return st, rf.read()
 
+    @staticmethod
+    def _publish_exclusive_file(target_path: Path, tmp_path: Path, payload: bytes) -> None:
+        """Write complete payload to tmp_path and publish exclusively via os.link when supported."""
+        try:
+            tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(tfd, payload)
+                os.fsync(tfd)
+            finally:
+                os.close(tfd)
+            try:
+                os.link(str(tmp_path), str(target_path))
+            except OSError as link_exc:
+                if isinstance(link_exc, FileExistsError):
+                    raise
+                if link_exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EPERM):
+                    raise
+                lfd = os.open(str(target_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    os.write(lfd, payload)
+                    os.fsync(lfd)
+                finally:
+                    os.close(lfd)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _is_reclaim_claim_expired(
+        st: os.stat_result,
+        raw_bytes: bytes,
+        now_chk: datetime,
+    ) -> bool:
+        """Return True only when a reclaim claim is expired or an aged (>= 5s) empty stub."""
+        if not raw_bytes.strip():
+            return (now_chk.timestamp() - st.st_mtime) >= 5.0
+        try:
+            rp = parse_json_no_duplicates(raw_bytes.decode("utf-8", errors="replace"))
+        except Exception:
+            return False
+        if not isinstance(rp, dict):
+            return False
+        reclaim_exp = ShadowLedger._parse_iso_utc(rp.get("expires_at_utc"))
+        return reclaim_exp is not None and now_chk >= reclaim_exp
+
     def _acquire_cross_instance_lease(
         self,
         lease_path: Path,
@@ -1444,31 +1491,7 @@ class ShadowLedger:
         for attempt in range(2):
             tmp_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.{attempt}.lock")
             try:
-                try:
-                    tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                    try:
-                        os.write(tfd, lease_bytes)
-                        os.fsync(tfd)
-                    finally:
-                        os.close(tfd)
-                    try:
-                        os.link(str(tmp_path), str(lease_path))
-                    except OSError as link_exc:
-                        if isinstance(link_exc, FileExistsError):
-                            raise
-                        if link_exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EPERM):
-                            raise
-                        lfd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                        try:
-                            os.write(lfd, lease_bytes)
-                            os.fsync(lfd)
-                        finally:
-                            os.close(lfd)
-                finally:
-                    try:
-                        tmp_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                self._publish_exclusive_file(lease_path, tmp_path, lease_bytes)
                 return lease_id
             except FileExistsError:
                 existing: dict = {}
@@ -1523,31 +1546,14 @@ class ShadowLedger:
                     ]
                     for existing_claim_path in existing_claims:
                         try:
-                            _, ex_bytes = self._read_lease_snapshot(existing_claim_path)
+                            ex_st, ex_bytes = self._read_lease_snapshot(existing_claim_path)
                         except FileNotFoundError:
                             continue
                         except Exception as pexc:
                             raise ChainConcurrencyConflictError(
                                 "Stale chain lease reclamation already claimed by peer writer"
                             ) from pexc
-                        try:
-                            ex_rp = (
-                                parse_json_no_duplicates(
-                                    ex_bytes.decode("utf-8", errors="replace")
-                                )
-                                if ex_bytes.strip()
-                                else {}
-                            )
-                        except Exception as pexc:
-                            raise ChainConcurrencyConflictError(
-                                "Stale chain lease reclamation already claimed by peer writer"
-                            ) from pexc
-                        ex_exp = (
-                            self._parse_iso_utc(ex_rp.get("expires_at_utc"))
-                            if isinstance(ex_rp, dict)
-                            else None
-                        )
-                        if ex_exp is None or now_chk < ex_exp:
+                        if not self._is_reclaim_claim_expired(ex_st, ex_bytes, now_chk):
                             raise ChainConcurrencyConflictError(
                                 "Stale chain lease reclamation already claimed by peer writer"
                             )
@@ -1579,27 +1585,18 @@ class ShadowLedger:
                             )
                             + "\n"
                         ).encode("utf-8")
+                        reclaim_tmp_path = lease_path.with_name(
+                            f".chain.lease.tmp.reclaim.{lease_id}.{gen}.lock"
+                        )
                         try:
-                            cfd = os.open(
-                                str(reclaim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                            self._publish_exclusive_file(
+                                reclaim_path, reclaim_tmp_path, reclaim_bytes
                             )
-                            try:
-                                os.write(cfd, reclaim_bytes)
-                                os.fsync(cfd)
-                            finally:
-                                os.close(cfd)
                             won = True
                             break
                         except FileExistsError as exc:
                             try:
-                                _, rc_bytes = self._read_lease_snapshot(reclaim_path)
-                                rp = (
-                                    parse_json_no_duplicates(
-                                        rc_bytes.decode("utf-8", errors="replace")
-                                    )
-                                    if rc_bytes.strip()
-                                    else {}
-                                )
+                                rc_st, rc_bytes = self._read_lease_snapshot(reclaim_path)
                             except FileNotFoundError as fnf:
                                 raise ChainConcurrencyConflictError(
                                     "Stale chain lease reclamation claim vanished during acquisition"
@@ -1608,12 +1605,7 @@ class ShadowLedger:
                                 raise ChainConcurrencyConflictError(
                                     "Stale chain lease reclamation already claimed by peer writer"
                                 ) from pexc
-                            reclaim_exp = (
-                                self._parse_iso_utc(rp.get("expires_at_utc"))
-                                if isinstance(rp, dict)
-                                else None
-                            )
-                            if reclaim_exp is None or now_chk < reclaim_exp:
+                            if not self._is_reclaim_claim_expired(rc_st, rc_bytes, now_chk):
                                 raise ChainConcurrencyConflictError(
                                     "Stale chain lease reclamation already claimed by peer writer"
                                 ) from exc
@@ -1678,13 +1670,8 @@ class ShadowLedger:
                         pass
         for rpath in lease_path.parent.glob(".chain.lease.reclaim.*.lock"):
             try:
-                rparsed = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
-                rexp = (
-                    ShadowLedger._parse_iso_utc(rparsed.get("expires_at_utc"))
-                    if isinstance(rparsed, dict)
-                    else None
-                )
-                if rexp is not None and now_utc >= rexp:
+                rst, rbytes = ShadowLedger._read_lease_snapshot(rpath)
+                if ShadowLedger._is_reclaim_claim_expired(rst, rbytes, now_utc):
                     rpath.unlink()
             except Exception:
                 pass

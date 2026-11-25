@@ -1903,6 +1903,57 @@ class CloudRunJobTest(unittest.TestCase):
             ):
                 guard_ledger._acquire_cross_instance_lease(guard_lease, lease_ttl_seconds=300.0)
 
+    def test_abandoned_empty_reclaim_claim_blocks_while_fresh_and_recovers_when_aged(self) -> None:
+        import hashlib
+        import os
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ShadowLedger(Path(tmpdir) / "empty_reclaim" / "ledger")
+            lease_path = ledger.root_dir / ".chain.lease.json"
+            past_utc = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"
+            )
+            stale_bytes = json.dumps(
+                {
+                    "schema_version": "c-sh-chain-lease-v1",
+                    "lease_id": "stale-empty-reclaim-333",
+                    "pid": 555555,
+                    "execution_id": "exec-stale-333",
+                    "expires_at_utc": past_utc,
+                }
+            ).encode("utf-8")
+            lease_path.write_bytes(stale_bytes)
+            stale_sha = hashlib.sha256(stale_bytes).hexdigest()
+            claim_key = hashlib.sha256(
+                f"id:stale-empty-reclaim-333:{stale_sha}".encode("utf-8")
+            ).hexdigest()[:32]
+            empty_claim_path = lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock")
+            empty_claim_path.write_bytes(b"")
+
+            # Fresh (<5s) 0-byte initializing claim must still block peer acquisition
+            with self.assertRaisesRegex(
+                ChainConcurrencyConflictError, "already claimed by peer writer"
+            ):
+                ledger._acquire_cross_instance_lease(lease_path, lease_ttl_seconds=300.0)
+
+            # Aged (>=5s) abandoned 0-byte claim recovers via .g1.lock and is swept on release
+            aged_epoch = datetime.now(timezone.utc).timestamp() - 10.0
+            os.utime(empty_claim_path, (aged_epoch, aged_epoch))
+
+            acquired_id = ledger._acquire_cross_instance_lease(
+                lease_path, lease_ttl_seconds=300.0
+            )
+            g1_path = lease_path.with_name(f".chain.lease.reclaim.{claim_key}.g1.lock")
+            self.assertTrue(g1_path.is_file())
+            g1_payload = json.loads(g1_path.read_text(encoding="utf-8"))
+            self.assertEqual(g1_payload["generation"], 1)
+            self.assertEqual(g1_payload["claimed_by_lease_id"], acquired_id)
+
+            ShadowLedger._release_cross_instance_lease(lease_path, acquired_id)
+            self.assertFalse(lease_path.exists())
+            self.assertFalse(empty_claim_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
