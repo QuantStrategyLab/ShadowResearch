@@ -2530,6 +2530,14 @@ def _load_trusted_head_anchor(
         raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
     if seq == -1 and not hmac.compare_digest(head_sha, GENESIS_PREV_HASH):
         raise EngineIdentityError("invalid_trusted_head_anchor:genesis_seq_head_mismatch")
+    pend_ds = obj.get("pending_rejected_session_date")
+    if pend_ds is not None:
+        if not isinstance(pend_ds, str) or not _DATE_YYYY_MM_DD_RE.fullmatch(pend_ds):
+            raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
+        try:
+            date.fromisoformat(pend_ds)
+        except ValueError as exc:
+            raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields") from exc
     return obj, raw_bytes
 
 
@@ -2543,6 +2551,7 @@ def _advance_trusted_head_anchor(
     head_sha256: str,
     pending_rejected_state_sha256: str,
     now_utc: str,
+    pending_rejected_session_date: str | None = None,
 ) -> dict:
     anchor_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = anchor_path.with_name(f".{anchor_path.name}.lock")
@@ -2577,6 +2586,7 @@ def _advance_trusted_head_anchor(
                 "session_date": session_date,
                 "head_sha256": head_sha256,
                 "pending_rejected_state_sha256": pending_rejected_state_sha256,
+                "pending_rejected_session_date": pending_rejected_session_date,
                 "anchor_version": next_version,
                 "updated_at_utc": now_utc,
             }
@@ -2603,6 +2613,102 @@ def _advance_trusted_head_anchor(
             fcntl.flock(lfd, fcntl.LOCK_UN)
     finally:
         os.close(lfd)
+
+
+def _verify_or_catchup_pending_anchor(
+    *,
+    anchor_resolved: Path,
+    anchor_obj: dict | None,
+    anchor_bytes: bytes | None,
+    chain_id: str,
+    head_seq: int,
+    head_ds: str | None,
+    head_sha: str,
+    session_date: str,
+    expected_pending_state_sha256: str | None,
+    auth_pending: dict | None,
+    now_utc_fn: Callable[[], str] | None,
+    rollback_err_reason: str,
+) -> tuple[dict | None, bytes | None]:
+    """Verify pending snapshot matches trusted anchor, or catch up a forward interrupted pending anchor write."""
+    actual_pend_sha = (
+        compute_pending_rejected_state_sha256(auth_pending)
+        if auth_pending is not None
+        else NO_PENDING_REJECTED_STATE_SHA256
+    )
+    if anchor_obj is None:
+        if (
+            head_seq == -1
+            and auth_pending is not None
+            and expected_pending_state_sha256 is not None
+            and not hmac.compare_digest(actual_pend_sha, NO_PENDING_REJECTED_STATE_SHA256)
+            and hmac.compare_digest(expected_pending_state_sha256, actual_pend_sha)
+        ):
+            # Genesis pending catch-up is only allowed after strict binding validation below.
+            pass
+        else:
+            return anchor_obj, anchor_bytes
+    else:
+        exp_anchor_pend = str(anchor_obj["pending_rejected_state_sha256"])
+        if hmac.compare_digest(actual_pend_sha, exp_anchor_pend) and (
+            expected_pending_state_sha256 is None
+            or hmac.compare_digest(expected_pending_state_sha256, exp_anchor_pend)
+        ):
+            return anchor_obj, anchor_bytes
+
+    rej_ds = auth_pending.get("rejected_session_date") if isinstance(auth_pending, Mapping) else None
+    valid_rej_ds = False
+    if isinstance(rej_ds, str) and _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds):
+        try:
+            date.fromisoformat(rej_ds)
+            valid_rej_ds = (head_ds is None or rej_ds > head_ds) and rej_ds <= session_date
+        except ValueError:
+            valid_rej_ds = False
+
+    exp_anchor_pend = (
+        str(anchor_obj["pending_rejected_state_sha256"])
+        if anchor_obj is not None
+        else NO_PENDING_REJECTED_STATE_SHA256
+    )
+    anchor_pend_ds = anchor_obj.get("pending_rejected_session_date") if anchor_obj is not None else None
+    monotonic_forward = (
+        anchor_obj is None
+        or hmac.compare_digest(exp_anchor_pend, NO_PENDING_REJECTED_STATE_SHA256)
+        or (isinstance(anchor_pend_ds, str) and valid_rej_ds and rej_ds > anchor_pend_ds)
+    )
+    can_catchup = (
+        auth_pending is not None
+        and valid_rej_ds
+        and monotonic_forward
+        and not hmac.compare_digest(actual_pend_sha, NO_PENDING_REJECTED_STATE_SHA256)
+        and expected_pending_state_sha256 is not None
+        and hmac.compare_digest(expected_pending_state_sha256, actual_pend_sha)
+        and auth_pending.get("chain_id") == chain_id
+        and auth_pending.get("base_sequence") == head_seq
+        and not isinstance(auth_pending.get("base_sequence"), bool)
+        and isinstance(auth_pending.get("base_record_sha256"), str)
+        and hmac.compare_digest(auth_pending["base_record_sha256"], head_sha)
+    )
+    if not can_catchup:
+        raise EngineIdentityError(rollback_err_reason)
+
+    catchup_now = (
+        now_utc_fn()
+        if now_utc_fn is not None
+        else _format_utc_ms(datetime.now(timezone.utc))
+    )
+    _advance_trusted_head_anchor(
+        anchor_resolved,
+        chain_id=chain_id,
+        expected_prior_bytes=anchor_bytes,
+        sequence=head_seq,
+        session_date=head_ds,
+        head_sha256=head_sha,
+        pending_rejected_state_sha256=actual_pend_sha,
+        pending_rejected_session_date=str(rej_ds),
+        now_utc=catchup_now,
+    )
+    return _load_trusted_head_anchor(anchor_resolved, expected_chain_id=chain_id)
 
 
 def _authenticate_production_history(
@@ -2657,24 +2763,20 @@ def _authenticate_production_history(
                 expected_pending_state_sha256=expected_pending_state_sha256,
                 require_external_pending_auth=True,
             )
-            actual_pend_sha = (
-                compute_pending_rejected_state_sha256(
-                    parse_json_no_duplicates(
-                        (snapshots_dir / "pending_rejected_state.json").read_text(encoding="utf-8")
-                    )
-                )
-                if auth_pending is not None
-                else NO_PENDING_REJECTED_STATE_SHA256
+            anchor_obj, anchor_bytes = _verify_or_catchup_pending_anchor(
+                anchor_resolved=anchor_resolved,
+                anchor_obj=anchor_obj,
+                anchor_bytes=anchor_bytes,
+                chain_id=cfg.chain_id,
+                head_seq=-1,
+                head_ds=None,
+                head_sha=GENESIS_PREV_HASH,
+                session_date=session_date,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                auth_pending=auth_pending,
+                now_utc_fn=now_utc_fn,
+                rollback_err_reason="production_trusted_head_rollback_rejected: pending state behind trusted anchor",
             )
-            if anchor_obj is not None:
-                exp_anchor_pend = str(anchor_obj["pending_rejected_state_sha256"])
-                if not hmac.compare_digest(actual_pend_sha, exp_anchor_pend) or (
-                    expected_pending_state_sha256 is not None
-                    and not hmac.compare_digest(expected_pending_state_sha256, exp_anchor_pend)
-                ):
-                    raise EngineIdentityError(
-                        "production_trusted_head_rollback_rejected: pending state behind trusted anchor"
-                    )
             if auth_pending is None and reports_dir is not None:
                 _check_no_unconsumed_pending_rejected_reports(
                     reports_dir,
@@ -2794,31 +2896,29 @@ def _authenticate_production_history(
         raise EngineIdentityError("production_trusted_head_mismatch")
 
     if snapshots_dir is not None:
-        pend_path = snapshots_dir / "pending_rejected_state.json"
         if existing_env is None:
             auth_pending = authenticate_pending_rejected_state_snapshot(
                 snapshots_dir,
                 expected_pending_state_sha256=expected_pending_state_sha256,
                 require_external_pending_auth=True,
             )
-            actual_pend_sha = (
-                compute_pending_rejected_state_sha256(
-                    parse_json_no_duplicates(pend_path.read_text(encoding="utf-8"))
-                )
-                if auth_pending is not None
-                else NO_PENDING_REJECTED_STATE_SHA256
+            head_body = prior_records[-1].get("record_body") if isinstance(prior_records[-1], Mapping) else None
+            head_ds = str(head_body.get("session_date")) if isinstance(head_body, Mapping) and head_body.get("session_date") else None
+            anchor_obj, anchor_bytes = _verify_or_catchup_pending_anchor(
+                anchor_resolved=anchor_resolved,
+                anchor_obj=anchor_obj,
+                anchor_bytes=anchor_bytes,
+                chain_id=cfg.chain_id,
+                head_seq=actual_seq,
+                head_ds=head_ds,
+                head_sha=str(head_rec_sha),
+                session_date=session_date,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                auth_pending=auth_pending,
+                now_utc_fn=now_utc_fn,
+                rollback_err_reason="production_trusted_head_rollback_rejected: pending state diverged from trusted anchor",
             )
-            exp_anchor_pend = str(anchor_obj["pending_rejected_state_sha256"])
-            if not hmac.compare_digest(actual_pend_sha, exp_anchor_pend) or (
-                expected_pending_state_sha256 is not None
-                and not hmac.compare_digest(expected_pending_state_sha256, exp_anchor_pend)
-            ):
-                raise EngineIdentityError(
-                    "production_trusted_head_rollback_rejected: pending state diverged from trusted anchor"
-                )
             if auth_pending is None and reports_dir is not None:
-                head_body = prior_records[-1].get("record_body") if isinstance(prior_records[-1], Mapping) else None
-                head_ds = str(head_body.get("session_date")) if isinstance(head_body, Mapping) and head_body.get("session_date") else None
                 _check_no_unconsumed_pending_rejected_reports(
                     reports_dir,
                     head_session_date=head_ds,
@@ -3747,6 +3847,7 @@ def _run_daily_drill_cycle_locked(
                 session_date=prior_head_ds,
                 head_sha256=head_hash,
                 pending_rejected_state_sha256=pending_sha_val,
+                pending_rejected_session_date=session_date,
                 now_utc=_format_utc_ms(clock_fn()),
             )
             anchor_bytes = anchor_resolved.read_bytes()

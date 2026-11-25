@@ -1384,6 +1384,75 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(int(con_funds["TQQQ"]["q_ideal"]), 0)
         self.assertEqual(int(con_funds["SOXL"]["q_ideal"]), 0)
 
+    def test_explicit_fuse_inputs_evaluated_per_tier_for_sizing(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+
+        si_base = _valid_inputs()
+        si_base.update(
+            {
+                "E": "44000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "6000",
+                "prior_E": "44000",
+                "tier": "balanced",
+            }
+        )
+        for sym in ("TQQQ", "SOXL"):
+            si_base["funds"][sym]["q_pre"] = 0
+        si_base["positions_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_base["broker_reconciliation_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_base["market_records"] = [
+            {
+                "instrument": inst,
+                "normalized_value": 50.0,
+                "calendar_spec_digest": str(cal6["spec_digest"]),
+                "eligibility": {"eligible": True},
+            }
+            for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
+        ]
+        balanced_native = build_fuse_validated_inputs(
+            si_base,
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        wrapped_inputs = dict(si_base)
+        wrapped_inputs["fuse_inputs"] = balanced_native
+
+        built = build_record_body(
+            chain_id="drill-wrapped-tier-v1",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=wrapped_inputs,
+            calendar_session=cal6,
+            code_version_sha=compute_code_manifest_hash(),
+            evaluator=ev,
+            prior_row_state={},
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built["appended"])
+        rb = built["record_body"]
+        by_tier = rb["evaluator"]["by_tier"]
+        self.assertEqual(by_tier["balanced"]["effective_state_by_scope"]["account"], "NORMAL")
+        self.assertEqual(by_tier["conservative"]["effective_state_by_scope"]["account"], "NO-NEW-RISK")
+        cons_l2 = next(b for b in by_tier["conservative"]["breakers"] if b["id"] == "L2")
+        self.assertTrue(cons_l2["latched"])
+        self.assertEqual(cons_l2["state"], "NO-NEW-RISK")
+
+        tiers_by_name = {t["tier_id"]: t for t in rb["tiers"]}
+        bal_funds = {f["instrument"]: f for f in tiers_by_name["balanced"]["funds"]}
+        con_funds = {f["instrument"]: f for f in tiers_by_name["conservative"]["funds"]}
+        self.assertGreater(int(bal_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["SOXL"]["q_ideal"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1360,6 +1360,152 @@ class CloudRunJobTest(unittest.TestCase):
                 )
             self.assertIn("production_trusted_head_mismatch:diverges_from_anchor", str(gap_ctx.exception))
 
+    def test_interrupted_pending_anchor_catchup_recovers_and_blocks_older_pending_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_cfg = json.loads(
+                (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+            )
+            raw_cfg["production_chain_locked"] = False
+            raw_cfg["clk01_active"] = True
+            unlocked_cfg = Path(tmpdir) / "unlocked-production.json"
+            unlocked_cfg.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            heights = {"2026-01-05": 880100, "2026-01-06": 880101, "2026-01-07": 880102, "2026-01-08": 880103}
+
+            def _make_ots(session_date: str):
+                class _Ots(OpenTimestampsClient):
+                    def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                        ots_b, _ = build_synthetic_ots_fixture(
+                            sha256_hex, bitcoin_height=heights[session_date]
+                        )
+                        return ots_b, "https://a.pool.opentimestamps.org"
+
+                return _Ots()
+
+            tick = [4000.0]
+
+            def _fast_clk() -> float:
+                tick[0] += 25.0
+                return tick[0]
+
+            ddir = Path(tmpdir) / "interrupted_pending_data"
+            anchor_path = Path(tmpdir) / "external_pending_anchor.json"
+            r0 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                ots_client=_make_ots("2026-01-05"),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            head_0 = str(r0["record_sha256"])
+            anchor_jan5_bytes = anchor_path.read_bytes()
+
+            base_rej_t = build_live_mock_transport("2026-01-06")
+
+            def _missing_tbill_6(url: str, headers: dict):
+                if "treasury.gov" in url.lower():
+                    return 404, b"missing"
+                return base_rej_t(url, headers)
+
+            rej6 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-06",
+                transport=_missing_tbill_6,
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(rej6["status"], "fail_closed")
+            pend_sha_6 = str(rej6["pending_rejected_state_sha256"])
+            pend_jan6_bytes = (ddir / "state_snapshots" / "pending_rejected_state.json").read_bytes()
+
+            # Simulate interruption after saving pending_rejected_state.json before _advance_trusted_head_anchor()
+            anchor_path.write_bytes(anchor_jan5_bytes)
+
+            # Old NO_PENDING digest must still fail closed (prevents stripping pending state!)
+            with self.assertRaises(EngineIdentityError):
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-07",
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    },
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    trusted_head_anchor_path=anchor_path,
+                )
+
+            # Authenticated Jan 6 pending digest catches anchor up and cleanly rejects Jan 7 for another missing source
+            base_rej_t7 = build_live_mock_transport("2026-01-07")
+
+            def _missing_tbill_7(url: str, headers: dict):
+                if "treasury.gov" in url.lower():
+                    return 404, b"missing"
+                return base_rej_t7(url, headers)
+
+            rej7 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-07",
+                transport=_missing_tbill_7,
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": pend_sha_6,
+                },
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(rej7["status"], "fail_closed")
+            pend_sha_7 = str(rej7["pending_rejected_state_sha256"])
+            anchor_after_7 = json.loads(anchor_path.read_text(encoding="utf-8"))
+            self.assertEqual(anchor_after_7["pending_rejected_state_sha256"], pend_sha_7)
+            self.assertEqual(anchor_after_7["pending_rejected_session_date"], "2026-01-07")
+
+            # Rollback attack back to Jan 6's older pending file + pend_sha_6 MUST fail closed while anchor is at Jan 7
+            (ddir / "state_snapshots" / "pending_rejected_state.json").write_bytes(pend_jan6_bytes)
+            with self.assertRaises(EngineIdentityError) as rb_ctx:
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-08",
+                    transport=build_live_mock_transport("2026-01-08"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": pend_sha_6,
+                    },
+                    wall_clock=lambda: datetime(2026, 1, 8, 22, 30, tzinfo=timezone.utc),
+                    trusted_head_anchor_path=anchor_path,
+                )
+            self.assertIn("production_trusted_head_rollback_rejected", str(rb_ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

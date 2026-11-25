@@ -889,6 +889,55 @@ def _derive_conv_scale(
         return None
 
 
+def _apply_explicit_payload_tier(
+    payload: dict[str, Any],
+    session_inputs: Mapping[str, Any],
+    *,
+    policy_hash: str,
+) -> dict[str, Any]:
+    """Align an explicit/direct FUSE payload with the outer tier request and tier-dependent caps."""
+    has_outer_tier = "tier" in session_inputs and session_inputs.get("tier") is not None
+    requested_tier = str(session_inputs["tier"]) if has_outer_tier else str(payload.get("tier", "balanced"))
+    if has_outer_tier and requested_tier != payload.get("tier"):
+        payload["tier"] = requested_tier
+        if requested_tier in TIER_CONFIGS:
+            payload["tier_loss_budget_D"] = _TIER_D_MAP[requested_tier]
+            bankroll_val = _finite_number(payload.get("bankroll", session_inputs.get("E")))
+            hwm_val = _finite_number(
+                payload.get(
+                    "high_water_mark",
+                    session_inputs.get("high_water_mark", session_inputs.get("E_star", bankroll_val)),
+                )
+            )
+            if bankroll_val is not None:
+                payload["tier_joint_cap"] = float(
+                    Decimal(str(TIER_CONFIGS[requested_tier]["x_joint"]))
+                    * Decimal(str(bankroll_val))
+                )
+            if "E" in session_inputs:
+                cap_inputs = session_inputs
+            else:
+                cap_inputs = {
+                    "E": bankroll_val,
+                    "E_star": hwm_val,
+                    "H": payload.get("H", payload.get("h_value", session_inputs.get("H", "0"))),
+                }
+                if "L" in session_inputs:
+                    cap_inputs["L"] = session_inputs["L"]
+                elif payload.get("one_session_loss") is not None:
+                    cap_inputs["L"] = payload["one_session_loss"]
+            derived_cap = _derive_default_max_loss_cap(
+                cap_inputs, requested_tier, bankroll_val, hwm_val
+            )
+            if derived_cap is not None:
+                payload["max_loss_cap"] = derived_cap
+    else:
+        payload.setdefault("tier", "balanced")
+    payload.setdefault("loaded_policy_hash", policy_hash)
+    payload.setdefault("registered_policy_hash", policy_hash)
+    return payload
+
+
 def build_fuse_validated_inputs(
     session_inputs: Mapping[str, Any],
     calendar_session: Mapping[str, Any] | None,
@@ -906,9 +955,7 @@ def build_fuse_validated_inputs(
         if not isinstance(explicit_fuse, Mapping):
             raise ValueError("fuse_inputs must be a mapping when provided")
         merged = copy.deepcopy(dict(explicit_fuse))
-        merged.setdefault("loaded_policy_hash", policy_hash)
-        merged.setdefault("registered_policy_hash", policy_hash)
-        return merged
+        return _apply_explicit_payload_tier(merged, session_inputs, policy_hash=policy_hash)
 
     if (
         "bankroll" in session_inputs
@@ -916,10 +963,7 @@ def build_fuse_validated_inputs(
         and "E" not in session_inputs
     ):
         direct = copy.deepcopy(dict(session_inputs))
-        direct.setdefault("tier", "balanced")
-        direct.setdefault("loaded_policy_hash", policy_hash)
-        direct.setdefault("registered_policy_hash", policy_hash)
-        return direct
+        return _apply_explicit_payload_tier(direct, session_inputs, policy_hash=policy_hash)
 
     tier = str(session_inputs.get("tier", "balanced"))
     tier_cfg = TIER_CONFIGS.get(tier, TIER_CONFIGS["balanced"])
