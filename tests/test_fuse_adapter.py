@@ -32,6 +32,7 @@ from shadow.fuse_adapter import (
 )
 from shadow.ledger import GENESIS_PREV_HASH, build_record_body
 from shadow.manifest import compute_code_manifest_hash
+from shadow.sizing import compute_session_sizing
 
 
 def _valid_inputs() -> dict:
@@ -560,6 +561,266 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertEqual(rows_div["V2"]["state"], "HALT")
 
+    def test_no_new_risk_clamp_and_per_fund_isolation_in_sizing(self) -> None:
+        # q_pre=0 under NO-NEW-RISK clamps increase to q_ideal=0, delta_q_exec=0
+        s_inp_zero = json.loads(json.dumps(_valid_inputs()))
+        s_inp_zero["funds"]["TQQQ"]["q_pre"] = 0
+        s_inp_zero["funds"]["SOXL"]["q_pre"] = 0
+        out_nnr = compute_session_sizing(s_inp_zero, active_control_state="NO-NEW-RISK")
+        balanced_zero = next(t for t in out_nnr["tiers"] if t["tier_id"] == "balanced")
+        for fdec in balanced_zero["funds"]:
+            self.assertEqual(fdec["q_ideal"], 0)
+            self.assertEqual(fdec["delta_q_exec"], 0)
+
+        # NO-NEW-RISK allows risk reductions when q_pre exceeds target; ORDER-UNKNOWN blocks all orders
+        s_inp_over = json.loads(json.dumps(_valid_inputs()))
+        s_inp_over["funds"]["TQQQ"]["q_pre"] = 1000
+        s_inp_over["funds"]["SOXL"]["q_pre"] = 1000
+        out_reduce = compute_session_sizing(s_inp_over, active_control_state="NO-NEW-RISK")
+        balanced_red = next(t for t in out_reduce["tiers"] if t["tier_id"] == "balanced")
+        for fdec in balanced_red["funds"]:
+            self.assertLess(fdec["q_ideal"], fdec["q_pre"])
+            self.assertLess(fdec["delta_q_exec"], 0)
+
+        out_ou = compute_session_sizing(s_inp_over, active_control_state="ORDER-UNKNOWN")
+        balanced_ou = next(t for t in out_ou["tiers"] if t["tier_id"] == "balanced")
+        for fdec in balanced_ou["funds"]:
+            self.assertEqual(fdec["delta_q_exec"], 0)
+
+        # End-to-end build_record_body isolates per-fund V4 NO-NEW-RISK on TQQQ without blocking SOXL
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        inp_per_fund = json.loads(json.dumps(_valid_inputs()))
+        inp_per_fund["funds"]["TQQQ"]["q_pre"] = 0
+        inp_per_fund["funds"]["TQQQ"]["sigma_forecast"] = "0.50"  # trips V4 NO-NEW-RISK on TQQQ only
+        inp_per_fund["funds"]["SOXL"]["q_pre"] = 0
+        inp_per_fund["funds"]["SOXL"]["sigma_forecast"] = "0.22"
+        built = build_record_body(
+            chain_id="prod-per-fund-v4",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=inp_per_fund,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=VendoredFuseEvaluator(),
+            calendar_spec=spec,
+        )
+        self.assertTrue(built["appended"])
+        rec = built["record_body"]
+        balanced_rec = next(t for t in rec["tiers"] if t["tier_id"] == "balanced")
+        by_sym = {f["instrument"]: f for f in balanced_rec["funds"]}
+        self.assertEqual(by_sym["TQQQ"]["q_ideal"], 0)
+        self.assertEqual(by_sym["TQQQ"]["delta_q_exec"], 0)
+        self.assertGreater(by_sym["SOXL"]["q_ideal"], 0)
+        self.assertGreater(by_sym["SOXL"]["delta_q_exec"], 0)
+
+    def test_shadow_optional_hwm_and_source_records_translate_without_native_misclassification(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        shadow_opt = json.loads(json.dumps(_valid_inputs()))
+        shadow_opt["high_water_mark"] = "50000"
+        shadow_opt["source_records"] = {
+            "positions": {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0},
+            "broker_reconciliation": {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0},
+        }
+        del shadow_opt["positions_source_record"]
+        del shadow_opt["broker_reconciliation_source_record"]
+
+        vin = build_fuse_validated_inputs(
+            shadow_opt,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        rows, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NORMAL")
+        self.assertEqual(rows["O2"]["state"], "NORMAL")
+
+        built = build_record_body(
+            chain_id="prod-opt-fields",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=shadow_opt,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec,
+        )
+        self.assertTrue(built["appended"])
+
+        # Explicit native FUSE pass-through still works via fuse_inputs or native schema without E
+        vin_native = build_fuse_validated_inputs(
+            {"fuse_inputs": vin},
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_native["bankroll"], 50000.0)
+        direct_native = {k: v for k, v in vin.items() if k not in ("loaded_policy_hash", "registered_policy_hash")}
+        vin_direct = build_fuse_validated_inputs(
+            direct_native,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_direct["loaded_policy_hash"], "p")
+
+    def test_per_tier_q_pre_step3_max_loss_cap_and_fund_hwm_preserved(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # 1. Per-tier q_pre mapping resolves selected tier cleanly (and fails closed if tier absent)
+        tiered = json.loads(json.dumps(_valid_inputs()))
+        tiered["funds"]["TQQQ"]["q_pre"] = {"conservative": 50, "balanced": 100, "aggressive": 150}
+        tiered["funds"]["SOXL"]["q_pre"] = {"conservative": 50, "balanced": 100, "aggressive": 150}
+        vin_tiered = build_fuse_validated_inputs(
+            tiered,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertEqual(vin_tiered["funds"]["TQQQ"]["share_count"], 100)
+        self.assertEqual(vin_tiered["funds"]["TQQQ"]["broker_position"], 100)
+        rows_tiered, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_tiered,
+            {},
+            None,
+        )
+        self.assertEqual(rows_tiered["O1"]["state"], "NORMAL")
+        self.assertEqual(rows_tiered["O2"]["state"], "NORMAL")
+        built_tiered = build_record_body(
+            chain_id="prod-tiered-qpre",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=tiered,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec,
+        )
+        self.assertTrue(built_tiered["appended"])
+
+        missing_tier = json.loads(json.dumps(tiered))
+        missing_tier["funds"]["TQQQ"]["q_pre"] = {"conservative": 50}
+        built_missing = build_record_body(
+            chain_id="prod-missing-tier-qpre",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=missing_tier,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec,
+        )
+        self.assertFalse(built_missing["appended"])
+        self.assertTrue(built_missing["o1_output"]["would_have_tripped"])
+
+        # 2. Default max_loss_cap comes from sizing Step 3 x_ML * E (~$10,064.44 for balanced $50k),
+        # so $15,000 TQQQ exposure trips L0 even though it is below x_joint * E ($20,000).
+        l0_case = json.loads(json.dumps(_valid_inputs()))
+        l0_case["funds"]["TQQQ"]["q_pre"] = 300
+        l0_case["funds"]["SOXL"]["q_pre"] = 0
+        vin_l0 = build_fuse_validated_inputs(
+            l0_case,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        sizing_bal = next(
+            t for t in compute_session_sizing(_valid_inputs())["tiers"] if t["tier_id"] == "balanced"
+        )
+        self.assertAlmostEqual(
+            vin_l0["max_loss_cap"],
+            float(sizing_bal["x_ML"]) * 50000.0,
+            places=2,
+        )
+        self.assertLess(vin_l0["max_loss_cap"], 15000.0)
+        rows_l0, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_l0,
+            {},
+            None,
+        )
+        self.assertTrue(rows_l0["L0"]["outputs"]["cap_breached"])
+        self.assertTrue(rows_l0["L0"]["would_have_tripped"])
+
+        # 3. Fund-level hwm_adjusted=False is preserved even when corporate_action.hwm_adjusted=True
+        ca_fund_false = json.loads(json.dumps(_valid_inputs()))
+        ca_fund_false["funds"]["TQQQ"]["hwm_adjusted"] = False
+        ca_fund_false["funds"]["TQQQ"]["corporate_action"] = {
+            "type": "split",
+            "ratio": 2,
+            "adjustment_complete": True,
+            "exact_reconciliation": True,
+            "hwm_adjusted": True,
+        }
+        vin_ca = build_fuse_validated_inputs(
+            ca_fund_false,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIs(vin_ca["funds"]["TQQQ"]["hwm_adjusted"], False)
+        rows_ca, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin_ca,
+            {},
+            None,
+        )
+        self.assertEqual(rows_ca["V2"]["state"], "HALT")
+        self.assertTrue(rows_ca["V2"]["would_have_tripped"])
+        self.assertEqual(rows_ca["V2"]["reason"], "reconciliation_mismatch")
+
     def test_split_adjusted_fund_return_and_l4_one_session_loss_derivation(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
         cal = resolve_session("XNYS", "2026-01-05", spec=spec)
@@ -1044,6 +1305,283 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertTrue(rows_mkt["O1"]["would_have_tripped"])
 
+    def test_v6_missing_observations_not_fabricated_and_per_tier_controls_isolated(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+
+        # 1. PRRT_kwDOV2RNAc67rRKk: omitting V6 observations keeps them missing_input (no fabricated 0.0 / 0.04)
+        vin_missing_v6 = build_fuse_validated_inputs(
+            _valid_inputs(),
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertIsNone(vin_missing_v6["funds"]["TQQQ"]["carrying_cost_measured"])
+        self.assertIsNone(vin_missing_v6["funds"]["TQQQ"]["excess_return_shrunk"])
+        rows_v6, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            vin_missing_v6,
+            {},
+            None,
+        )
+        self.assertEqual(rows_v6["V6"]["reason"], "missing_input")
+        self.assertTrue(rows_v6["V6"]["would_have_tripped"])
+        self.assertTrue(rows_v6["V6"]["outputs"]["notify"])
+
+        # 2. PRRT_kwDOV2RNAc67rRKh: E=44000, E_star=50000, L=6000, prior_E=44000, q_pre=0
+        # balanced stays NORMAL and buys, while conservative latches L2 (10% threshold) and blocks increases.
+        si_tier = _valid_inputs()
+        si_tier.update(
+            {
+                "E": "44000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "6000",
+                "prior_E": "44000",
+                "tier": "balanced",
+            }
+        )
+        for sym in ("TQQQ", "SOXL"):
+            si_tier["funds"][sym]["q_pre"] = 0
+        si_tier["positions_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_tier["broker_reconciliation_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_tier["market_records"] = [
+            {
+                "instrument": inst,
+                "normalized_value": 50.0,
+                "calendar_spec_digest": str(cal6["spec_digest"]),
+                "eligibility": {"eligible": True},
+            }
+            for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
+        ]
+
+        code_sha = compute_code_manifest_hash()
+        built = build_record_body(
+            chain_id="drill-tier-iso-v1",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=si_tier,
+            calendar_session=cal6,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state={},
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built["appended"])
+        rb = built["record_body"]
+        by_tier_ev = rb["evaluator"]["by_tier"]
+        self.assertEqual(by_tier_ev["balanced"]["effective_state_by_scope"]["account"], "NORMAL")
+        self.assertEqual(by_tier_ev["conservative"]["effective_state_by_scope"]["account"], "NO-NEW-RISK")
+        cons_l2 = next(b for b in by_tier_ev["conservative"]["breakers"] if b["id"] == "L2")
+        self.assertEqual(cons_l2["state"], "NO-NEW-RISK")
+        self.assertTrue(cons_l2["latched"])
+
+        tiers_by_name = {t["tier_id"]: t for t in rb["tiers"]}
+        bal_funds = {f["instrument"]: f for f in tiers_by_name["balanced"]["funds"]}
+        con_funds = {f["instrument"]: f for f in tiers_by_name["conservative"]["funds"]}
+        self.assertGreater(int(bal_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["SOXL"]["q_ideal"]), 0)
+
+    def test_explicit_fuse_inputs_evaluated_per_tier_for_sizing(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+
+        si_base = _valid_inputs()
+        si_base.update(
+            {
+                "E": "44000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "6000",
+                "prior_E": "44000",
+                "tier": "balanced",
+            }
+        )
+        for sym in ("TQQQ", "SOXL"):
+            si_base["funds"][sym]["q_pre"] = 0
+        si_base["positions_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_base["broker_reconciliation_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_base["market_records"] = [
+            {
+                "instrument": inst,
+                "normalized_value": 50.0,
+                "calendar_spec_digest": str(cal6["spec_digest"]),
+                "eligibility": {"eligible": True},
+            }
+            for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
+        ]
+        balanced_native = build_fuse_validated_inputs(
+            si_base,
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        wrapped_inputs = dict(si_base)
+        wrapped_inputs["fuse_inputs"] = balanced_native
+
+        built = build_record_body(
+            chain_id="drill-wrapped-tier-v1",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=wrapped_inputs,
+            calendar_session=cal6,
+            code_version_sha=compute_code_manifest_hash(),
+            evaluator=ev,
+            prior_row_state={},
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built["appended"])
+        rb = built["record_body"]
+        by_tier = rb["evaluator"]["by_tier"]
+        self.assertEqual(by_tier["balanced"]["effective_state_by_scope"]["account"], "NORMAL")
+        self.assertEqual(by_tier["conservative"]["effective_state_by_scope"]["account"], "NO-NEW-RISK")
+        cons_l2 = next(b for b in by_tier["conservative"]["breakers"] if b["id"] == "L2")
+        self.assertTrue(cons_l2["latched"])
+        self.assertEqual(cons_l2["state"], "NO-NEW-RISK")
+
+        tiers_by_name = {t["tier_id"]: t for t in rb["tiers"]}
+        bal_funds = {f["instrument"]: f for f in tiers_by_name["balanced"]["funds"]}
+        con_funds = {f["instrument"]: f for f in tiers_by_name["conservative"]["funds"]}
+        self.assertGreater(int(bal_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["SOXL"]["q_ideal"]), 0)
+
+    def test_v4_missing_or_invalid_long_run_volatility_fails_closed_and_blocks_increases(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # Omitted long_run_volatility with zero holdings MUST fail closed V4 (NO-NEW-RISK, missing_input) and block buys
+        for bad_lrv in (None, "bad", float("nan"), 0, "-0.1"):
+            si = json.loads(json.dumps(_valid_inputs()))
+            for sym in ("TQQQ", "SOXL"):
+                si["funds"][sym]["q_pre"] = 0
+                if bad_lrv is None:
+                    si["funds"][sym].pop("long_run_volatility", None)
+                else:
+                    si["funds"][sym]["long_run_volatility"] = bad_lrv
+            translated = build_fuse_validated_inputs(
+                si,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-05",
+                as_of="2026-01-05T22:00:00.000Z",
+            )
+            if bad_lrv is None or bad_lrv in ("bad",) or (isinstance(bad_lrv, float) and bad_lrv != bad_lrv):
+                self.assertIsNone(translated["funds"]["TQQQ"]["long_run_volatility"])
+                self.assertIsNone(translated["funds"]["SOXL"]["long_run_volatility"])
+            else:
+                self.assertLessEqual(float(translated["funds"]["TQQQ"]["long_run_volatility"]), 0.0)
+
+            built = build_record_body(
+                chain_id="drill-v4-missing-lrv",
+                sequence=0,
+                prev_record_sha256=GENESIS_PREV_HASH,
+                mode="drill",
+                session_date="2026-01-05",
+                decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                session_inputs=si,
+                calendar_session=cal,
+                code_version_sha=code_sha,
+                evaluator=ev,
+                prior_row_state={},
+                calendar_spec=spec,
+            )
+            self.assertTrue(built["appended"])
+            rec = built["record_body"]
+            v4_row = next(b for b in rec["evaluator"]["breakers"] if b["id"] == "V4")
+            self.assertEqual(v4_row["state"], "NO-NEW-RISK")
+            self.assertEqual(v4_row["reason"], "missing_input")
+            self.assertTrue(v4_row["would_have_tripped"])
+            balanced_rec = next(t for t in rec["tiers"] if t["tier_id"] == "balanced")
+            for fdec in balanced_rec["funds"]:
+                self.assertEqual(fdec["q_ideal"], 0)
+                self.assertEqual(fdec["delta_q_exec"], 0)
+
+    def test_v5_and_v7_missing_observations_fail_closed_and_preserve_v5_counter(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-06", spec=spec)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # Resolved v5_tolerance + v7_spread_width with omitted observations MUST fail closed as missing_input
+        si = json.loads(json.dumps(_valid_inputs()))
+        si["positions_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si["broker_reconciliation_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si["funds"]["TQQQ"]["v5_tolerance"] = 0.001
+        si["funds"]["SOXL"]["v5_tolerance"] = 0.001
+        si["funds"]["TQQQ"]["v7_spread_width"] = 0.01
+        si["funds"]["SOXL"]["v7_spread_width"] = 0.01
+        prior_state = {
+            "V5": {
+                "TQQQ": {
+                    "consecutive_beyond_tolerance": 39,
+                    "last_session": "2026-01-05",
+                    "escalated": False,
+                }
+            }
+        }
+        translated = build_fuse_validated_inputs(
+            si,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        for sym in ("TQQQ", "SOXL"):
+            self.assertIsNone(translated["funds"][sym]["shortfall_observed"])
+            self.assertIsNone(translated["funds"][sym]["shortfall_predicted"])
+            self.assertIsNone(translated["funds"][sym]["quote_staleness"])
+            self.assertIsNone(translated["funds"][sym]["spread_width"])
+            self.assertIsNone(translated["funds"][sym]["trading_pause"])
+
+        built = build_record_body(
+            chain_id="drill-v5-v7-missing-obs",
+            sequence=1,
+            prev_record_sha256="a" * 64,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=si,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state=prior_state,
+            calendar_spec=spec,
+        )
+        self.assertTrue(built["appended"])
+        v5_row = next(
+            b for b in built["record_body"]["evaluator"]["breakers"] if b["id"] == "V5"
+        )
+        v7_row = next(
+            b for b in built["record_body"]["evaluator"]["breakers"] if b["id"] == "V7"
+        )
+        self.assertTrue(v5_row["would_have_tripped"])
+        self.assertEqual(v5_row["reason"], "missing_input")
+        self.assertEqual(
+            built["next_row_state"]["V5"]["TQQQ"]["consecutive_beyond_tolerance"],
+            39,
+        )
+        self.assertTrue(v7_row["would_have_tripped"])
+        self.assertEqual(v7_row["reason"], "missing_input")
+
     def test_v1_missing_fee_or_financing_fails_closed(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
         cal = resolve_session("XNYS", "2026-01-05", spec=spec)
@@ -1245,6 +1783,49 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(rows["V1"]["state"], "NORMAL")
         self.assertFalse(rows["V1"]["latched"])
         self.assertFalse(nxt.get("V1", {}).get("latched", False))
+
+    def test_invalid_or_null_high_water_mark_remains_missing_and_rejects_via_o1(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT)
+
+        for bad_hwm in ("bad", None):
+            with self.subTest(bad_hwm=bad_hwm):
+                si = json.loads(json.dumps(_valid_inputs()))
+                si["E"] = "44000"
+                si["E_star"] = "50000"
+                si["high_water_mark"] = bad_hwm
+                si["prior_bankroll"] = "44000"
+                si["L"] = "6000"
+                for sym in ("TQQQ", "SOXL"):
+                    si["funds"][sym]["q_pre"] = 0
+                vin = build_fuse_validated_inputs(
+                    si,
+                    cal,
+                    policy_hash="p",
+                    session_date="2026-01-05",
+                    as_of="2026-01-05T22:00:00.000Z",
+                )
+                self.assertIsNone(vin["high_water_mark"])
+                built = build_record_body(
+                    chain_id="drill-bad-hwm",
+                    sequence=1,
+                    prev_record_sha256="a" * 64,
+                    mode="drill",
+                    session_date="2026-01-05",
+                    decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                    session_inputs=si,
+                    calendar_session=cal,
+                    code_version_sha=code_sha,
+                    evaluator=ev,
+                    prior_row_state={},
+                    calendar_spec=spec,
+                )
+                self.assertFalse(built["appended"])
+                self.assertTrue(built["fail_closed"])
+                self.assertEqual(built["o1_output"]["state"], "NO-NEW-RISK")
+                self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
 
     def test_qqq_forward_split_does_not_leak_into_l6_index_crash_inputs(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
@@ -1605,6 +2186,169 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertEqual(rows2["V2"]["state"], "NORMAL")
         self.assertNotEqual(rows2["V2"].get("reason"), "pending_corporate_action_carried_TQQQ")
+
+    def test_invalid_or_missing_fund_signal_fails_closed_in_o1_preserving_l6(self) -> None:
+        from shadow.ledger import build_record_body
+
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        for bad_s in ("2", "-0.1", "not-a-num", None):
+            si = json.loads(json.dumps(_valid_inputs()))
+            si["funds"]["TQQQ"]["s"] = bad_s
+            si["index_one_session_returns"] = {"NDX": -0.11, "SEMI": -0.02}
+            si["positions_source_record"] = {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0}
+            si["broker_reconciliation_source_record"] = {
+                "as_of": "2026-01-05T22:00:00.000Z",
+                "age_sessions": 0,
+            }
+            built = build_record_body(
+                chain_id="prod-sh2-v1",
+                sequence=0,
+                prev_record_sha256="0" * 64,
+                mode="production",
+                session_date="2026-01-05",
+                decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                session_inputs=si,
+                calendar_session=cal,
+                code_version_sha="a" * 64,
+                evaluator=ev,
+                prior_row_state=None,
+                discipline_labels={"forward_clock_credit_eligible": False},
+            )
+            self.assertFalse(built["appended"], msg=f"bad_s={bad_s!r}")
+            self.assertTrue(built["fail_closed"], msg=f"bad_s={bad_s!r}")
+            self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
+            self.assertTrue(built["o1_output"].get("would_have_tripped"), msg=f"bad_s={bad_s!r}")
+            self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=f"bad_s={bad_s!r}")
+
+    def test_missing_e_star_or_l_fails_closed_via_o1_and_preserves_l6_latch(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+
+        cases = [
+            ("missing_e_star", {"remove": ("E_star",)}),
+            ("missing_l", {"remove": ("L",)}),
+            ("explicit_cap_missing_e_star", {"remove": ("E_star",), "extra": {"max_loss_cap": 10000.0, "high_water_mark": "50000"}}),
+            ("explicit_cap_missing_l", {"remove": ("L",), "extra": {"max_loss_cap": 10000.0}}),
+            ("e_greater_than_e_star", {"extra": {"E_star": "49000", "max_loss_cap": 10000.0}}),
+            ("negative_l", {"extra": {"L": "-1", "max_loss_cap": 10000.0}}),
+        ]
+        for label, cfg in cases:
+            with self.subTest(case=label):
+                si = json.loads(json.dumps(_valid_inputs()))
+                si["index_one_session_returns"] = {"NDX": -0.12, "SEMI": -0.02}
+                for key in cfg.get("remove", ()):
+                    si.pop(key, None)
+                for key, val in cfg.get("extra", {}).items():
+                    si[key] = val
+
+                vin = build_fuse_validated_inputs(
+                    si,
+                    cal,
+                    policy_hash="p",
+                    session_date="2026-01-05",
+                    as_of="2026-01-05T22:00:00.000Z",
+                )
+                self.assertIsNone(vin["max_loss_cap"], msg=label)
+                if "E_star" not in si and "high_water_mark" not in si:
+                    self.assertIsNone(vin["high_water_mark"], msg=label)
+                    self.assertIsNone(vin["joint_exposure"], msg=label)
+
+                built = build_record_body(
+                    chain_id="prod-sh2-v1",
+                    sequence=0,
+                    prev_record_sha256="0" * 64,
+                    mode="production",
+                    session_date="2026-01-05",
+                    decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                    session_inputs=si,
+                    calendar_session=cal,
+                    code_version_sha=code_sha,
+                    evaluator=ev,
+                    prior_row_state=None,
+                    calendar_spec=spec,
+                    discipline_labels={"forward_clock_credit_eligible": False},
+                )
+                self.assertFalse(built["appended"], msg=label)
+                self.assertTrue(built["fail_closed"], msg=label)
+                self.assertNotEqual(built["o1_output"]["state"], "NORMAL", msg=label)
+                self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input", msg=label)
+                self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=label)
+
+    def test_missing_q_pre_fails_closed_via_o1_and_preserves_l6_latch(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+
+        si = json.loads(json.dumps(_valid_inputs()))
+        si["funds"]["TQQQ"].pop("q_pre", None)
+        si["index_one_session_returns"] = {"NDX": -0.10, "SEMI": -0.02}
+
+        built = build_record_body(
+            chain_id="prod-sh2-v1",
+            sequence=0,
+            prev_record_sha256="0" * 64,
+            mode="production",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=si,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state=None,
+            calendar_spec=spec,
+            discipline_labels={"forward_clock_credit_eligible": False},
+        )
+        self.assertFalse(built["appended"])
+        self.assertTrue(built["fail_closed"])
+        self.assertNotEqual(built["o1_output"]["state"], "NORMAL")
+        self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
+        self.assertTrue(built["next_row_state"]["L6"].get("latched"))
+
+    def test_float_sizing_inputs_fail_closed_via_o1_and_preserve_l6_latch(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+
+        cases = [
+            ("float_signal_s", lambda si: si["funds"]["TQQQ"].__setitem__("s", 1.0)),
+            ("float_close_price", lambda si: si["funds"]["TQQQ"].__setitem__("close_price", 50.0)),
+            ("float_sigma_forecast", lambda si: si["funds"]["TQQQ"].__setitem__("sigma_forecast", 0.24)),
+            ("float_prior_e", lambda si: si.__setitem__("prior_E", 50000.0)),
+            ("float_external_flow", lambda si: si.__setitem__("external_flow", 0.0)),
+            ("float_monthly_returns", lambda si: si.__setitem__("monthly_returns", [0.01])),
+        ]
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                si = json.loads(json.dumps(_valid_inputs()))
+                si["index_one_session_returns"] = {"NDX": -0.10, "SEMI": -0.02}
+                mutate(si)
+
+                built = build_record_body(
+                    chain_id="prod-sh2-v1",
+                    sequence=0,
+                    prev_record_sha256="0" * 64,
+                    mode="production",
+                    session_date="2026-01-05",
+                    decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                    session_inputs=si,
+                    calendar_session=cal,
+                    code_version_sha=code_sha,
+                    evaluator=ev,
+                    prior_row_state=None,
+                    calendar_spec=spec,
+                    discipline_labels={"forward_clock_credit_eligible": False},
+                )
+                self.assertFalse(built["appended"], msg=label)
+                self.assertTrue(built["fail_closed"], msg=label)
+                self.assertNotEqual(built["o1_output"]["state"], "NORMAL", msg=label)
+                self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input", msg=label)
+                self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=label)
 
     def test_market_corporate_action_with_none_optional_fields_is_preserved(self) -> None:
         from shadow.fuse_adapter import _map_market_corporate_action

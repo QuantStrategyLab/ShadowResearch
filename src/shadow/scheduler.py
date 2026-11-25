@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import fcntl
+import hmac
 import json
 import os
 import re
@@ -14,13 +17,21 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from shadow.calendar_consumer import load_spec, resolve_session
-from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator
+from shadow.calendar_consumer import (
+    load_spec,
+    resolve_previous_trading_date,
+    resolve_session,
+)
+from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, StubProductionForbiddenError
 from shadow.feeder import (
     SOXL_PROXY_LABEL,
     emit_market_records_from_fixtures,
+    extract_prior_close_from_tiingo_bytes,
+    extract_prior_close_from_yahoo_bytes,
+    read_verified_archived_bytes,
     verify_market_record_raw_integrity,
 )
 from shadow.feeder_live import (
@@ -30,20 +41,47 @@ from shadow.feeder_live import (
     Transport,
     emit_live_market_records,
 )
+from shadow.fuse_adapter import (
+    EngineIdentityError,
+    PINNED_CSA22_V2_DIGEST,
+    PINNED_FUSE_ENGINE_HASH,
+    PINNED_FUSE_SPEC_VERSION,
+    ProductionChainLockedError,
+    VendoredFuseEvaluator,
+    apply_fund_long_run_volatility,
+    build_fuse_validated_inputs,
+    is_stub_evaluator,
+    resolve_aggregate_control_state,
+)
 from shadow.ledger import (
+    ChainConcurrencyConflictError,
     GENESIS_PREV_HASH,
+    NO_PENDING_REJECTED_STATE_SHA256,
     ShadowLedger,
-    _atomic_write_bytes,
     _DATE_YYYY_MM_DD_RE,
+    _HEX64_RE,
+    _atomic_write_bytes,
+    _sha256_canonical_state_dict,
+    authenticate_pending_rejected_state_snapshot,
+    build_pending_rejected_state_payload,
     build_record_body,
     canonical_json_bytes,
     compute_code_manifest_hash,
     compute_inputs_digest,
+    compute_pending_rejected_state_sha256,
     compute_session_commitment_deadline_utc,
+    evaluate_non_stub_tiers,
     has_committed_detached_evidence,
     is_receipt_timely,
     is_utc_ms_timestamp,
+    load_pending_rejected_state_snapshot,
+    load_row_state_snapshot,
+    normalize_pending_authorized_events,
+    o1_blocks_session_commit,
     parse_json_no_duplicates,
+    resolve_blocking_validation_outputs,
+    save_pending_rejected_state_snapshot,
+    save_row_state_snapshot,
     sha256_canonical,
     verify_receipt,
 )
@@ -54,6 +92,7 @@ from shadow.sizing import INSTRUMENT_ORDER, canonical_decimal_str, policy_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCHEDULER_CONFIG_PATH = REPO_ROOT / "config" / "drill-scheduler.json"
+DEFAULT_PRODUCTION_CONFIG_PATH = REPO_ROOT / "config" / "production-scheduler.json"
 DEFAULT_DEPLOY_DIR = REPO_ROOT / "deploy" / "scheduler"
 _NY_TZ = ZoneInfo("America/New_York")
 _STRICT_HHMM_RE = re.compile(r"^[0-9]{2}:[0-9]{2}$", re.ASCII)
@@ -118,6 +157,12 @@ class DrillSchedulerConfig:
     resource_caps: dict[str, object] | None = None
     schema_version: str = "sh1-drill-scheduler-v1"
     production_mode_forbidden: bool = True
+    production_chain_locked: bool | None = None
+    deployment_target: str | None = None
+    cloudrun_region: str | None = None
+    calendar_spec_digest: str | None = None
+    fuse_spec_version: str | None = None
+    fuse_engine_hash: str | None = None
 
     def __post_init__(self) -> None:
         for fname in (
@@ -176,6 +221,94 @@ def load_scheduler_config(config_path: str | Path | None = None) -> DrillSchedul
         resource_caps=dict(raw.get("resource_caps", {})),
         schema_version=str(raw.get("schema_version", "sh1-drill-scheduler-v1")),
         production_mode_forbidden=bool(raw.get("production_mode_forbidden", True)),
+        production_chain_locked=raw.get("production_chain_locked"),
+        deployment_target=raw.get("deployment_target"),
+        cloudrun_region=raw.get("cloudrun_region"),
+        calendar_spec_digest=raw.get("calendar_spec_digest"),
+        fuse_spec_version=raw.get("fuse_spec_version"),
+        fuse_engine_hash=raw.get("fuse_engine_hash"),
+    )
+
+
+def _require_strict_bool(
+    raw: Mapping[str, object],
+    key: str,
+    *,
+    default: bool | None = None,
+) -> bool:
+    if key not in raw:
+        if default is None:
+            raise ValueError(f"missing_required_boolean:{key}")
+        return default
+    val = raw[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"invalid_boolean_for_{key}:{val!r}")
+    return val
+
+
+def load_production_scheduler_config(config_path: str | Path | None = None) -> DrillSchedulerConfig:
+    """Load and validate production scheduler config with strict boolean and OA-SH2-2 lock checks."""
+    path = Path(config_path) if config_path is not None else DEFAULT_PRODUCTION_CONFIG_PATH
+    raw = parse_json_no_duplicates(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Production scheduler configuration JSON must be an object")
+    if raw.get("mode") != "production":
+        raise DrillOnlyViolationError("Production scheduler config MUST specify mode='production'")
+    clk01_active = _require_strict_bool(raw, "clk01_active")
+    production_chain_locked = _require_strict_bool(raw, "production_chain_locked")
+    production_mode_forbidden = _require_strict_bool(raw, "production_mode_forbidden", default=False)
+    if production_mode_forbidden is True:
+        raise DrillOnlyViolationError("production_mode_forbidden=true cannot run production mode")
+    if raw.get("fuse_spec_version") != PINNED_FUSE_SPEC_VERSION:
+        raise ValueError(
+            f"Production config must pin fuse_spec_version={PINNED_FUSE_SPEC_VERSION!r}, got {raw.get('fuse_spec_version')!r}"
+        )
+    if raw.get("fuse_engine_hash") != PINNED_FUSE_ENGINE_HASH:
+        raise ValueError(
+            f"Production config must pin fuse_engine_hash={PINNED_FUSE_ENGINE_HASH!r}, got {raw.get('fuse_engine_hash')!r}"
+        )
+    if raw.get("calendar_version") != "csa22-v2" or raw.get("calendar_spec_digest") != PINNED_CSA22_V2_DIGEST:
+        raise CalendarCoverageError(
+            "Production config must pin calendar_version='csa22-v2' and csa22-v2 spec_digest"
+        )
+    validated_times: dict[str, str] = {}
+    for time_key in (
+        "decision_instant_et",
+        "half_day_run_time_et",
+        "decision_cutoff_et",
+        "decision_cutoff_half_day_et",
+        "commitment_deadline_et",
+    ):
+        if time_key not in raw:
+            raise ValueError(f"missing_required_scheduler_config:{time_key}")
+        _, _, validated_times[time_key] = _parse_strict_hhmm(raw[time_key], field_name=time_key)
+    return DrillSchedulerConfig(
+        chain_id=str(raw["chain_id"]),
+        mode="production",
+        clk01_active=clk01_active,
+        venue=str(raw["venue"]),
+        calendar_version=str(raw["calendar_version"]),
+        decision_instant_et=validated_times["decision_instant_et"],
+        half_day_run_time_et=validated_times["half_day_run_time_et"],
+        decision_cutoff_et=validated_times["decision_cutoff_et"],
+        decision_cutoff_half_day_et=validated_times["decision_cutoff_half_day_et"],
+        commitment_deadline_et=validated_times["commitment_deadline_et"],
+        treasury_endpoint=str(raw.get("treasury_endpoint", DEFAULT_TREASURY_URL_TEMPLATE)),
+        yahoo_symbol_map=dict(raw.get("yahoo_symbol_map", DEFAULT_YAHOO_SYMBOL_MAP)),
+        ots_calendars=tuple(raw.get("ots_calendars", DEFAULT_OTS_CALENDARS)),
+        ots_timeout_seconds=float(raw.get("ots_timeout_seconds", 10.0)),
+        max_footprint_bytes=int(raw.get("max_footprint_bytes", 2 * 1024 * 1024 * 1024)),
+        log_retention_days=int(raw.get("log_retention_days", 30)),
+        log_max_bytes=int(raw.get("log_max_bytes", 50 * 1024 * 1024)),
+        resource_caps=dict(raw.get("resource_caps", {})),
+        schema_version=str(raw.get("schema_version", "sh2-production-scheduler-v1")),
+        production_mode_forbidden=production_mode_forbidden,
+        production_chain_locked=production_chain_locked,
+        deployment_target=str(raw.get("deployment_target", "cloudrun-job")),
+        cloudrun_region=str(raw.get("cloudrun_region", "us-east1")),
+        calendar_spec_digest=str(raw["calendar_spec_digest"]),
+        fuse_spec_version=str(raw["fuse_spec_version"]),
+        fuse_engine_hash=str(raw["fuse_engine_hash"]),
     )
 
 
@@ -213,6 +346,17 @@ def _effective_runtime_config(
         "log_max_bytes": cfg.log_max_bytes,
         "resource_caps": dict(cfg.resource_caps or {}),
     }
+    for opt_key in (
+        "production_chain_locked",
+        "deployment_target",
+        "cloudrun_region",
+        "calendar_spec_digest",
+        "fuse_spec_version",
+        "fuse_engine_hash",
+    ):
+        opt_val = getattr(cfg, opt_key)
+        if opt_val is not None:
+            raw[opt_key] = opt_val
     return _normalize_config_value(raw)  # type: ignore[return-value]
 
 
@@ -564,7 +708,7 @@ def _validate_bundle_session_against_record(
         w_ref = pb.get("bankroll", {}).get("W_ref") if isinstance(pb.get("bankroll"), dict) else None
         ev_block = pb.get("evaluator") if isinstance(pb.get("evaluator"), dict) else {}
         eff_scope = ev_block.get("effective_state_by_scope") if isinstance(ev_block, dict) else {}
-        act_state = eff_scope.get("aggregate") if isinstance(eff_scope, dict) else None
+        act_state = resolve_aggregate_control_state(eff_scope) if isinstance(eff_scope, dict) else None
         computed_inputs_digest = compute_inputs_digest(
             sess_inputs,
             w_ref=w_ref,
@@ -900,7 +1044,8 @@ def _is_committed_session_report_valid(
         return False
     if rep_obj.get("notifications_sent") != 0:
         return False
-    if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
+    expected_scope = "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+    if rep_obj.get("consecutive_session_scope") != expected_scope:
         return False
     consec = rep_obj.get("consecutive_session_count")
     if isinstance(consec, bool) or consec != expected_consecutive_count:
@@ -1061,7 +1206,8 @@ def _is_fail_closed_session_report_valid(
     notif = rep_obj.get("notifications_sent")
     if type(notif) is not int or notif != 0:
         return False
-    if rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
+    expected_scope = "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+    if rep_obj.get("consecutive_session_scope") != expected_scope:
         return False
     consec = rep_obj.get("consecutive_session_count")
     if type(consec) is not int or consec < 0:
@@ -1271,6 +1417,8 @@ def _update_replay_bundle(
     archive_dir: Path,
     session_entry: dict,
     seq: int,
+    engine_hash: str | None = None,
+    spec_version: str | None = None,
 ) -> Path:
     bundle_dir.mkdir(parents=True, exist_ok=True)
     bundle_path = bundle_dir / "replay_bundle.json"
@@ -1298,6 +1446,10 @@ def _update_replay_bundle(
             "archive_dir": str(archive_dir),
             "sessions": [],
         }
+        if engine_hash is not None:
+            bundle["engine_hash"] = engine_hash
+        if spec_version is not None:
+            bundle["spec_version"] = spec_version
     sessions = list(bundle.get("sessions", []))
     if len(sessions) < seq:
         raise ValueError(f"replay_bundle_truncated_vs_ledger:len={len(sessions)}<seq={seq}")
@@ -1314,6 +1466,10 @@ def _update_replay_bundle(
         bundle["runtime_config"] = runtime_config
         bundle["code_version_sha"] = code_sha
         bundle["archive_dir"] = str(archive_dir)
+        if engine_hash is not None:
+            bundle["engine_hash"] = engine_hash
+        if spec_version is not None:
+            bundle["spec_version"] = spec_version
     sessions.append(session_entry)
     bundle["sessions"] = sessions
     _atomic_write_text(bundle_path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
@@ -1337,15 +1493,61 @@ def _commit_drill_session_atomically(
     archive_dir: Path,
     session_entry: dict,
     post_ledger_hook: Callable[[], None] | None = None,
+    snapshots_dir: Path | None = None,
+    next_row_state: dict | None = None,
+    engine_hash: str | None = None,
+    spec_version: str | None = None,
+    trusted_head_anchor_path: Path | None = None,
+    expected_prior_anchor_bytes: bytes | None = None,
+    anchor_updated_at_utc: str | None = None,
 ) -> dict:
-    """Serialize via chain_lock, stage replay_bundle, commit seq_NNNNNN.record.json, then write detached .ots/.receipt."""
+    """Serialize via chain_lock, stage replay_bundle + state snapshot before seq_NNNNNN.record.json commit."""
     with ledger.chain_lock():
         bundle_path = bundle_dir / "replay_bundle.json"
         prior_bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
         bundle_modified = False
 
+        should_stage_snap = (
+            snapshots_dir is not None
+            and next_row_state is not None
+            and engine_hash is not None
+            and spec_version is not None
+        )
+        seq_snap_path = snapshots_dir / f"seq_{seq:06d}.state.json" if should_stage_snap and snapshots_dir is not None else None
+        latest_snap_path = snapshots_dir / "latest.state.json" if should_stage_snap and snapshots_dir is not None else None
+        pending_snap_path = snapshots_dir / "pending_rejected_state.json" if snapshots_dir is not None else None
+        prior_latest_bytes = (
+            latest_snap_path.read_bytes()
+            if latest_snap_path is not None and latest_snap_path.is_file()
+            else None
+        )
+        snap_staged = False
+        prior_anchor_bytes = expected_prior_anchor_bytes
+        staged_bundle_bytes: bytes | None = None
+        staged_snap_bytes: bytes | None = None
+
         def _stage_bundle_before_marker() -> None:
-            nonlocal bundle_modified
+            nonlocal bundle_modified, snap_staged, prior_anchor_bytes, staged_bundle_bytes, staged_snap_bytes
+            ledger.assert_active_chain_lease()
+            if (
+                seq == 0
+                and trusted_head_anchor_path is not None
+                and prior_anchor_bytes is None
+            ):
+                _advance_trusted_head_anchor(
+                    trusted_head_anchor_path,
+                    chain_id=cfg.chain_id,
+                    expected_prior_bytes=None,
+                    sequence=-1,
+                    session_date=None,
+                    head_sha256=GENESIS_PREV_HASH,
+                    pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    now_utc=anchor_updated_at_utc or rcp_obtained_utc,
+                )
+                _, prior_anchor_bytes = _load_trusted_head_anchor(
+                    trusted_head_anchor_path,
+                    expected_chain_id=cfg.chain_id,
+                )
             _update_replay_bundle(
                 bundle_dir,
                 cfg=cfg,
@@ -1355,34 +1557,105 @@ def _commit_drill_session_atomically(
                 archive_dir=archive_dir,
                 session_entry=session_entry,
                 seq=seq,
+                engine_hash=engine_hash,
+                spec_version=spec_version,
             )
+            staged_bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
             bundle_modified = True
+            if should_stage_snap and snapshots_dir is not None:
+                ledger.assert_active_chain_lease()
+                save_row_state_snapshot(
+                    snapshots_dir,
+                    chain_id=cfg.chain_id,
+                    sequence=seq,
+                    session_date=str(body["session_date"]),
+                    record_sha256=sha256_canonical(body),
+                    engine_hash=engine_hash,  # type: ignore[arg-type]
+                    spec_version=spec_version,  # type: ignore[arg-type]
+                    next_row_state=next_row_state,  # type: ignore[arg-type]
+                )
+                staged_snap_bytes = (
+                    seq_snap_path.read_bytes()
+                    if seq_snap_path is not None and seq_snap_path.is_file()
+                    else None
+                )
+                snap_staged = True
             if post_ledger_hook is not None:
                 post_ledger_hook()
 
         try:
             if ots_bytes is not None:
-                return ledger.append_record(
+                env = ledger.append_record(
                     body,
                     obtained_at_utc=rcp_obtained_utc,
                     ots_bytes=ots_bytes,
                     commitment_deadline_utc=deadline_utc,
                     before_record_commit=_stage_bundle_before_marker,
                 )
-            if allow_unanchored:
-                return ledger.append_record(
+            elif allow_unanchored:
+                env = ledger.append_record(
                     body,
                     allow_unanchored=True,
                     before_record_commit=_stage_bundle_before_marker,
                 )
-            raise RuntimeError("OTS receipt missing and unanchored append disabled")
+            else:
+                raise RuntimeError("OTS receipt missing and unanchored append disabled")
         except Exception:
-            if bundle_modified:
-                if prior_bundle_bytes is not None:
-                    _atomic_write_bytes(bundle_path, prior_bundle_bytes)
-                elif bundle_path.exists():
-                    bundle_path.unlink()
+            def _still_owns_lease() -> bool:
+                try:
+                    ledger.assert_active_chain_lease()
+                    return True
+                except ChainConcurrencyConflictError:
+                    return False
+
+            rec_path = ledger._record_path(seq)
+            if _still_owns_lease() and not rec_path.exists():
+                if (
+                    bundle_modified
+                    and staged_bundle_bytes is not None
+                    and bundle_path.is_file()
+                    and bundle_path.read_bytes() == staged_bundle_bytes
+                    and _still_owns_lease()
+                ):
+                    if prior_bundle_bytes is not None:
+                        _atomic_write_bytes(bundle_path, prior_bundle_bytes)
+                    else:
+                        bundle_path.unlink()
+                if snap_staged and staged_snap_bytes is not None:
+                    if (
+                        seq_snap_path is not None
+                        and seq_snap_path.is_file()
+                        and seq_snap_path.read_bytes() == staged_snap_bytes
+                        and _still_owns_lease()
+                    ):
+                        seq_snap_path.unlink()
+                    if (
+                        latest_snap_path is not None
+                        and latest_snap_path.is_file()
+                        and latest_snap_path.read_bytes() == staged_snap_bytes
+                        and _still_owns_lease()
+                    ):
+                        if prior_latest_bytes is not None:
+                            _atomic_write_bytes(latest_snap_path, prior_latest_bytes)
+                        else:
+                            latest_snap_path.unlink()
             raise
+        if pending_snap_path is not None and pending_snap_path.is_file():
+            ledger.assert_active_chain_lease()
+            pending_snap_path.unlink()
+        if trusted_head_anchor_path is not None:
+            ledger.assert_active_chain_lease()
+            _advance_trusted_head_anchor(
+                trusted_head_anchor_path,
+                chain_id=cfg.chain_id,
+                expected_prior_bytes=prior_anchor_bytes,
+                sequence=seq,
+                session_date=str(body["session_date"]),
+                head_sha256=env["record_sha256"],
+                pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                now_utc=anchor_updated_at_utc or rcp_obtained_utc,
+            )
+        return env
 
 
 def _summarize_required_series(mkt_recs: list[dict]) -> list[dict]:
@@ -1516,7 +1789,9 @@ def _build_committed_completeness_report(
         "ledger": ledger_meta,
         "receipt": receipt_summary,
         "consecutive_session_count": consecutive_now,
-        "consecutive_session_scope": "drill_only_not_clk01",
+        "consecutive_session_scope": (
+            "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+        ),
         "standing_assertions": {
             "kelly_applied": False,
             "orders_placed": 0,
@@ -1525,7 +1800,9 @@ def _build_committed_completeness_report(
             "stop_loss_return_rule": "OFF",
             "loss_controls_armed": False,
         },
-        "observation_class": "synthetic",
+        "observation_class": (
+            "decision_time_market" if cfg.mode == "production" else "synthetic"
+        ),
         "notifications_sent": 0,
         "metrics": {
             "wall_seconds": round(time.monotonic() - t_start, 6),
@@ -1557,6 +1834,7 @@ def _build_fail_closed_result(
     receipt_status: str = "not_applicable_fail_closed",
     receipt_obtained_at_utc: str | None = None,
     receipt_reasons: list[str] | None = None,
+    pending_rejected_state_sha256: str | None = None,
 ) -> dict:
     report = {
         "session_date": session_date,
@@ -1587,7 +1865,9 @@ def _build_fail_closed_result(
             "non_creditable_reasons": receipt_reasons or [fail_reason, "drill_mode"],
         },
         "consecutive_session_count": consecutive_count,
-        "consecutive_session_scope": "drill_only_not_clk01",
+        "consecutive_session_scope": (
+            "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+        ),
         "standing_assertions": {
             "kelly_applied": False,
             "orders_placed": 0,
@@ -1603,6 +1883,8 @@ def _build_fail_closed_result(
             "peak_rss_bytes": _peak_rss_bytes(),
         },
     }
+    if pending_rejected_state_sha256 is not None:
+        report["pending_rejected_state_sha256"] = pending_rejected_state_sha256
     report_paths, wrote_report = _write_completeness_report(
         reports_dir,
         report,
@@ -1610,7 +1892,7 @@ def _build_fail_closed_result(
     )
     if wrote_report:
         report["created_at_utc"] = created_at_utc
-    return {
+    res_out = {
         "appended": False,
         "fail_closed": True,
         "reason": reason_key,
@@ -1620,6 +1902,9 @@ def _build_fail_closed_result(
         "existing_report_preserved": not wrote_report,
         "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
     }
+    if pending_rejected_state_sha256 is not None:
+        res_out["pending_rejected_state_sha256"] = pending_rejected_state_sha256
+    return res_out
 
 
 def run_daily_drill_cycle(
@@ -1640,8 +1925,11 @@ def run_daily_drill_cycle(
     yahoo_symbol_map: Mapping[str, str] | None = None,
     q_pre_by_inst: Mapping[str, object] | None = None,
     sigma_by_inst: Mapping[str, str] | None = None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
     revision_seq: int = 0,
     allow_unanchored_on_ots_failure: bool = True,
+    evaluator: object | None = None,
+    authorized_events: dict | list | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None = None,
     _post_record_commit_hook: Callable[[], None] | None = None,
     _post_report_json_hook: Callable[[], None] | None = None,
@@ -1651,6 +1939,186 @@ def run_daily_drill_cycle(
     cfg = config if config is not None else load_scheduler_config()
     if cfg.mode != "drill" or cfg.clk01_active:
         raise DrillOnlyViolationError("Drill cycle refused non-drill or clk01_active config")
+    return _execute_cycle_with_config(
+        t_start=t_start,
+        cfg=cfg,
+        session_date=session_date,
+        data_dir=data_dir,
+        spec_dir=spec_dir,
+        transport=transport,
+        environ=environ,
+        fixtures_dir=fixtures_dir,
+        ots_client=ots_client,
+        ots_transport=ots_transport,
+        wall_clock=wall_clock,
+        clock=clock,
+        sleeper=sleeper,
+        treasury_endpoint=treasury_endpoint,
+        yahoo_symbol_map=yahoo_symbol_map,
+        q_pre_by_inst=q_pre_by_inst,
+        sigma_by_inst=sigma_by_inst,
+        long_run_vol_by_inst=long_run_vol_by_inst,
+        revision_seq=revision_seq,
+        allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
+        evaluator=evaluator,
+        authorized_events=authorized_events,
+        _post_ledger_commit_hook=_post_ledger_commit_hook,
+        _post_record_commit_hook=_post_record_commit_hook,
+        _post_report_json_hook=_post_report_json_hook,
+    )
+
+
+def run_production_cycle(
+    *,
+    session_date: str,
+    data_dir: str | Path,
+    config_path: str | Path | None = None,
+    config: DrillSchedulerConfig | None = None,
+    spec_dir: str | Path | None = None,
+    transport: Transport | None = None,
+    environ: Mapping[str, str] | None = None,
+    fixtures_dir: str | Path | None = None,
+    ots_client: OpenTimestampsClient | None = None,
+    ots_transport: OtsTransport | None = None,
+    wall_clock: Callable[[], datetime] | None = None,
+    clock: Callable[[], float] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+    treasury_endpoint: str | None = None,
+    yahoo_symbol_map: Mapping[str, str] | None = None,
+    q_pre_by_inst: Mapping[str, object] | None = None,
+    sigma_by_inst: Mapping[str, str] | None = None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
+    revision_seq: int = 0,
+    allow_unanchored_on_ots_failure: bool = False,
+    evaluator: object | None = None,
+    authorized_events: dict | list | None = None,
+    expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
+) -> dict:
+    """Execute one CLK-01 production cycle ONLY when OA-SH2-2 lock is explicitly unlocked."""
+    t_start = time.monotonic()
+    cfg = config if config is not None else load_production_scheduler_config(config_path)
+    if cfg.mode != "production":
+        raise DrillOnlyViolationError("run_production_cycle requires mode='production'")
+    if cfg.production_mode_forbidden is not False:
+        raise DrillOnlyViolationError(
+            "run_production_cycle requires production_mode_forbidden=false"
+        )
+    if (
+        cfg.calendar_version != "csa22-v2"
+        or cfg.calendar_spec_digest != PINNED_CSA22_V2_DIGEST
+    ):
+        raise CalendarCoverageError(
+            "run_production_cycle requires calendar_version='csa22-v2' and pinned calendar_spec_digest"
+        )
+    if cfg.production_chain_locked is not False or not cfg.clk01_active:
+        raise ProductionChainLockedError(
+            "Production chain is locked pending OA-SH2-2 sign-off; 0 production appends permitted"
+        )
+    if fixtures_dir is not None:
+        raise ValueError("production_mode_forbids_offline_fixtures")
+    if allow_unanchored_on_ots_failure:
+        raise ValueError("Production chain structurally forbids unanchored appends")
+    ev = evaluator if evaluator is not None else VendoredFuseEvaluator()
+    if is_stub_evaluator(ev):
+        raise StubProductionForbiddenError(
+            "StubEvaluator is structurally forbidden in production forward-clock mode"
+        )
+    if (
+        getattr(ev, "engine_hash", None) != PINNED_FUSE_ENGINE_HASH
+        or getattr(ev, "spec_version", None) != PINNED_FUSE_SPEC_VERSION
+    ):
+        raise ValueError("Production cycle requires exact pinned FUSE-1 identity")
+    return _execute_cycle_with_config(
+        t_start=t_start,
+        cfg=cfg,
+        session_date=session_date,
+        data_dir=data_dir,
+        spec_dir=spec_dir,
+        transport=transport,
+        environ=environ,
+        fixtures_dir=fixtures_dir,
+        ots_client=ots_client,
+        ots_transport=ots_transport,
+        wall_clock=wall_clock,
+        clock=clock,
+        sleeper=sleeper,
+        treasury_endpoint=treasury_endpoint,
+        yahoo_symbol_map=yahoo_symbol_map,
+        q_pre_by_inst=q_pre_by_inst,
+        sigma_by_inst=sigma_by_inst,
+        long_run_vol_by_inst=long_run_vol_by_inst,
+        revision_seq=revision_seq,
+        allow_unanchored_on_ots_failure=False,
+        evaluator=ev,
+        authorized_events=authorized_events,
+        expected_prior_head_sha256=expected_prior_head_sha256,
+        expected_pending_state_sha256=expected_pending_state_sha256,
+        bitcoin_merkle_roots=bitcoin_merkle_roots,
+        trusted_head_anchor_path=trusted_head_anchor_path,
+        _post_ledger_commit_hook=None,
+        _post_record_commit_hook=None,
+        _post_report_json_hook=None,
+    )
+
+
+def _resolve_cycle_network_deadlines(
+    t_start: float,
+    cfg: DrillSchedulerConfig,
+) -> tuple[float, float]:
+    """Return (market_deadline, network_deadline) leaving reporting reserve before task_timeout."""
+    raw_task_timeout = (cfg.resource_caps or {}).get("task_timeout_seconds", 300)
+    task_timeout = (
+        float(raw_task_timeout)
+        if isinstance(raw_task_timeout, (int, float))
+        and not isinstance(raw_task_timeout, bool)
+        and float(raw_task_timeout) > 0
+        else 300.0
+    )
+    reporting_reserve = min(45.0, task_timeout * 0.25)
+    network_deadline = t_start + max(1.0, task_timeout - reporting_reserve)
+    ots_reserve = min(
+        float(cfg.ots_timeout_seconds) * 2.0,
+        max(0.0, (task_timeout - reporting_reserve) * 0.25),
+    )
+    market_deadline = max(t_start + 1.0, network_deadline - ots_reserve)
+    return market_deadline, network_deadline
+
+
+def _execute_cycle_with_config(
+    *,
+    t_start: float,
+    cfg: DrillSchedulerConfig,
+    session_date: str,
+    data_dir: str | Path,
+    spec_dir: str | Path | None,
+    transport: Transport | None,
+    environ: Mapping[str, str] | None,
+    fixtures_dir: str | Path | None,
+    ots_client: OpenTimestampsClient | None,
+    ots_transport: OtsTransport | None,
+    wall_clock: Callable[[], datetime] | None,
+    clock: Callable[[], float] | None,
+    sleeper: Callable[[float], None] | None,
+    treasury_endpoint: str | None,
+    yahoo_symbol_map: Mapping[str, str] | None,
+    q_pre_by_inst: Mapping[str, object] | None,
+    sigma_by_inst: Mapping[str, str] | None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
+    revision_seq: int,
+    allow_unanchored_on_ots_failure: bool,
+    evaluator: object | None,
+    authorized_events: dict | list | None = None,
+    expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
+    _post_ledger_commit_hook: Callable[[], None] | None,
+    _post_record_commit_hook: Callable[[], None] | None,
+    _post_report_json_hook: Callable[[], None] | None,
+) -> dict:
 
     root = Path(data_dir)
     ledger_dir = root / "ledger"
@@ -1665,6 +2133,10 @@ def run_daily_drill_cycle(
     if spec["rules"]["calendar_version"] != cfg.calendar_version:
         raise CalendarCoverageError(
             f"calendar_coverage_insufficient: configured {cfg.calendar_version} != loaded {spec['rules']['calendar_version']}"
+        )
+    if cfg.calendar_spec_digest is not None and spec.get("spec_digest") != cfg.calendar_spec_digest:
+        raise CalendarCoverageError(
+            f"calendar_coverage_insufficient: configured spec_digest {cfg.calendar_spec_digest} != loaded {spec.get('spec_digest')}"
         )
     if cfg.venue != spec["rules"]["exchange"]:
         raise CalendarCoverageError(
@@ -1714,12 +2186,964 @@ def run_daily_drill_cycle(
             yahoo_symbol_map=yahoo_symbol_map,
             q_pre_by_inst=q_pre_by_inst,
             sigma_by_inst=sigma_by_inst,
+            long_run_vol_by_inst=long_run_vol_by_inst,
             revision_seq=revision_seq,
             allow_unanchored_on_ots_failure=allow_unanchored_on_ots_failure,
+            evaluator=evaluator,
+            authorized_events=authorized_events,
+            expected_prior_head_sha256=expected_prior_head_sha256,
+            expected_pending_state_sha256=expected_pending_state_sha256,
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
+            trusted_head_anchor_path=trusted_head_anchor_path,
             _post_ledger_commit_hook=_post_ledger_commit_hook,
             _post_record_commit_hook=_post_record_commit_hook,
             _post_report_json_hook=_post_report_json_hook,
         )
+
+
+def _extract_prior_session_closes(
+    *,
+    archive_dir: Path,
+    mkt_recs: list[dict],
+    session_date: str,
+    bundle_obj: dict | None,
+    cal: Mapping[str, object],
+    spec: dict | None = None,
+    venue: str = "XNYS",
+) -> dict[str, str]:
+    """Derive immediately preceding trading day closes from committed bundle or multi-day archives."""
+    _ = cal
+    loaded_spec = spec if spec is not None else load_spec()
+    prev_trading_date = resolve_previous_trading_date(loaded_spec, venue, session_date)
+    if prev_trading_date is None:
+        return {}
+
+    closes: dict[str, str] = {}
+    if isinstance(bundle_obj, dict):
+        sessions = bundle_obj.get("sessions")
+        if isinstance(sessions, list) and sessions:
+            prior_sess = next(
+                (
+                    cand
+                    for cand in reversed(sessions)
+                    if isinstance(cand, dict) and str(cand.get("session_date", "")) == prev_trading_date
+                ),
+                None,
+            )
+            if prior_sess is not None and isinstance(prior_sess.get("market_records"), list):
+                for rec in prior_sess["market_records"]:
+                    if (
+                        isinstance(rec, dict)
+                        and rec.get("instrument") in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI")
+                        and rec.get("normalized_value") is not None
+                    ):
+                        closes[str(rec["instrument"])] = str(rec["normalized_value"])
+
+    cal_prior = resolve_session(venue, prev_trading_date, spec=loaded_spec)
+    for rec in mkt_recs:
+        inst = str(rec.get("instrument", ""))
+        if inst not in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI") or inst in closes:
+            continue
+        ref = rec.get("raw_bytes_ref") or ""
+        digest = rec.get("raw_bytes_sha256") or ""
+        if not ref or not digest:
+            continue
+        try:
+            raw_bytes = read_verified_archived_bytes(archive_dir, ref, digest)
+        except Exception:
+            continue
+        provider = str(rec.get("provider", ""))
+        if inst in ("TQQQ", "SOXL", "QQQ") or "tiingo" in provider:
+            val = extract_prior_close_from_tiingo_bytes(
+                raw_bytes,
+                session_date,
+                calendar_session=cal_prior,
+                target_prior_date=prev_trading_date,
+            )
+        else:
+            val = extract_prior_close_from_yahoo_bytes(
+                raw_bytes,
+                session_date,
+                calendar_session=cal_prior,
+                target_prior_date=prev_trading_date,
+            )
+        if val is not None:
+            closes[inst] = val
+    return closes
+
+
+def _committed_expected_next_state_sha256(record_env: Mapping[str, object]) -> str:
+    body = record_env.get("record_body")
+    ev_obj = body.get("evaluator") if isinstance(body, Mapping) else None
+    nrs_sha = ev_obj.get("next_row_state_sha256") if isinstance(ev_obj, Mapping) else None
+    if not isinstance(nrs_sha, str) or not _HEX64_RE.fullmatch(nrs_sha):
+        raise EngineIdentityError(
+            "Committed non-stub ledger record missing valid evaluator.next_row_state_sha256"
+        )
+    return nrs_sha
+
+
+def _retire_superseded_pending_rejected_state(
+    snapshots_dir: Path,
+    *,
+    committed_seq: int,
+    committed_session_date: str,
+    expected_chain_id: str | None = None,
+) -> bool:
+    """Remove stale pending_rejected_state.json strictly superseded by an already-committed session."""
+    pending_path = snapshots_dir / "pending_rejected_state.json"
+    if not pending_path.is_file():
+        return False
+    try:
+        payload = parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt pending rejected state snapshot {pending_path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-pending-rejected-state-v1":
+        raise EngineIdentityError(f"Invalid pending rejected state snapshot schema in {pending_path}")
+    if expected_chain_id is not None and payload.get("chain_id") != expected_chain_id:
+        return False
+    base_seq = payload.get("base_sequence")
+    rej_ds = payload.get("rejected_session_date")
+    if (
+        isinstance(base_seq, int)
+        and not isinstance(base_seq, bool)
+        and base_seq < committed_seq
+        and isinstance(rej_ds, str)
+        and _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds)
+        and rej_ds <= committed_session_date
+    ):
+        pending_path.unlink(missing_ok=True)
+        return True
+    return False
+
+
+def _reconcile_committed_state_snapshot_if_missing(
+    *,
+    snapshots_dir: Path,
+    ledger: ShadowLedger,
+    bundle_obj: dict | None,
+    prior_records: list[dict],
+    ex_seq: int,
+    existing_env: dict,
+    cfg: DrillSchedulerConfig,
+    spec: dict,
+    cal: dict,
+) -> None:
+    """Verify or deterministically rebuild seq_{ex_seq}.state.json after mid-commit interruption."""
+    ex_body = existing_env["record_body"]
+    ex_sess_date = str(ex_body["session_date"])
+    ex_hash = ex_body.get("engine_hash")
+    ex_spec = (ex_body.get("evaluator") or {}).get("spec_version")
+    if ex_hash != PINNED_FUSE_ENGINE_HASH or ex_spec != PINNED_FUSE_SPEC_VERSION:
+        _retire_superseded_pending_rejected_state(
+            snapshots_dir,
+            committed_seq=ex_seq,
+            committed_session_date=ex_sess_date,
+            expected_chain_id=cfg.chain_id,
+        )
+        return
+    ex_expected_state_sha = _committed_expected_next_state_sha256(existing_env)
+    try:
+        seq_state, _ = load_row_state_snapshot(
+            snapshots_dir,
+            expected_chain_id=cfg.chain_id,
+            expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+            expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+            expected_sequence=ex_seq,
+            expected_record_sha256=existing_env["record_sha256"],
+            expected_state_sha256=ex_expected_state_sha,
+            allow_missing_at_genesis=False,
+        )
+        if ex_seq == len(prior_records) - 1:
+            latest_path = snapshots_dir / "latest.state.json"
+            if latest_path.is_file():
+                try:
+                    latest_obj = parse_json_no_duplicates(latest_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(latest_obj, dict)
+                        and latest_obj.get("sequence") == ex_seq
+                        and latest_obj.get("record_sha256") == existing_env["record_sha256"]
+                    ):
+                        load_row_state_snapshot(
+                            snapshots_dir,
+                            expected_chain_id=cfg.chain_id,
+                            expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                            expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+                            expected_sequence=None,
+                            expected_record_sha256=existing_env["record_sha256"],
+                            expected_state_sha256=ex_expected_state_sha,
+                            allow_missing_at_genesis=False,
+                        )
+                        _retire_superseded_pending_rejected_state(
+                            snapshots_dir,
+                            committed_seq=ex_seq,
+                            committed_session_date=ex_sess_date,
+                            expected_chain_id=cfg.chain_id,
+                        )
+                        return
+                except Exception:
+                    pass
+            save_row_state_snapshot(
+                snapshots_dir,
+                chain_id=cfg.chain_id,
+                sequence=ex_seq,
+                session_date=ex_sess_date,
+                record_sha256=existing_env["record_sha256"],
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state=seq_state,
+            )
+        _retire_superseded_pending_rejected_state(
+            snapshots_dir,
+            committed_seq=ex_seq,
+            committed_session_date=ex_sess_date,
+            expected_chain_id=cfg.chain_id,
+        )
+        return
+    except Exception:
+        pass
+
+    if not isinstance(bundle_obj, dict):
+        raise ValueError("missing_replay_bundle_for_snapshot_recovery")
+    sessions = bundle_obj.get("sessions")
+    if not isinstance(sessions, list) or ex_seq >= len(sessions):
+        raise ValueError(f"missing_bundle_session_for_snapshot_recovery:seq={ex_seq}")
+    sess_entry = sessions[ex_seq]
+    fctx = sess_entry.get("fuse_context") if isinstance(sess_entry.get("fuse_context"), Mapping) else {}
+    if ex_seq == 0:
+        if isinstance(fctx, Mapping) and fctx.get("prior_row_state_used") is not None:
+            prior_state = copy.deepcopy(fctx["prior_row_state_used"])
+        else:
+            prior_state = {}
+    else:
+        prev_env = prior_records[ex_seq - 1]
+        prev_expected_sha = _committed_expected_next_state_sha256(prev_env)
+        committed_prev_state, _ = load_row_state_snapshot(
+            snapshots_dir,
+            expected_chain_id=cfg.chain_id,
+            expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+            expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+            expected_sequence=ex_seq - 1,
+            expected_record_sha256=prev_env["record_sha256"],
+            expected_state_sha256=prev_expected_sha,
+            allow_missing_at_genesis=False,
+        )
+        if isinstance(fctx, Mapping) and fctx.get("prior_row_state_used") is not None:
+            prior_state = copy.deepcopy(fctx["prior_row_state_used"])
+        else:
+            prior_state = committed_prev_state
+
+    rec_inputs = dict(sess_entry["inputs"])
+    rec_inputs["market_records"] = sess_entry["market_records"]
+    rec_inputs["required_series"] = REQUIRED_MARKET_SERIES
+    if isinstance(fctx, Mapping):
+        for ctx_key in (
+            "prior_closes",
+            "positions_source_record",
+            "broker_reconciliation_source_record",
+            "index_one_session_returns",
+            "authorized_events",
+        ):
+            if ctx_key in fctx and fctx[ctx_key] is not None:
+                rec_inputs[ctx_key] = fctx[ctx_key]
+        apply_fund_long_run_volatility(rec_inputs, fctx.get("long_run_vol_by_inst"))
+
+    ev = VendoredFuseEvaluator()
+    ex_cal = cal if str(cal.get("date", "")) == ex_sess_date else resolve_session(cfg.venue, ex_sess_date, spec=spec)
+    rebuilt = build_record_body(
+        chain_id=cfg.chain_id,
+        sequence=ex_seq,
+        prev_record_sha256=str(ex_body["prev_record_sha256"]),
+        mode=str(ex_body["mode"]),
+        session_date=str(ex_body["session_date"]),
+        decision_timestamp_utc=str(ex_body["decision_timestamp_utc"]),
+        session_inputs=rec_inputs,
+        calendar_session=ex_cal,
+        code_version_sha=str(ex_body["code_version_sha"]),
+        evaluator=ev,
+        prior_row_state=prior_state,
+        discipline_labels=sess_entry.get("discipline_labels"),
+        market_records_digest=sess_entry.get("market_records_digest"),
+        runtime_config=bundle_obj.get("runtime_config"),
+        calendar_spec=spec,
+    )
+    if not rebuilt.get("appended") or sha256_canonical(rebuilt["record_body"]) != existing_env["record_sha256"]:
+        raise ValueError(f"snapshot_recovery_record_hash_mismatch:seq={ex_seq}")
+    save_row_state_snapshot(
+        snapshots_dir,
+        chain_id=cfg.chain_id,
+        sequence=ex_seq,
+        session_date=ex_sess_date,
+        record_sha256=existing_env["record_sha256"],
+        engine_hash=PINNED_FUSE_ENGINE_HASH,
+        spec_version=PINNED_FUSE_SPEC_VERSION,
+        next_row_state=rebuilt["next_row_state"],
+    )
+    _retire_superseded_pending_rejected_state(
+        snapshots_dir,
+        committed_seq=ex_seq,
+        committed_session_date=ex_sess_date,
+        expected_chain_id=cfg.chain_id,
+    )
+
+
+def _reconcile_uncommitted_staged_snapshots(
+    *,
+    snapshots_dir: Path,
+    ledger: ShadowLedger,
+    bundle_obj: dict | None,
+    prior_records: list[dict],
+    cfg: DrillSchedulerConfig,
+    spec: dict,
+) -> None:
+    """Prune uncommitted staged seq snapshots and restore latest.state.json to committed head."""
+    if not snapshots_dir.is_dir():
+        return
+    committed_len = len(prior_records)
+    removed_uncommitted = False
+    for cand in sorted(snapshots_dir.iterdir()):
+        if not cand.is_file():
+            continue
+        m = re.fullmatch(r"seq_(\d{6})\.state\.json", cand.name)
+        if m is not None and int(m.group(1)) >= committed_len:
+            cand.unlink(missing_ok=True)
+            removed_uncommitted = True
+
+    latest_path = snapshots_dir / "latest.state.json"
+    if not latest_path.is_file():
+        return
+    latest_obj: dict | None = None
+    latest_unparseable = False
+    try:
+        parsed = parse_json_no_duplicates(latest_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            latest_obj = parsed
+    except Exception:
+        latest_unparseable = True
+
+    latest_is_uncommitted = bool(
+        latest_obj is not None
+        and latest_obj.get("chain_id") == cfg.chain_id
+        and isinstance(latest_obj.get("sequence"), int)
+        and not isinstance(latest_obj.get("sequence"), bool)
+        and latest_obj["sequence"] >= committed_len
+    ) or (removed_uncommitted and latest_unparseable)
+
+    if not latest_is_uncommitted:
+        return
+    if committed_len == 0:
+        latest_path.unlink(missing_ok=True)
+        return
+    head_idx = committed_len - 1
+    head_env = prior_records[head_idx]
+    head_sess = str(head_env["record_body"]["session_date"])
+    head_cal = resolve_session(cfg.venue, head_sess, spec=spec)
+    _reconcile_committed_state_snapshot_if_missing(
+        snapshots_dir=snapshots_dir,
+        ledger=ledger,
+        bundle_obj=bundle_obj,
+        prior_records=prior_records,
+        ex_seq=head_idx,
+        existing_env=head_env,
+        cfg=cfg,
+        spec=spec,
+        cal=head_cal,
+    )
+
+
+def _check_no_unconsumed_pending_rejected_reports(
+    reports_dir: Path,
+    *,
+    head_session_date: str | None,
+) -> None:
+    """Fail closed if a post-head rejected completeness report recorded a pending state now absent."""
+    if not reports_dir.is_dir():
+        return
+    for rpath in sorted(reports_dir.glob("completeness_*.json")):
+        try:
+            rep = parse_json_no_duplicates(rpath.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(rep, Mapping):
+            continue
+        rep_ledger = rep.get("ledger")
+        pend_sha = rep.get("pending_rejected_state_sha256")
+        if (
+            isinstance(rep_ledger, Mapping)
+            and rep_ledger.get("appended") is False
+            and isinstance(pend_sha, str)
+            and pend_sha
+        ):
+            rep_ds = str(rep.get("session_date") or "")
+            if head_session_date is None or rep_ds > head_session_date:
+                raise EngineIdentityError(
+                    "production_pending_rejected_state_missing: post-head rejected report records pending_rejected_state_sha256 but pending_rejected_state.json is absent"
+                )
+
+
+def _validate_trusted_head_anchor_path(
+    anchor_path: str | Path | None,
+    data_dir: str | Path,
+) -> Path:
+    if anchor_path is None or not str(anchor_path).strip():
+        raise EngineIdentityError(
+            "production_trusted_head_anchor_required: require external trusted_head_anchor_path"
+        )
+    resolved_anchor = Path(anchor_path).resolve()
+    resolved_data = Path(data_dir).resolve()
+    try:
+        resolved_anchor.relative_to(resolved_data)
+        inside_data = True
+    except ValueError:
+        inside_data = False
+    if inside_data:
+        raise EngineIdentityError(
+            "production_trusted_head_anchor_inside_data_dir: anchor must reside outside SHADOW_DATA_DIR"
+        )
+    if resolved_anchor.exists() and resolved_anchor.is_dir():
+        raise EngineIdentityError("production_trusted_head_anchor_is_directory")
+    return resolved_anchor
+
+
+def _anchor_version_slot_path(anchor_path: Path, version: int) -> Path:
+    if version == 1:
+        return anchor_path
+    return anchor_path.with_name(f"{anchor_path.name}.v{version}.json")
+
+
+def _list_trusted_head_anchor_version_slots(anchor_path: Path) -> list[tuple[int, Path]]:
+    if not anchor_path.parent.is_dir():
+        return []
+    prefix = f"{anchor_path.name}.v"
+    suffix = ".json"
+    slots: list[tuple[int, Path]] = []
+    for cand in anchor_path.parent.glob(f"{anchor_path.name}.v*.json"):
+        name = cand.name
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            continue
+        ver_str = name[len(prefix) : -len(suffix)]
+        if not (ver_str.isascii() and ver_str.isdigit()):
+            continue
+        ver = int(ver_str)
+        if ver < 2 or str(ver) != ver_str:
+            continue
+        slots.append((ver, cand))
+    slots.sort(key=lambda item: item[0])
+    return slots
+
+
+def _parse_trusted_head_anchor_bytes(raw_bytes: bytes, *, expected_chain_id: str) -> dict:
+    try:
+        obj = parse_json_no_duplicates(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
+    if not isinstance(obj, dict):
+        raise EngineIdentityError("invalid_trusted_head_anchor:not_dict")
+    if obj.get("schema_version") != "c-sh-trusted-head-anchor-v1":
+        raise EngineIdentityError("invalid_trusted_head_anchor:schema_version")
+    if obj.get("chain_id") != expected_chain_id:
+        raise EngineIdentityError("invalid_trusted_head_anchor:chain_id_mismatch")
+    seq = obj.get("sequence")
+    anchor_ver = obj.get("anchor_version")
+    head_sha = obj.get("head_sha256")
+    pend_sha = obj.get("pending_rejected_state_sha256")
+    if (
+        isinstance(seq, bool)
+        or not isinstance(seq, int)
+        or seq < -1
+        or isinstance(anchor_ver, bool)
+        or not isinstance(anchor_ver, int)
+        or anchor_ver < 1
+        or not isinstance(head_sha, str)
+        or not _HEX64_RE.fullmatch(head_sha)
+        or not isinstance(pend_sha, str)
+        or not _HEX64_RE.fullmatch(pend_sha)
+    ):
+        raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
+    if seq == -1 and not hmac.compare_digest(head_sha, GENESIS_PREV_HASH):
+        raise EngineIdentityError("invalid_trusted_head_anchor:genesis_seq_head_mismatch")
+    pend_ds = obj.get("pending_rejected_session_date")
+    if pend_ds is not None:
+        if not isinstance(pend_ds, str) or not _DATE_YYYY_MM_DD_RE.fullmatch(pend_ds):
+            raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
+        try:
+            date.fromisoformat(pend_ds)
+        except ValueError as exc:
+            raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields") from exc
+    pend_rev = obj.get("pending_rejected_revision")
+    if pend_rev is not None and (
+        isinstance(pend_rev, bool)
+        or not isinstance(pend_rev, int)
+        or pend_rev < 1
+    ):
+        raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
+    return obj
+
+
+def _load_trusted_head_anchor(
+    anchor_path: Path,
+    *,
+    expected_chain_id: str,
+) -> tuple[dict | None, bytes | None]:
+    version_slots = _list_trusted_head_anchor_version_slots(anchor_path)
+    if not anchor_path.exists():
+        if version_slots:
+            raise EngineIdentityError(
+                "production_trusted_head_anchor_missing: primary anchor deleted while history exists"
+            )
+        return None, None
+    try:
+        best_bytes = anchor_path.read_bytes()
+    except Exception as exc:
+        raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
+    best_obj = _parse_trusted_head_anchor_bytes(best_bytes, expected_chain_id=expected_chain_id)
+    for slot_ver, slot_path in version_slots:
+        try:
+            slot_bytes = slot_path.read_bytes()
+        except Exception as exc:
+            raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
+        slot_obj = _parse_trusted_head_anchor_bytes(slot_bytes, expected_chain_id=expected_chain_id)
+        if int(slot_obj["anchor_version"]) != slot_ver:
+            raise EngineIdentityError("invalid_trusted_head_anchor:slot_version_mismatch")
+        if int(slot_obj["anchor_version"]) > int(best_obj["anchor_version"]):
+            best_obj = slot_obj
+            best_bytes = slot_bytes
+    return best_obj, best_bytes
+
+
+def _advance_trusted_head_anchor(
+    anchor_path: Path,
+    *,
+    chain_id: str,
+    expected_prior_bytes: bytes | None,
+    sequence: int,
+    session_date: str | None,
+    head_sha256: str,
+    pending_rejected_state_sha256: str,
+    now_utc: str,
+    pending_rejected_session_date: str | None = None,
+    pending_rejected_revision: int | None = None,
+) -> dict:
+    anchor_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = anchor_path.with_name(f".{anchor_path.name}.lock")
+    lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        try:
+            cur_obj, cur_bytes = _load_trusted_head_anchor(
+                anchor_path, expected_chain_id=chain_id
+            )
+            if expected_prior_bytes is None:
+                if cur_bytes is not None:
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: anchor appeared concurrently"
+                    )
+                next_version = 1
+            else:
+                if cur_bytes != expected_prior_bytes or cur_obj is None:
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: anchor modified concurrently"
+                    )
+                if sequence < int(cur_obj["sequence"]):
+                    raise EngineIdentityError(
+                        "production_trusted_head_rollback_rejected: anchor sequence regression"
+                    )
+                next_version = int(cur_obj["anchor_version"]) + 1
+
+            new_obj: dict[str, object] = {
+                "schema_version": "c-sh-trusted-head-anchor-v1",
+                "chain_id": chain_id,
+                "sequence": sequence,
+                "session_date": session_date,
+                "head_sha256": head_sha256,
+                "pending_rejected_state_sha256": pending_rejected_state_sha256,
+                "pending_rejected_session_date": pending_rejected_session_date,
+                "pending_rejected_revision": pending_rejected_revision,
+                "anchor_version": next_version,
+                "updated_at_utc": now_utc,
+            }
+            new_bytes = (
+                json.dumps(new_obj, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            slot_path = _anchor_version_slot_path(anchor_path, next_version)
+            tmp_path = slot_path.with_name(f".{slot_path.name}.tmp.{uuid4().hex}")
+            try:
+                ShadowLedger._publish_exclusive_file(slot_path, tmp_path, new_bytes)
+            except FileExistsError as exc:
+                msg = (
+                    "production_trusted_head_rollback_rejected: anchor appeared concurrently"
+                    if next_version == 1
+                    else "production_trusted_head_rollback_rejected: anchor modified concurrently"
+                )
+                raise EngineIdentityError(msg) from exc
+            if next_version >= 2:
+                existing_versions = [
+                    v for v, _ in _list_trusted_head_anchor_version_slots(anchor_path)
+                ]
+                if max(existing_versions, default=1) == next_version:
+                    _atomic_write_bytes(anchor_path, new_bytes)
+            dfd = os.open(str(anchor_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return new_obj
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+    finally:
+        os.close(lfd)
+
+
+def _verify_or_catchup_pending_anchor(
+    *,
+    anchor_resolved: Path,
+    anchor_obj: dict | None,
+    anchor_bytes: bytes | None,
+    chain_id: str,
+    head_seq: int,
+    head_ds: str | None,
+    head_sha: str,
+    session_date: str,
+    expected_pending_state_sha256: str | None,
+    auth_pending: dict | None,
+    now_utc_fn: Callable[[], str] | None,
+    rollback_err_reason: str,
+) -> tuple[dict | None, bytes | None]:
+    """Verify pending snapshot matches trusted anchor, or catch up a forward interrupted pending anchor write."""
+    actual_pend_sha = (
+        compute_pending_rejected_state_sha256(auth_pending)
+        if auth_pending is not None
+        else NO_PENDING_REJECTED_STATE_SHA256
+    )
+    if anchor_obj is None:
+        if (
+            head_seq == -1
+            and auth_pending is not None
+            and expected_pending_state_sha256 is not None
+            and not hmac.compare_digest(actual_pend_sha, NO_PENDING_REJECTED_STATE_SHA256)
+            and hmac.compare_digest(expected_pending_state_sha256, actual_pend_sha)
+        ):
+            # Genesis pending catch-up is only allowed after strict binding validation below.
+            pass
+        else:
+            return anchor_obj, anchor_bytes
+    else:
+        exp_anchor_pend = str(anchor_obj["pending_rejected_state_sha256"])
+        if hmac.compare_digest(actual_pend_sha, exp_anchor_pend) and (
+            expected_pending_state_sha256 is None
+            or hmac.compare_digest(expected_pending_state_sha256, exp_anchor_pend)
+        ):
+            return anchor_obj, anchor_bytes
+
+    rej_ds = auth_pending.get("rejected_session_date") if isinstance(auth_pending, Mapping) else None
+    valid_rej_ds = False
+    if isinstance(rej_ds, str) and _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds):
+        try:
+            date.fromisoformat(rej_ds)
+            valid_rej_ds = (head_ds is None or rej_ds > head_ds) and rej_ds <= session_date
+        except ValueError:
+            valid_rej_ds = False
+
+    exp_anchor_pend = (
+        str(anchor_obj["pending_rejected_state_sha256"])
+        if anchor_obj is not None
+        else NO_PENDING_REJECTED_STATE_SHA256
+    )
+    anchor_pend_ds = anchor_obj.get("pending_rejected_session_date") if anchor_obj is not None else None
+
+    def _pos_rev(raw: object) -> int | None:
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1 else None
+
+    pend_rev = _pos_rev(auth_pending.get("pending_revision")) if isinstance(auth_pending, Mapping) else None
+    anchor_pend_rev = _pos_rev(anchor_obj.get("pending_rejected_revision")) if anchor_obj is not None else None
+    cross_day_rev_ok = (
+        pend_rev is None
+        or anchor_pend_rev is None
+        or pend_rev > anchor_pend_rev
+    )
+    monotonic_forward = (
+        anchor_obj is None
+        or hmac.compare_digest(exp_anchor_pend, NO_PENDING_REJECTED_STATE_SHA256)
+        or (
+            isinstance(anchor_pend_ds, str)
+            and valid_rej_ds
+            and (
+                (rej_ds > anchor_pend_ds and cross_day_rev_ok)
+                or (
+                    rej_ds == anchor_pend_ds
+                    and pend_rev is not None
+                    and anchor_pend_rev is not None
+                    and pend_rev > anchor_pend_rev
+                )
+            )
+        )
+    )
+    can_catchup = (
+        auth_pending is not None
+        and valid_rej_ds
+        and monotonic_forward
+        and not hmac.compare_digest(actual_pend_sha, NO_PENDING_REJECTED_STATE_SHA256)
+        and expected_pending_state_sha256 is not None
+        and hmac.compare_digest(expected_pending_state_sha256, actual_pend_sha)
+        and auth_pending.get("chain_id") == chain_id
+        and auth_pending.get("base_sequence") == head_seq
+        and not isinstance(auth_pending.get("base_sequence"), bool)
+        and isinstance(auth_pending.get("base_record_sha256"), str)
+        and hmac.compare_digest(auth_pending["base_record_sha256"], head_sha)
+    )
+    if not can_catchup:
+        raise EngineIdentityError(rollback_err_reason)
+
+    catchup_now = (
+        now_utc_fn()
+        if now_utc_fn is not None
+        else _format_utc_ms(datetime.now(timezone.utc))
+    )
+    _advance_trusted_head_anchor(
+        anchor_resolved,
+        chain_id=chain_id,
+        expected_prior_bytes=anchor_bytes,
+        sequence=head_seq,
+        session_date=head_ds,
+        head_sha256=head_sha,
+        pending_rejected_state_sha256=actual_pend_sha,
+        pending_rejected_session_date=str(rej_ds),
+        pending_rejected_revision=pend_rev,
+        now_utc=catchup_now,
+    )
+    return _load_trusted_head_anchor(anchor_resolved, expected_chain_id=chain_id)
+
+
+def _authenticate_production_history(
+    *,
+    ledger: ShadowLedger,
+    cfg: DrillSchedulerConfig,
+    prior_records: list[dict],
+    session_date: str,
+    expected_prior_head_sha256: str | None,
+    expected_pending_state_sha256: str | None = None,
+    snapshots_dir: Path | None = None,
+    reports_dir: Path | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None,
+    data_dir: Path | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
+    now_utc_fn: Callable[[], str] | None = None,
+) -> tuple[Path | None, bytes | None]:
+    """Fail closed if persisted production history or pending state is unauthenticated before reuse."""
+    if cfg.mode != "production":
+        return None, None
+    anchor_resolved = _validate_trusted_head_anchor_path(
+        trusted_head_anchor_path,
+        data_dir if data_dir is not None else ledger.root_dir.parent,
+    )
+    anchor_obj, anchor_bytes = _load_trusted_head_anchor(
+        anchor_resolved, expected_chain_id=cfg.chain_id
+    )
+    if expected_prior_head_sha256 is not None:
+        if not isinstance(expected_prior_head_sha256, str) or not _HEX64_RE.fullmatch(
+            expected_prior_head_sha256
+        ):
+            raise EngineIdentityError(
+                f"invalid_expected_prior_head_sha256:{expected_prior_head_sha256!r}"
+            )
+    if not prior_records:
+        if expected_prior_head_sha256 is None:
+            raise EngineIdentityError(
+                "production_genesis_unauthenticated: require expected_prior_head_sha256=GENESIS_PREV_HASH"
+            )
+        if not hmac.compare_digest(expected_prior_head_sha256, GENESIS_PREV_HASH):
+            raise EngineIdentityError("production_trusted_head_mismatch:empty_ledger")
+        if anchor_obj is not None:
+            if int(anchor_obj["sequence"]) >= 0:
+                raise EngineIdentityError(
+                    "production_trusted_head_rollback_rejected: empty ledger behind monotonic trusted head anchor"
+                )
+            if not hmac.compare_digest(str(anchor_obj["head_sha256"]), GENESIS_PREV_HASH):
+                raise EngineIdentityError("production_trusted_head_rollback_rejected")
+        if snapshots_dir is not None:
+            auth_pending = authenticate_pending_rejected_state_snapshot(
+                snapshots_dir,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                require_external_pending_auth=True,
+            )
+            anchor_obj, anchor_bytes = _verify_or_catchup_pending_anchor(
+                anchor_resolved=anchor_resolved,
+                anchor_obj=anchor_obj,
+                anchor_bytes=anchor_bytes,
+                chain_id=cfg.chain_id,
+                head_seq=-1,
+                head_ds=None,
+                head_sha=GENESIS_PREV_HASH,
+                session_date=session_date,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                auth_pending=auth_pending,
+                now_utc_fn=now_utc_fn,
+                rollback_err_reason="production_trusted_head_rollback_rejected: pending state behind trusted anchor",
+            )
+            if auth_pending is None and reports_dir is not None:
+                _check_no_unconsumed_pending_rejected_reports(
+                    reports_dir,
+                    head_session_date=None,
+                )
+        return anchor_resolved, anchor_bytes
+
+    if anchor_obj is None:
+        raise EngineIdentityError(
+            "production_trusted_head_anchor_missing: non-empty production ledger requires existing trusted head anchor"
+        )
+    if expected_prior_head_sha256 is None:
+        raise EngineIdentityError(
+            "production_history_unauthenticated: require expected_prior_head_sha256"
+        )
+
+    existing_env = next(
+        (
+            r
+            for r in prior_records
+            if isinstance(r, dict)
+            and isinstance(r.get("record_body"), dict)
+            and r["record_body"].get("session_date") == session_date
+        ),
+        None,
+    )
+    actual_seq = int(prior_records[-1]["record_body"]["sequence"])
+    head_rec_sha = prior_records[-1]["record_sha256"]
+    if existing_env is not None and existing_env["record_body"]["sequence"] != len(prior_records) - 1:
+        raise EngineIdentityError("production_trusted_head_mismatch")
+    if actual_seq < int(anchor_obj["sequence"]):
+        raise EngineIdentityError(
+            f"production_trusted_head_rollback_rejected: ledger sequence {actual_seq} < trusted anchor sequence {anchor_obj['sequence']}"
+        )
+    anchor_seq = int(anchor_obj["sequence"])
+    pend_file = snapshots_dir / "pending_rejected_state.json" if snapshots_dir is not None else None
+    catchup_body = (
+        prior_records[-1].get("record_body")
+        if prior_records and isinstance(prior_records[-1], Mapping)
+        else None
+    )
+    catchup_ds = str(catchup_body.get("session_date") or "") if isinstance(catchup_body, Mapping) else ""
+    superseded_pending_ok = False
+    if pend_file is not None and pend_file.is_file() and catchup_ds:
+        try:
+            p_raw = parse_json_no_duplicates(pend_file.read_text(encoding="utf-8"))
+            superseded_pending_ok = (
+                isinstance(p_raw, Mapping)
+                and p_raw.get("schema_version") == "c-sh-pending-rejected-state-v1"
+                and p_raw.get("chain_id") == cfg.chain_id
+                and isinstance(p_raw.get("base_sequence"), int)
+                and not isinstance(p_raw.get("base_sequence"), bool)
+                and p_raw["base_sequence"] < actual_seq
+                and isinstance(p_raw.get("rejected_session_date"), str)
+                and p_raw["rejected_session_date"] <= catchup_ds
+            )
+        except Exception:
+            superseded_pending_ok = False
+    can_catchup_interrupted_commit = (
+        actual_seq == anchor_seq + 1
+        and isinstance(head_rec_sha, str)
+        and hmac.compare_digest(head_rec_sha, expected_prior_head_sha256)
+        and isinstance(catchup_body, Mapping)
+        and bool(catchup_ds)
+        and hmac.compare_digest(
+            str(catchup_body.get("prev_record_sha256") or ""),
+            str(anchor_obj["head_sha256"]),
+        )
+        and (
+            expected_pending_state_sha256 is None
+            or hmac.compare_digest(expected_pending_state_sha256, NO_PENDING_REJECTED_STATE_SHA256)
+        )
+        and (pend_file is None or not pend_file.is_file() or superseded_pending_ok)
+    )
+    if can_catchup_interrupted_commit:
+        if bitcoin_merkle_roots is not None:
+            ok_credit, credit_issues = ledger.assess_receipt_creditability(
+                bitcoin_merkle_roots=bitcoin_merkle_roots,
+                commitment_deadline_et=cfg.commitment_deadline_et,
+                runtime_config=cfg,
+            )
+            if not ok_credit:
+                raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
+        if superseded_pending_ok and snapshots_dir is not None:
+            _retire_superseded_pending_rejected_state(
+                snapshots_dir,
+                committed_seq=actual_seq,
+                committed_session_date=catchup_ds,
+                expected_chain_id=cfg.chain_id,
+            )
+        catchup_now = (
+            now_utc_fn()
+            if now_utc_fn is not None
+            else _format_utc_ms(datetime.now(timezone.utc))
+        )
+        _advance_trusted_head_anchor(
+            anchor_resolved,
+            chain_id=cfg.chain_id,
+            expected_prior_bytes=anchor_bytes,
+            sequence=actual_seq,
+            session_date=catchup_ds,
+            head_sha256=head_rec_sha,
+            pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+            now_utc=catchup_now,
+        )
+        anchor_obj, anchor_bytes = _load_trusted_head_anchor(
+            anchor_resolved, expected_chain_id=cfg.chain_id
+        )
+    if (
+        anchor_obj is None
+        or actual_seq != int(anchor_obj["sequence"])
+        or not isinstance(head_rec_sha, str)
+        or not hmac.compare_digest(head_rec_sha, str(anchor_obj["head_sha256"]))
+    ):
+        raise EngineIdentityError("production_trusted_head_mismatch:diverges_from_anchor")
+    if not hmac.compare_digest(head_rec_sha, expected_prior_head_sha256):
+        raise EngineIdentityError("production_trusted_head_mismatch")
+
+    if snapshots_dir is not None:
+        if existing_env is None:
+            auth_pending = authenticate_pending_rejected_state_snapshot(
+                snapshots_dir,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                require_external_pending_auth=True,
+            )
+            head_body = prior_records[-1].get("record_body") if isinstance(prior_records[-1], Mapping) else None
+            head_ds = str(head_body.get("session_date")) if isinstance(head_body, Mapping) and head_body.get("session_date") else None
+            anchor_obj, anchor_bytes = _verify_or_catchup_pending_anchor(
+                anchor_resolved=anchor_resolved,
+                anchor_obj=anchor_obj,
+                anchor_bytes=anchor_bytes,
+                chain_id=cfg.chain_id,
+                head_seq=actual_seq,
+                head_ds=head_ds,
+                head_sha=str(head_rec_sha),
+                session_date=session_date,
+                expected_pending_state_sha256=expected_pending_state_sha256,
+                auth_pending=auth_pending,
+                now_utc_fn=now_utc_fn,
+                rollback_err_reason="production_trusted_head_rollback_rejected: pending state diverged from trusted anchor",
+            )
+            if auth_pending is None and reports_dir is not None:
+                _check_no_unconsumed_pending_rejected_reports(
+                    reports_dir,
+                    head_session_date=head_ds,
+                )
+        elif not hmac.compare_digest(
+            str(anchor_obj["pending_rejected_state_sha256"]),
+            NO_PENDING_REJECTED_STATE_SHA256,
+        ):
+            raise EngineIdentityError(
+                "production_trusted_head_rollback_rejected: unexpected pending digest on committed anchor"
+            )
+
+    if bitcoin_merkle_roots is not None:
+        ok_credit, credit_issues = ledger.assess_receipt_creditability(
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
+            commitment_deadline_et=cfg.commitment_deadline_et,
+            runtime_config=cfg,
+        )
+        if not ok_credit:
+            raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
+
+    return anchor_resolved, anchor_bytes
 
 
 def _run_daily_drill_cycle_locked(
@@ -1748,8 +3172,15 @@ def _run_daily_drill_cycle_locked(
     yahoo_symbol_map: Mapping[str, str] | None,
     q_pre_by_inst: Mapping[str, object] | None,
     sigma_by_inst: Mapping[str, str] | None,
+    long_run_vol_by_inst: Mapping[str, str] | None = None,
     revision_seq: int,
     allow_unanchored_on_ots_failure: bool,
+    evaluator: object | None,
+    authorized_events: dict | list | None = None,
+    expected_prior_head_sha256: str | None = None,
+    expected_pending_state_sha256: str | None = None,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    trusted_head_anchor_path: str | Path | None = None,
     _post_ledger_commit_hook: Callable[[], None] | None,
     _post_record_commit_hook: Callable[[], None] | None,
     _post_report_json_hook: Callable[[], None] | None,
@@ -1804,6 +3235,20 @@ def _run_daily_drill_cycle_locked(
     head_env = ledger.head()
     head_hash = head_env["record_sha256"] if head_env is not None else GENESIS_PREV_HASH
     prior_records = ledger.load_records()
+    anchor_resolved, anchor_bytes = _authenticate_production_history(
+        ledger=ledger,
+        cfg=cfg,
+        prior_records=prior_records,
+        session_date=session_date,
+        expected_prior_head_sha256=expected_prior_head_sha256,
+        expected_pending_state_sha256=expected_pending_state_sha256,
+        snapshots_dir=root / "state_snapshots",
+        reports_dir=reports_dir,
+        bitcoin_merkle_roots=bitcoin_merkle_roots,
+        data_dir=root,
+        trusted_head_anchor_path=trusted_head_anchor_path,
+        now_utc_fn=lambda: _format_utc_ms(clock_fn()),
+    )
     prior_streak = _count_consecutive_trading_sessions(
         prior_records,
         session_date,
@@ -1932,6 +3377,15 @@ def _run_daily_drill_cycle_locked(
                 "footprint": check_footprint_budget(root, cfg.max_footprint_bytes),
             }
 
+    _reconcile_uncommitted_staged_snapshots(
+        snapshots_dir=root / "state_snapshots",
+        ledger=ledger,
+        bundle_obj=bundle_obj_validated,
+        prior_records=prior_records,
+        cfg=cfg,
+        spec=spec,
+    )
+
     # 3b. Reconcile already-committed session if completeness report is missing, invalid, or out-of-sync with ledger+bundle
     existing_env = next(
         (
@@ -1981,6 +3435,18 @@ def _run_daily_drill_cycle_locked(
             spec,
             cfg.venue,
             current_appended=True,
+        )
+
+        _reconcile_committed_state_snapshot_if_missing(
+            snapshots_dir=root / "state_snapshots",
+            ledger=ledger,
+            bundle_obj=bundle_obj_validated,
+            prior_records=prior_records,
+            ex_seq=ex_seq,
+            existing_env=existing_env,
+            cfg=cfg,
+            spec=spec,
+            cal=cal,
         )
 
         if _is_committed_session_report_valid(
@@ -2227,7 +3693,10 @@ def _run_daily_drill_cycle_locked(
     )
 
     # Step 1 & 2: Fetch canonical 7-series (with per-provider timestamps) inside [session_close_utc, decision_cutoff_utc]
+    market_deadline, network_deadline = _resolve_cycle_network_deadlines(t_start, cfg)
     required_for_eval = REQUIRED_MARKET_SERIES
+    if cfg.mode == "production" and fixtures_dir is not None:
+        raise ValueError("production_mode_forbids_offline_fixtures")
     if fixtures_dir is not None:
         fixture_ret_utc = _format_utc_ms(clock_fn())
         mkt_recs = emit_market_records_from_fixtures(
@@ -2257,14 +3726,15 @@ def _run_daily_drill_cycle_locked(
             yahoo_symbol_map=eff_yahoo_map,
             session_close_utc=session_close_utc,
             decision_cutoff_utc=decision_cutoff_utc,
-            observation_class="synthetic",
+            observation_class="decision_time_market" if cfg.mode == "production" else "synthetic",
             auto_advance_revision=True,
+            deadline_monotonic=market_deadline if (transport is None and clock is None) else None,
         )
 
     raw_integrity_failures: list[str] = []
     for rec in mkt_recs:
         ok_raw, raw_err = verify_market_record_raw_integrity(
-            archive_dir, rec, session_date=session_date
+            archive_dir, rec, session_date=session_date, calendar_session=cal
         )
         if not ok_raw:
             raw_integrity_failures.append(str(raw_err))
@@ -2272,13 +3742,18 @@ def _run_daily_drill_cycle_locked(
     by_inst = {r["instrument"]: r for r in mkt_recs}
     series_summary = _summarize_required_series(mkt_recs)
 
-    # Step 3: Build notional inputs & evaluate C-FUSE-EVAL stub
+    # Step 3: Build notional inputs & evaluate C-FUSE-EVAL (stub or vendored FUSE-1)
     q_pre_map = dict(q_pre_by_inst or {})
     sig_map = dict(sigma_by_inst or {})
+    lrv_map = (
+        {str(k): v for k, v in long_run_vol_by_inst.items() if v is not None}
+        if long_run_vol_by_inst is not None
+        else None
+    )
     tqqq_close = by_inst.get("TQQQ", {}).get("normalized_value")
     soxl_close = by_inst.get("SOXL", {}).get("normalized_value")
 
-    session_inputs = {
+    session_inputs: dict[str, object] = {
         "E": "50000",
         "E_star": "50000",
         "H": "0",
@@ -2298,11 +3773,31 @@ def _run_daily_drill_cycle_locked(
             },
         },
     }
+    if head_env is not None:
+        prev_bankroll = (
+            head_env.get("record_body", {}).get("bankroll", {})
+            if isinstance(head_env, Mapping)
+            else {}
+        )
+        if isinstance(prev_bankroll, Mapping) and prev_bankroll.get("E") is not None:
+            session_inputs["prior_E"] = str(prev_bankroll["E"])
     eval_inputs = dict(session_inputs)
+    apply_fund_long_run_volatility(eval_inputs, lrv_map)
     eval_inputs["market_records"] = mkt_recs
     eval_inputs["required_series"] = required_for_eval
 
-    ev = StubEvaluator()
+    if evaluator is not None:
+        ev = evaluator
+    elif cfg.mode == "production" or cfg.fuse_engine_hash == PINNED_FUSE_ENGINE_HASH:
+        ev = VendoredFuseEvaluator()
+    else:
+        ev = StubEvaluator()
+
+    if cfg.mode == "production" and is_stub_evaluator(ev):
+        raise StubProductionForbiddenError(
+            "StubEvaluator is structurally forbidden in production forward-clock mode"
+        )
+
     eff_cfg = _effective_runtime_config(
         cfg,
         treasury_endpoint=eff_treasury,
@@ -2315,8 +3810,87 @@ def _run_daily_drill_cycle_locked(
         code_manifest_hash=code_sha,
     )
     seq = len(prior_records)
+    snapshots_dir = root / "state_snapshots"
     prior_state: dict = {}
-    if head_env is not None:
+    prior_row_state_used: dict | None = None
+    prior_rejected_session_date: str | None = None
+    prior_row_state_base_sha256: str | None = None
+    session_base_prior_state: dict = {}
+    prior_o4_resolved_symbols: list[str] = []
+    prior_authorized_events: list[dict] = []
+    prior_pending_revision: int = 0
+    if not is_stub_evaluator(ev):
+        committed_base_state: dict = {}
+        expected_base_prior_sha = _sha256_canonical_state_dict({})
+        if head_env is not None:
+            expected_base_prior_sha = _committed_expected_next_state_sha256(head_env)
+            committed_base_state, _ = load_row_state_snapshot(
+                snapshots_dir,
+                expected_chain_id=cfg.chain_id,
+                expected_engine_hash=ev.engine_hash,
+                expected_spec_version=ev.spec_version,
+                expected_sequence=seq - 1,
+                expected_record_sha256=head_hash,
+                expected_state_sha256=expected_base_prior_sha,
+                allow_missing_at_genesis=False,
+            )
+            if (snapshots_dir / "latest.state.json").is_file():
+                load_row_state_snapshot(
+                    snapshots_dir,
+                    expected_chain_id=cfg.chain_id,
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_sequence=None,
+                    expected_record_sha256=head_hash,
+                    expected_state_sha256=expected_base_prior_sha,
+                    allow_missing_at_genesis=False,
+                )
+        expected_base_sess_date = (
+            str(head_env["record_body"]["session_date"]) if head_env is not None else None
+        )
+        pending_rej = load_pending_rejected_state_snapshot(
+            snapshots_dir,
+            expected_chain_id=cfg.chain_id,
+            expected_base_sequence=seq - 1,
+            expected_base_record_sha256=head_hash,
+            current_session_date=session_date,
+            expected_engine_hash=ev.engine_hash,
+            expected_spec_version=ev.spec_version,
+            expected_base_prior_state_sha256=expected_base_prior_sha,
+            committed_base_prior_row_state=committed_base_state,
+            expected_base_session_date=expected_base_sess_date,
+            expected_pending_state_sha256=expected_pending_state_sha256,
+            require_external_pending_auth=(cfg.mode == "production"),
+        )
+        if pending_rej is not None:
+            prior_state = pending_rej[0]
+            prior_o4_resolved_symbols = [
+                str(s) for s in (pending_rej[1].get("o4_resolved_symbols") or ())
+                if isinstance(s, str) and s
+            ]
+            prior_authorized_events = normalize_pending_authorized_events(
+                pending_rej[1].get("authorized_events")
+            )
+            raw_pend_rev = pending_rej[1].get("pending_revision")
+            prior_pending_revision = (
+                raw_pend_rev
+                if isinstance(raw_pend_rev, int)
+                and not isinstance(raw_pend_rev, bool)
+                and raw_pend_rev >= 1
+                else 1
+            )
+            prior_row_state_used = copy.deepcopy(prior_state)
+            prior_rejected_session_date = str(
+                pending_rej[1].get("rejected_session_date") or session_date
+            )
+            prior_row_state_base_sha256 = expected_base_prior_sha
+            session_base_prior_state = (
+                copy.deepcopy(committed_base_state) if head_env is not None else {}
+            )
+        elif head_env is not None:
+            prior_state = committed_base_state
+            session_base_prior_state = copy.deepcopy(committed_base_state)
+    elif head_env is not None:
         breakers = head_env["record_body"]["evaluator"]["breakers"]
         prior_state = {
             b["id"]: {"state": b["state"], "latched": b["latched"], "reason": b["reason"]}
@@ -2324,6 +3898,27 @@ def _run_daily_drill_cycle_locked(
         }
 
     decision_utc = _format_utc_ms(clock_fn())
+    prior_closes: dict[str, str] = {}
+    pos_src: dict[str, object] | None = None
+    brk_src: dict[str, object] | None = None
+    if not is_stub_evaluator(ev):
+        prior_closes = _extract_prior_session_closes(
+            archive_dir=archive_dir,
+            mkt_recs=mkt_recs,
+            session_date=session_date,
+            bundle_obj=bundle_obj_validated,
+            cal=cal,
+            spec=spec,
+            venue=cfg.venue,
+        )
+        if prior_closes:
+            eval_inputs["prior_closes"] = prior_closes
+        # Explicit Stage-N notional source records when operating without live broker execution (H='0', orders_placed=0)
+        pos_src = {"as_of": decision_utc, "age_sessions": 0}
+        brk_src = {"as_of": decision_utc, "age_sessions": 0}
+        eval_inputs["positions_source_record"] = pos_src
+        eval_inputs["broker_reconciliation_source_record"] = brk_src
+
     if raw_integrity_failures:
         built = {
             "appended": False,
@@ -2345,29 +3940,82 @@ def _run_daily_drill_cycle_locked(
             },
         }
     else:
-        eval_inputs["calendar"] = cal
-        rows_by_id, eff_scope, next_state = ev.evaluate(
-            spec_version=ev.spec_version,
-            engine_hash=ev.engine_hash,
-            policy_hash=p_hash,
-            session=session_date,
-            as_of=decision_utc,
-            mode=cfg.mode,
-            validated_inputs=eval_inputs,
-            prior_row_state=prior_state,
-            authorized_events=None,
+        rows_by_tier: dict[str, dict] | None = None
+        if is_stub_evaluator(ev):
+            eval_inputs["calendar"] = cal
+            ev_validated = eval_inputs
+            ev_mode = cfg.mode
+            rows_by_id, eff_scope, next_state = ev.evaluate(
+                spec_version=ev.spec_version,
+                engine_hash=ev.engine_hash,
+                policy_hash=p_hash,
+                session=session_date,
+                as_of=decision_utc,
+                mode=ev_mode,
+                validated_inputs=ev_validated,
+                prior_row_state=prior_state,
+                authorized_events=authorized_events,
+            )
+            o4_resolved: list[str] = []
+        else:
+            tiered_eval = evaluate_non_stub_tiers(
+                evaluator=ev,
+                session_inputs=eval_inputs,
+                calendar_session=cal,
+                policy_hash=p_hash,
+                session_date=session_date,
+                decision_timestamp_utc=decision_utc,
+                prior_row_state=prior_state,
+                authorized_events=authorized_events,
+            )
+            rows_by_id = tiered_eval["rows_by_id"]
+            eff_scope = tiered_eval["effective_state_by_scope"]
+            next_state = tiered_eval["next_row_state"]
+            rows_by_tier = tiered_eval["rows_by_tier"]
+            o4_resolved = tiered_eval["o4_resolved_symbols"]
+        blocked, blocking_o1, blocking_o2 = resolve_blocking_validation_outputs(
+            rows_by_id, rows_by_tier
         )
-        if rows_by_id["O1"]["would_have_tripped"] or rows_by_id["O2"]["would_have_tripped"]:
+        if blocked:
             built = {
                 "appended": False,
                 "fail_closed": True,
-                "o1_output": rows_by_id["O1"],
-                "o2_output": rows_by_id["O2"],
+                "o1_output": blocking_o1,
+                "o2_output": blocking_o2,
                 "effective_state_by_scope": eff_scope,
                 "next_row_state": next_state,
+                "o4_resolved_symbols": o4_resolved,
             }
         else:
             mkt_digest = sha256_canonical(mkt_recs)
+            cycle_inputs = (
+                dict(session_inputs)
+                if is_stub_evaluator(ev)
+                else {
+                    **session_inputs,
+                    "market_records": mkt_recs,
+                    "required_series": required_for_eval,
+                    "positions_source_record": pos_src,
+                    "broker_reconciliation_source_record": brk_src,
+                    **({"prior_closes": prior_closes} if prior_closes else {}),
+                }
+            )
+            if authorized_events is not None:
+                cycle_inputs["authorized_events"] = copy.deepcopy(authorized_events)
+            apply_fund_long_run_volatility(cycle_inputs, lrv_map)
+            cycle_labels = (
+                {
+                    "production_chain": True,
+                    "soxl_basis": SOXL_PROXY_LABEL,
+                    "forward_clock_credit_eligible": True,
+                }
+                if cfg.mode == "production"
+                else {
+                    "drill_chain": True,
+                    "soxl_basis": SOXL_PROXY_LABEL,
+                    "forward_clock_credit_eligible": False,
+                }
+            )
             built = build_record_body(
                 chain_id=cfg.chain_id,
                 sequence=seq,
@@ -2375,24 +4023,91 @@ def _run_daily_drill_cycle_locked(
                 mode=cfg.mode,
                 session_date=session_date,
                 decision_timestamp_utc=decision_utc,
-                session_inputs=session_inputs,
+                session_inputs=cycle_inputs,
                 calendar_session=cal,
                 code_version_sha=code_sha,
                 evaluator=ev,
                 prior_row_state=prior_state,
-                discipline_labels={
-                    "drill_chain": True,
-                    "soxl_basis": SOXL_PROXY_LABEL,
-                    "forward_clock_credit_eligible": False,
-                },
+                discipline_labels=cycle_labels,
                 market_records_digest=mkt_digest,
                 runtime_config=eff_cfg,
                 calendar_spec=spec,
             )
 
+    def _persist_pending_rejected_state() -> str | None:
+        nonlocal anchor_bytes
+        if is_stub_evaluator(ev) or not isinstance(built.get("next_row_state"), dict):
+            return None
+        merged_o4_resolved = sorted(
+            set(prior_o4_resolved_symbols)
+            | {
+                str(s)
+                for s in (built.get("o4_resolved_symbols") or ())
+                if isinstance(s, str) and s
+            }
+        )
+        merged_authorized_events = normalize_pending_authorized_events(
+            prior_authorized_events + normalize_pending_authorized_events(authorized_events)
+        )
+        next_pending_revision = prior_pending_revision + 1
+        pending_payload = build_pending_rejected_state_payload(
+            chain_id=cfg.chain_id,
+            base_sequence=seq - 1,
+            base_record_sha256=head_hash,
+            rejected_session_date=session_date,
+            engine_hash=ev.engine_hash,
+            spec_version=ev.spec_version,
+            next_row_state=built["next_row_state"],
+            base_prior_row_state=session_base_prior_state,
+            o4_resolved_symbols=merged_o4_resolved,
+            authorized_events=merged_authorized_events or None,
+            pending_revision=next_pending_revision,
+        )
+        ledger.assert_active_chain_lease()
+        save_pending_rejected_state_snapshot(
+            snapshots_dir,
+            chain_id=cfg.chain_id,
+            base_sequence=seq - 1,
+            base_record_sha256=head_hash,
+            rejected_session_date=session_date,
+            engine_hash=ev.engine_hash,
+            spec_version=ev.spec_version,
+            next_row_state=built["next_row_state"],
+            base_prior_row_state=session_base_prior_state,
+            o4_resolved_symbols=merged_o4_resolved,
+            authorized_events=merged_authorized_events or None,
+            pending_revision=next_pending_revision,
+        )
+        pending_sha_val = compute_pending_rejected_state_sha256(pending_payload)
+        if anchor_resolved is not None:
+            prior_head_ds = (
+                str(prior_records[-1]["record_body"]["session_date"])
+                if prior_records
+                else None
+            )
+            ledger.assert_active_chain_lease()
+            _advance_trusted_head_anchor(
+                anchor_resolved,
+                chain_id=cfg.chain_id,
+                expected_prior_bytes=anchor_bytes,
+                sequence=seq - 1,
+                session_date=prior_head_ds,
+                head_sha256=head_hash,
+                pending_rejected_state_sha256=pending_sha_val,
+                pending_rejected_session_date=session_date,
+                pending_rejected_revision=next_pending_revision,
+                now_utc=_format_utc_ms(clock_fn()),
+            )
+            _, anchor_bytes = _load_trusted_head_anchor(
+                anchor_resolved,
+                expected_chain_id=cfg.chain_id,
+            )
+        return pending_sha_val
+
     if not built["appended"]:
+        pending_sha = _persist_pending_rejected_state()
         fail_reason = built["o1_output"].get("reason") or built.get("o2_output", {}).get("reason")
-        return _build_fail_closed_result(
+        fail_res = _build_fail_closed_result(
             t_start=t_start,
             root=root,
             reports_dir=reports_dir,
@@ -2408,8 +4123,10 @@ def _run_daily_drill_cycle_locked(
             fail_reason=str(fail_reason),
             required_series=series_summary,
             receipt_status="not_applicable_fail_closed",
-            receipt_reasons=["fail_closed_no_append", "drill_mode"],
+            receipt_reasons=["fail_closed_no_append", f"{cfg.mode}_mode"],
+            pending_rejected_state_sha256=pending_sha,
         )
+        return fail_res
 
     # Step 4: Obtain detached OTS receipt, check real post-stamp wall-clock, commit atomically
     body = built["record_body"]
@@ -2418,6 +4135,7 @@ def _run_daily_drill_cycle_locked(
         calendars=cfg.ots_calendars,
         transport=ots_transport,
         timeout=cfg.ots_timeout_seconds,
+        deadline_monotonic=network_deadline if (ots_client is None and ots_transport is None) else None,
     )
 
     ots_bytes: bytes | None = None
@@ -2431,8 +4149,9 @@ def _run_daily_drill_cycle_locked(
     rcp_obtained_utc = post_stamp_utc
 
     if post_stamp_utc > deadline_utc:
+        pending_sha = _persist_pending_rejected_state()
         fail_reason = "late_after_commitment_deadline_backfill_rejected"
-        return _build_fail_closed_result(
+        fail_res = _build_fail_closed_result(
             t_start=t_start,
             root=root,
             reports_dir=reports_dir,
@@ -2451,12 +4170,20 @@ def _run_daily_drill_cycle_locked(
             receipt_status="late_backfill_rejected",
             receipt_obtained_at_utc=rcp_obtained_utc,
             receipt_reasons=[fail_reason, "drill_mode"],
+            pending_rejected_state_sha256=pending_sha,
         )
+        return fail_res
 
     if ots_bytes is None and not allow_unanchored_on_ots_failure:
-        raise RuntimeError(f"OTS receipt acquisition failed: {ots_error}")
+        pending_sha = _persist_pending_rejected_state()
+        suffix = (
+            f" (pending_rejected_state_sha256={pending_sha})"
+            if pending_sha is not None
+            else ""
+        )
+        raise RuntimeError(f"OTS receipt acquisition failed: {ots_error}{suffix}")
 
-    session_entry = {
+    session_entry: dict[str, object] = {
         "session_date": session_date,
         "decision_timestamp_utc": decision_utc,
         "inputs": session_inputs,
@@ -2464,6 +4191,27 @@ def _run_daily_drill_cycle_locked(
         "market_records_digest": sha256_canonical(mkt_recs),
         "market_records": mkt_recs,
     }
+    if not is_stub_evaluator(ev):
+        fctx: dict[str, object] = {
+            "prior_closes": prior_closes,
+            "positions_source_record": pos_src,
+            "broker_reconciliation_source_record": brk_src,
+        }
+        if prior_row_state_used is not None:
+            fctx["prior_row_state_used"] = prior_row_state_used
+            if prior_row_state_base_sha256 is not None:
+                fctx["prior_row_state_base_sha256"] = prior_row_state_base_sha256
+            if prior_rejected_session_date is not None:
+                fctx["prior_rejected_session_date"] = prior_rejected_session_date
+            if prior_o4_resolved_symbols:
+                fctx["prior_o4_resolved_symbols"] = list(prior_o4_resolved_symbols)
+            if prior_authorized_events:
+                fctx["prior_authorized_events"] = copy.deepcopy(prior_authorized_events)
+        if authorized_events is not None:
+            fctx["authorized_events"] = copy.deepcopy(authorized_events)
+        if lrv_map:
+            fctx["long_run_vol_by_inst"] = copy.deepcopy(lrv_map)
+        session_entry["fuse_context"] = fctx
     env = _commit_drill_session_atomically(
         ledger=ledger,
         seq=seq,
@@ -2480,6 +4228,15 @@ def _run_daily_drill_cycle_locked(
         archive_dir=archive_dir,
         session_entry=session_entry,
         post_ledger_hook=_post_ledger_commit_hook,
+        snapshots_dir=None if is_stub_evaluator(ev) else snapshots_dir,
+        next_row_state=None if is_stub_evaluator(ev) else built["next_row_state"],
+        engine_hash=None if is_stub_evaluator(ev) else ev.engine_hash,
+        spec_version=None if is_stub_evaluator(ev) else ev.spec_version,
+        trusted_head_anchor_path=anchor_resolved,
+        expected_prior_anchor_bytes=anchor_bytes,
+        anchor_updated_at_utc=(
+            _format_utc_ms(clock_fn()) if anchor_resolved is not None else None
+        ),
     )
     if _post_record_commit_hook is not None:
         _post_record_commit_hook()
@@ -2573,6 +4330,10 @@ def detect_missed_runs(
     if spec["rules"]["calendar_version"] != cfg.calendar_version:
         raise CalendarCoverageError(
             f"calendar_coverage_insufficient: configured {cfg.calendar_version} != loaded {spec['rules']['calendar_version']}"
+        )
+    if cfg.calendar_spec_digest is not None and spec.get("spec_digest") != cfg.calendar_spec_digest:
+        raise CalendarCoverageError(
+            f"calendar_coverage_insufficient: configured spec_digest {cfg.calendar_spec_digest} != loaded {spec.get('spec_digest')}"
         )
     if cfg.venue != spec["rules"]["exchange"]:
         raise CalendarCoverageError(
@@ -3165,6 +4926,17 @@ def _resolve_auto_run_target(
                         ledger=ledger,
                         expected_consecutive_count=expected_consecutive,
                     ):
+                        _reconcile_committed_state_snapshot_if_missing(
+                            snapshots_dir=Path(data_dir) / "state_snapshots",
+                            ledger=ledger,
+                            bundle_obj=bundle_obj,
+                            prior_records=prior_records,
+                            ex_seq=ex_seq,
+                            existing_env=committed_env,
+                            cfg=cfg,
+                            spec=spec,
+                            cal=today_cal,
+                        )
                         return None, {
                             "status": "already_committed_no_op",
                             "ny_date": ny_today,

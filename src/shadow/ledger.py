@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+import copy
+import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import date, datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
-from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator
+from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator, StubProductionForbiddenError
+from shadow.fuse_adapter import (
+    EngineIdentityError,
+    PINNED_FUSE_ENGINE_HASH,
+    PINNED_FUSE_SPEC_VERSION,
+    build_fuse_validated_inputs,
+    is_stub_evaluator,
+    resolve_account_and_fund_control_states,
+    resolve_aggregate_control_state,
+    serialize_breakers_for_ledger,
+)
 from shadow.manifest import compute_code_manifest_hash, load_effective_runtime_config
 from shadow.ots import OtsFormatError, parse_ots_proof, verify_ots_bytes
 from shadow.sizing import (
@@ -27,6 +41,7 @@ from shadow.sizing import (
 )
 
 GENESIS_PREV_HASH = "0" * 64
+NO_PENDING_REJECTED_STATE_SHA256 = GENESIS_PREV_HASH
 SCHEMA_VERSION = "c-sh-ledger-v1"
 _NY_TZ = ZoneInfo("America/New_York")
 
@@ -77,6 +92,10 @@ class CanonicalizationError(ValueError):
 
 class LedgerAppendError(ValueError):
     """Raised when an append violates chain rules (duplicate, fork, gap, invalid body)."""
+
+
+class ChainConcurrencyConflictError(RuntimeError):
+    """Raised when another writer holds an active cross-instance chain lease."""
 
 
 def is_canonical_decimal_str(value: object) -> bool:
@@ -184,6 +203,8 @@ def validate_record_body(body: dict) -> None:
 
     if body["mode"] not in ("drill", "reconstruction", "production"):
         raise CanonicalizationError(f"Unsupported mode: {body['mode']!r}")
+    if body["mode"] == "production" and body.get("observation_class") == "synthetic":
+        raise CanonicalizationError("Synthetic observation_class is structurally forbidden in production mode")
     if body["mode"] == "production" and str(body.get("engine_hash", "")).startswith("stub-"):
         raise CanonicalizationError("Stub engine_hash is structurally forbidden in production mode")
     ev_obj = body.get("evaluator")
@@ -199,6 +220,18 @@ def validate_record_body(body: dict) -> None:
         raise CanonicalizationError("evaluator.engine_hash must match record engine_hash")
     if body["mode"] == "production" and ev_obj["engine_hash"].startswith("stub-"):
         raise CanonicalizationError("Stub evaluator.engine_hash is structurally forbidden in production mode")
+    is_legacy_stub_or_sh1_fixture = (
+        ev_obj["engine_hash"].startswith("stub-")
+        or ev_obj["spec_version"] == "c-fuse-eval-stub-v1"
+    )
+    if "next_row_state_sha256" in ev_obj:
+        nrs_sha = ev_obj.get("next_row_state_sha256")
+        if not isinstance(nrs_sha, str) or not _HEX64_RE.fullmatch(nrs_sha):
+            raise CanonicalizationError("evaluator.next_row_state_sha256 must be 64 lowercase hex chars")
+    elif not is_legacy_stub_or_sh1_fixture:
+        raise CanonicalizationError(
+            "evaluator.next_row_state_sha256 is required for non-stub evaluator records"
+        )
     if not isinstance(body["sequence"], int) or isinstance(body["sequence"], bool) or body["sequence"] < 0:
         raise CanonicalizationError(f"Invalid sequence: {body['sequence']!r}")
     for hex_field in (
@@ -598,6 +631,183 @@ def compute_inputs_digest(
     return sha256_canonical(canonical_inputs_snapshot)
 
 
+def o1_blocks_session_commit(o1_output: Mapping[str, Any]) -> bool:
+    """Return True when O1 tripped on missing/stale/invalid input, allowing FUSE-1 B3 clearing_period."""
+    return bool(o1_output.get("would_have_tripped")) and o1_output.get("reason") != "clearing_period"
+
+
+def resolve_blocking_validation_outputs(
+    rows_by_id: Mapping[str, Any],
+    rows_by_tier: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[bool, Mapping[str, Any], Mapping[str, Any]]:
+    """Check primary and every emitted tier for blocking O1/O2 failures before sizing."""
+    primary_o1 = rows_by_id["O1"]
+    primary_o2 = rows_by_id["O2"]
+    primary_o1_blocks = o1_blocks_session_commit(primary_o1)
+    primary_o2_blocks = bool(primary_o2.get("would_have_tripped"))
+    if primary_o1_blocks or primary_o2_blocks:
+        return True, primary_o1, primary_o2
+    if isinstance(rows_by_tier, Mapping):
+        for tier_rows in rows_by_tier.values():
+            if not isinstance(tier_rows, Mapping):
+                continue
+            t_o1 = tier_rows.get("O1")
+            t_o2 = tier_rows.get("O2")
+            t_o1_blocks = isinstance(t_o1, Mapping) and o1_blocks_session_commit(t_o1)
+            t_o2_blocks = isinstance(t_o2, Mapping) and bool(t_o2.get("would_have_tripped"))
+            if t_o1_blocks or t_o2_blocks:
+                return (
+                    True,
+                    t_o1 if t_o1_blocks and isinstance(t_o1, Mapping) else primary_o1,
+                    t_o2 if t_o2_blocks and isinstance(t_o2, Mapping) else primary_o2,
+                )
+    return False, primary_o1, primary_o2
+
+
+def _sha256_canonical_state_dict(state_obj: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            state_obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _extract_o4_resolved_symbols(
+    o4_row: Mapping[str, Any] | object,
+    prior_state: Mapping[str, Any] | None,
+    next_state: Mapping[str, Any] | None,
+) -> list[str]:
+    """Identify O4 symbols legitimately cleared by a definitive terminal status or authorized re-arm."""
+    if not isinstance(prior_state, Mapping) or not isinstance(prior_state.get("O4"), Mapping):
+        return []
+    if not isinstance(o4_row, Mapping):
+        return []
+    terminal_reasons = (
+        "original_order_terminal_status_received",
+        "order_filled",
+        "authorized_rearm",
+    )
+    reason_raw = str(o4_row.get("reason") or "")
+    reason_by_sym: dict[str, str] = {}
+    if ":" in reason_raw:
+        for part in reason_raw.split(","):
+            if ":" in part:
+                s_key, s_val = part.split(":", 1)
+                reason_by_sym[s_key.strip()] = s_val.strip()
+    prior_o4 = prior_state["O4"]
+    next_o4 = next_state.get("O4") if isinstance(next_state, Mapping) else None
+    outputs = o4_row.get("outputs") if isinstance(o4_row.get("outputs"), Mapping) else None
+    resolved: list[str] = []
+    for sym, cs in prior_o4.items():
+        if not isinstance(cs, Mapping) or "original_order_id" not in cs:
+            continue
+        if isinstance(next_o4, Mapping) and sym in next_o4:
+            continue
+        sym_out = outputs.get(sym) if isinstance(outputs, Mapping) else None
+        sym_reason = (
+            str(sym_out.get("reason") or "")
+            if isinstance(sym_out, Mapping)
+            else reason_by_sym.get(str(sym), reason_raw)
+        )
+        if sym_reason in terminal_reasons:
+            resolved.append(str(sym))
+    return sorted(resolved)
+
+
+def evaluate_non_stub_tiers(
+    *,
+    evaluator: object,
+    session_inputs: Mapping[str, Any],
+    calendar_session: dict,
+    policy_hash: str,
+    session_date: str,
+    decision_timestamp_utc: str,
+    prior_row_state: Mapping[str, Any] | None,
+    authorized_events: object | None = None,
+) -> dict[str, Any]:
+    """Evaluate all 3 sizing tiers with vendored FUSE-1 while preserving the primary tier's outputs."""
+    primary_tier = str(session_inputs.get("tier") or "balanced")
+    prior = prior_row_state if prior_row_state is not None else {}
+    prior_by_tier = prior.get("_by_tier") if isinstance(prior.get("_by_tier"), Mapping) else {}
+    clean_base_prior = {k: v for k, v in prior.items() if k != "_by_tier"}
+    primary_tier_change = (
+        session_inputs.get("tier_change_event")
+        if isinstance(session_inputs.get("tier_change_event"), Mapping)
+        else None
+    )
+
+    tiers_to_eval = list(TIER_ORDER)
+    if primary_tier not in TIER_ORDER:
+        tiers_to_eval.append(primary_tier)
+
+    rows_by_tier: dict[str, dict] = {}
+    eff_scope_by_tier: dict[str, dict[str, str]] = {}
+    next_state_by_tier: dict[str, dict] = {}
+    for tier_id in tiers_to_eval:
+        tier_inputs = dict(session_inputs)
+        tier_inputs["tier"] = tier_id
+        if (
+            tier_id != primary_tier
+            and primary_tier_change is not None
+            and primary_tier_change.get("to") == primary_tier
+        ):
+            tier_inputs.pop("tier_change_event", None)
+        tier_prior_raw = prior_by_tier.get(tier_id)
+        tier_prior = (
+            {k: v for k, v in tier_prior_raw.items() if k != "_by_tier"}
+            if isinstance(tier_prior_raw, Mapping)
+            else copy.deepcopy(clean_base_prior)
+        )
+        eval_inputs = build_fuse_validated_inputs(
+            tier_inputs,
+            calendar_session,
+            policy_hash=policy_hash,
+            session_date=session_date,
+            as_of=decision_timestamp_utc,
+        )
+        t_rows, t_eff, t_next = evaluator.evaluate(  # type: ignore[attr-defined]
+            spec_version=evaluator.spec_version,  # type: ignore[attr-defined]
+            engine_hash=evaluator.engine_hash,  # type: ignore[attr-defined]
+            policy_hash=policy_hash,
+            session=session_date,
+            as_of=decision_timestamp_utc,
+            mode="shadow",
+            validated_inputs=eval_inputs,
+            prior_row_state=tier_prior,
+            authorized_events=authorized_events,
+        )
+        rows_by_tier[tier_id] = t_rows
+        eff_scope_by_tier[tier_id] = t_eff
+        next_state_by_tier[tier_id] = (
+            {k: v for k, v in t_next.items() if k != "_by_tier"}
+            if isinstance(t_next, dict)
+            else {}
+        )
+
+    rows_by_id = rows_by_tier[primary_tier]
+    eff_scope = eff_scope_by_tier[primary_tier]
+    next_state = copy.deepcopy(next_state_by_tier[primary_tier])
+    next_state["_by_tier"] = copy.deepcopy(next_state_by_tier)
+    o4_resolved_symbols = _extract_o4_resolved_symbols(
+        rows_by_id.get("O4"),
+        clean_base_prior,
+        next_state_by_tier[primary_tier],
+    )
+    return {
+        "primary_tier": primary_tier,
+        "rows_by_id": rows_by_id,
+        "effective_state_by_scope": eff_scope,
+        "next_row_state": next_state,
+        "rows_by_tier": rows_by_tier,
+        "eff_scope_by_tier": eff_scope_by_tier,
+        "o4_resolved_symbols": o4_resolved_symbols,
+    }
+
+
 def build_record_body(
     *,
     chain_id: str,
@@ -609,7 +819,7 @@ def build_record_body(
     session_inputs: dict,
     calendar_session: dict,
     code_version_sha: str,
-    evaluator: StubEvaluator | None = None,
+    evaluator: object | None = None,
     prior_row_state: dict | None = None,
     discipline_labels: dict | None = None,
     market_records_digest: str | None = None,
@@ -618,6 +828,10 @@ def build_record_body(
 ) -> dict:
     """Run evaluator + sizing and assemble a canonical record_body (or O1/O2 fail-closed dict)."""
     ev = evaluator if evaluator is not None else StubEvaluator()
+    if mode == "production" and is_stub_evaluator(ev):
+        raise StubProductionForbiddenError(
+            "Production mode structurally forbids StubEvaluator and requires vendored FUSE-1"
+        )
     p_hash = policy_config_hash(
         runtime_config=runtime_config,
         calendar_spec=calendar_spec or calendar_session,
@@ -625,48 +839,124 @@ def build_record_body(
     )
     prior = prior_row_state if prior_row_state is not None else {}
 
-    eval_inputs = dict(session_inputs)
-    eval_inputs["calendar"] = calendar_session
-    rows_by_id, eff_scope, next_state = ev.evaluate(
-        spec_version=ev.spec_version,
-        engine_hash=ev.engine_hash,
-        policy_hash=p_hash,
-        session=session_date,
-        as_of=decision_timestamp_utc,
-        mode=mode,
-        validated_inputs=eval_inputs,
-        prior_row_state=prior,
-        authorized_events=None,
-    )
+    rows_by_tier: dict[str, dict] | None = None
+    eff_scope_by_tier: dict[str, dict[str, str]] | None = None
+    o4_resolved_symbols: list[str] = []
 
-    if rows_by_id["O1"]["would_have_tripped"] or rows_by_id["O2"]["would_have_tripped"]:
+    if is_stub_evaluator(ev):
+        eval_inputs = dict(session_inputs)
+        eval_inputs["calendar"] = calendar_session
+        eval_mode = mode
+        auth_events = None
+        rows_by_id, eff_scope, next_state = ev.evaluate(
+            spec_version=ev.spec_version,
+            engine_hash=ev.engine_hash,
+            policy_hash=p_hash,
+            session=session_date,
+            as_of=decision_timestamp_utc,
+            mode=eval_mode,
+            validated_inputs=eval_inputs,
+            prior_row_state=prior,
+            authorized_events=auth_events,
+        )
+    else:
+        tiered_eval = evaluate_non_stub_tiers(
+            evaluator=ev,
+            session_inputs=session_inputs,
+            calendar_session=calendar_session,
+            policy_hash=p_hash,
+            session_date=session_date,
+            decision_timestamp_utc=decision_timestamp_utc,
+            prior_row_state=prior,
+            authorized_events=session_inputs.get("authorized_events"),
+        )
+        rows_by_id = tiered_eval["rows_by_id"]
+        eff_scope = tiered_eval["effective_state_by_scope"]
+        next_state = tiered_eval["next_row_state"]
+        rows_by_tier = tiered_eval["rows_by_tier"]
+        eff_scope_by_tier = tiered_eval["eff_scope_by_tier"]
+        o4_resolved_symbols = tiered_eval["o4_resolved_symbols"]
+
+    blocked, blocking_o1, blocking_o2 = resolve_blocking_validation_outputs(rows_by_id, rows_by_tier)
+    if blocked:
         return {
             "appended": False,
             "fail_closed": True,
-            "o1_output": rows_by_id["O1"],
-            "o2_output": rows_by_id["O2"],
+            "o1_output": blocking_o1,
+            "o2_output": blocking_o2,
             "effective_state_by_scope": eff_scope,
             "next_row_state": next_state,
+            "o4_resolved_symbols": o4_resolved_symbols,
         }
 
     if canonical_decimal_str(session_inputs.get("H", "0")) != "0":
         raise CanonicalizationError("Stage N ledger boundary requires H == '0'")
 
+    account_state, fund_states, overall_state = resolve_account_and_fund_control_states(
+        eff_scope, INSTRUMENT_ORDER
+    )
+    tier_control_states: dict[str, tuple[str, Mapping[str, str] | None]] | None = None
+    if eff_scope_by_tier is not None:
+        tier_control_states = {}
+        for tier_id in TIER_ORDER:
+            t_acct, t_funds, _ = resolve_account_and_fund_control_states(
+                eff_scope_by_tier[tier_id], INSTRUMENT_ORDER
+            )
+            tier_control_states[tier_id] = (t_acct, t_funds)
+
     sizing_res = compute_session_sizing(
         session_inputs,
-        active_control_state=eff_scope["aggregate"],
+        active_control_state=account_state,
+        fund_control_states=fund_states,
+        tier_control_states=tier_control_states,
     )
 
     inputs_digest = compute_inputs_digest(
         session_inputs,
         w_ref=sizing_res["bankroll"]["W_ref"],
-        active_control_state=eff_scope["aggregate"],
+        active_control_state=overall_state,
         market_records_digest=market_records_digest,
         session_date=session_date,
     )
 
-    obs_class = "historical_reconstruction" if mode == "reconstruction" else "synthetic"
-    ledger_mode = "stage_n_reconstruction" if mode == "reconstruction" else "stage_n_notional"
+    if mode == "production":
+        obs_class = "decision_time_market"
+        ledger_mode = "stage_n_production"
+    elif mode == "reconstruction":
+        obs_class = "historical_reconstruction"
+        ledger_mode = "stage_n_reconstruction"
+    else:
+        obs_class = "synthetic"
+        ledger_mode = "stage_n_notional"
+
+    forward_credit = bool(
+        mode == "production"
+        and getattr(ev, "production_clock_capable", False) is True
+        and not (
+            isinstance(discipline_labels, dict)
+            and discipline_labels.get("forward_clock_credit_eligible") is False
+        )
+    )
+    serialized_breakers = serialize_breakers_for_ledger(rows_by_id)
+
+    evaluator_block: dict[str, object] = {
+        "spec_version": ev.spec_version,
+        "engine_hash": ev.engine_hash,
+        "effective_state_by_scope": eff_scope,
+        "breakers": serialized_breakers,
+    }
+    if rows_by_tier is not None and eff_scope_by_tier is not None:
+        evaluator_block["by_tier"] = {
+            tier_id: {
+                "effective_state_by_scope": eff_scope_by_tier[tier_id],
+                "breakers": serialize_breakers_for_ledger(rows_by_tier[tier_id]),
+            }
+            for tier_id in TIER_ORDER
+        }
+    if not is_stub_evaluator(ev):
+        evaluator_block["next_row_state_sha256"] = _sha256_canonical_state_dict(
+            next_state if isinstance(next_state, dict) else {}
+        )
 
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -690,16 +980,11 @@ def build_record_body(
         "raw_vs_adjusted": sizing_res["raw_vs_adjusted"],
         "monthly_diagnostic": sizing_res["monthly_diagnostic"],
         "tiers": sizing_res["tiers"],
-        "evaluator": {
-            "spec_version": ev.spec_version,
-            "engine_hash": ev.engine_hash,
-            "effective_state_by_scope": eff_scope,
-            "breakers": [rows_by_id[bid] for bid in ALL_BREAKER_IDS],
-        },
+        "evaluator": evaluator_block,
         "assertions": {
             "B0": "50000",
             "H": sizing_res["bankroll"]["H"],
-            "forward_clock_credit_eligible": False,
+            "forward_clock_credit_eligible": forward_credit,
             "kelly_applied": False,
             "loss_controls_armed": False,
             "orders_placed": 0,
@@ -749,12 +1034,103 @@ def check_forward_clock_credit(
     config_path: str | Path | None = None,
     calendar_spec: dict | None = None,
     spec_dir: str | Path | None = None,
+    expected_engine_hash: str | None = None,
+    expected_spec_version: str | None = None,
+    production_chain_locked: bool | None = None,
 ) -> tuple[bool, list[str]]:
     """Determine whether a ledger record sequence is eligible for CLK-01..04 forward credit."""
     reasons: list[str] = []
     if not records:
+        if production_chain_locked is True:
+            reasons.append("production_chain_locked")
         reasons.append("empty_chain")
         return False, reasons
+
+    eff_expected_engine_hash = expected_engine_hash
+    eff_expected_spec_version = expected_spec_version
+    eff_locked = production_chain_locked
+
+    if config_path is not None:
+        cfg_file = Path(config_path)
+        if not cfg_file.is_file():
+            reasons.append("missing_production_config")
+            eff_locked = True
+            if eff_expected_engine_hash is None:
+                eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+            if eff_expected_spec_version is None:
+                eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+        else:
+            try:
+                raw_cfg = parse_json_no_duplicates(cfg_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                reasons.append(f"invalid_production_config:{exc}")
+                raw_cfg = None
+            if not isinstance(raw_cfg, dict) or raw_cfg.get("mode") != "production":
+                bad_mode = raw_cfg.get("mode") if isinstance(raw_cfg, dict) else "invalid"
+                reasons.append(f"non_production_config_rejected:{bad_mode}")
+                eff_locked = True
+                if eff_expected_engine_hash is None:
+                    eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+                if eff_expected_spec_version is None:
+                    eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+            elif raw_cfg.get("production_mode_forbidden") is True or (
+                "production_mode_forbidden" in raw_cfg
+                and not isinstance(raw_cfg.get("production_mode_forbidden"), bool)
+            ):
+                reasons.append("non_production_config_rejected:production_mode_forbidden")
+                eff_locked = True
+                if eff_expected_engine_hash is None:
+                    eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+                if eff_expected_spec_version is None:
+                    eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+            else:
+                if eff_locked is None:
+                    eff_locked = not (
+                        raw_cfg.get("production_chain_locked") is False
+                        and raw_cfg.get("clk01_active") is True
+                    )
+                if eff_expected_engine_hash is None:
+                    eh = raw_cfg.get("fuse_engine_hash")
+                    eff_expected_engine_hash = eh if isinstance(eh, str) and eh else "__MISSING__"
+                if eff_expected_spec_version is None:
+                    sv = raw_cfg.get("fuse_spec_version")
+                    eff_expected_spec_version = sv if isinstance(sv, str) and sv else "__MISSING__"
+    else:
+        first_body = (
+            records[0].get("record_body", records[0])
+            if isinstance(records[0], dict)
+            else {}
+        )
+        is_sh2_prod_chain = isinstance(first_body, dict) and (
+            first_body.get("calendar_version") == "csa22-v2"
+            or first_body.get("chain_id") == "prod-sh2-v1"
+            or first_body.get("ledger_mode") == "stage_n_production"
+        )
+        if is_sh2_prod_chain:
+            if eff_locked is None:
+                base_root = Path(repo_root) if repo_root is not None else _SPECS_ROOT.parent
+                default_prod_cfg = base_root / "config" / "production-scheduler.json"
+                if not default_prod_cfg.is_file():
+                    eff_locked = True
+                else:
+                    try:
+                        raw_prod = parse_json_no_duplicates(default_prod_cfg.read_text(encoding="utf-8"))
+                    except Exception:
+                        raw_prod = None
+                    if not isinstance(raw_prod, dict):
+                        eff_locked = True
+                    else:
+                        eff_locked = not (
+                            raw_prod.get("production_chain_locked") is False
+                            and raw_prod.get("clk01_active") is True
+                        )
+            if eff_expected_engine_hash is None:
+                eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
+            if eff_expected_spec_version is None:
+                eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
+
+    if eff_locked is True:
+        reasons.append("production_chain_locked")
 
     if receipts is None or len(receipts) == 0:
         reasons.append("missing_receipts")
@@ -883,6 +1259,18 @@ def check_forward_clock_credit(
                     reasons.append(f"seq_{seq}:evaluator_engine_hash_mismatch")
             if not isinstance(ev_spec, str) or not ev_spec:
                 reasons.append(f"seq_{seq}:missing_evaluator_spec_version")
+            if eff_expected_engine_hash is not None and top_engine_hash != eff_expected_engine_hash:
+                reasons.append(f"seq_{seq}:unexpected_engine_hash")
+            if eff_expected_spec_version is not None and ev_spec != eff_expected_spec_version:
+                reasons.append(f"seq_{seq}:unexpected_spec_version")
+            if (
+                ev_spec == PINNED_FUSE_SPEC_VERSION
+                or top_engine_hash == PINNED_FUSE_ENGINE_HASH
+                or body.get("calendar_version") == "csa22-v2"
+            ):
+                nrs_sha = ev_obj.get("next_row_state_sha256")
+                if not isinstance(nrs_sha, str) or not _HEX64_RE.fullmatch(nrs_sha):
+                    reasons.append(f"seq_{seq}:missing_or_invalid_next_row_state_sha256")
 
         identity_checks = (
             ("chain_id", body.get("chain_id")),
@@ -1042,9 +1430,667 @@ class ShadowLedger:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _parse_iso_utc(raw: object) -> datetime | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            return datetime.fromisoformat(iso).astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    _MAX_RECLAIM_GENERATIONS = 64
+
+    @staticmethod
+    def _read_lease_snapshot(lease_path: Path) -> tuple[os.stat_result, bytes]:
+        rfd = os.open(str(lease_path), os.O_RDONLY)
+        with os.fdopen(rfd, "rb") as rf:
+            st = os.fstat(rf.fileno())
+            return st, rf.read()
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short_write_no_progress")
+            view = view[written:]
+
+    @staticmethod
+    def _publish_exclusive_file(target_path: Path, tmp_path: Path, payload: bytes) -> None:
+        """Write complete payload to tmp_path and publish exclusively via os.link when supported."""
+        try:
+            tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                ShadowLedger._write_all(tfd, payload)
+                os.fsync(tfd)
+            finally:
+                os.close(tfd)
+            try:
+                os.link(str(tmp_path), str(target_path))
+            except OSError as link_exc:
+                if isinstance(link_exc, FileExistsError):
+                    raise
+                if link_exc.errno not in (
+                    errno.ENOTSUP,
+                    errno.EOPNOTSUPP,
+                    errno.EXDEV,
+                    errno.EPERM,
+                    errno.ENOSYS,
+                ):
+                    raise
+                lfd = os.open(str(target_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                wrote_ok = False
+                try:
+                    ShadowLedger._write_all(lfd, payload)
+                    os.fsync(lfd)
+                    wrote_ok = True
+                finally:
+                    try:
+                        os.close(lfd)
+                    finally:
+                        if not wrote_ok:
+                            try:
+                                target_path.unlink()
+                            except OSError:
+                                pass
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _parse_valid_lease_payload(raw_bytes: bytes) -> tuple[dict | None, datetime | None]:
+        """Parse JSON lease/reclaim payload; return (dict, expires_at_utc) or (None, None) if partial/invalid."""
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        if not raw_text.strip():
+            return None, None
+        try:
+            parsed = parse_json_no_duplicates(raw_text)
+        except Exception:
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        exp_dt = ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc"))
+        if exp_dt is None:
+            return None, None
+        return parsed, exp_dt
+
+    @staticmethod
+    def _is_reclaim_claim_expired(
+        st: os.stat_result,
+        raw_bytes: bytes,
+        now_chk: datetime,
+    ) -> bool:
+        """Return True when a reclaim claim is expired or an aged (>= 5s) empty/partial stub."""
+        rp, reclaim_exp = ShadowLedger._parse_valid_lease_payload(raw_bytes)
+        if rp is None or reclaim_exp is None:
+            return (now_chk.timestamp() - st.st_mtime) >= 5.0
+        return now_chk >= reclaim_exp
+
+    @staticmethod
+    def _now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _latest_lease_slot(lease_path: Path) -> tuple[int, Path] | None:
+        prefix = ".chain.lease.epoch."
+        suffix = ".json"
+        best: tuple[int, Path] | None = None
+        for cand in lease_path.parent.glob(".chain.lease.epoch.*.json"):
+            name = cand.name
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            epoch_str = name[len(prefix) : -len(suffix)]
+            if not (epoch_str.isascii() and epoch_str.isdigit()):
+                continue
+            epoch = int(epoch_str)
+            if epoch < 1 or str(epoch) != epoch_str:
+                continue
+            if best is None or epoch > best[0]:
+                best = (epoch, cand)
+        if best is not None:
+            return best
+        if lease_path.is_file():
+            return (0, lease_path)
+        return None
+
+    def _acquire_cross_instance_lease(
+        self,
+        lease_path: Path,
+        *,
+        lease_ttl_seconds: float,
+    ) -> str:
+        lease_id = uuid4().hex
+
+        def _build_lease_bytes(target_epoch: int) -> bytes:
+            now_pub = self._now_utc()
+            expires_pub = now_pub + timedelta(seconds=max(1.0, float(lease_ttl_seconds)))
+            lease_payload = {
+                "schema_version": "c-sh-chain-lease-v1",
+                "epoch": target_epoch,
+                "lease_id": lease_id,
+                "pid": os.getpid(),
+                "execution_id": os.environ.get("CLOUD_RUN_EXECUTION", ""),
+                "acquired_at_utc": (
+                    now_pub.strftime("%Y-%m-%dT%H:%M:%S.")
+                    + f"{now_pub.microsecond // 1000:03d}Z"
+                ),
+                "expires_at_utc": (
+                    expires_pub.strftime("%Y-%m-%dT%H:%M:%S.")
+                    + f"{expires_pub.microsecond // 1000:03d}Z"
+                ),
+            }
+            return (
+                json.dumps(lease_payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+
+        latest = self._latest_lease_slot(lease_path)
+        if latest is None:
+            tmp0_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.0.lock")
+            try:
+                self._publish_exclusive_file(lease_path, tmp0_path, _build_lease_bytes(0))
+                return lease_id
+            except FileExistsError:
+                latest = self._latest_lease_slot(lease_path)
+                if latest is None:
+                    raise ChainConcurrencyConflictError(
+                        "Failed to acquire cross-instance chain lease"
+                    )
+
+        cur_epoch, cur_slot_path = latest
+        existing: dict = {}
+        try:
+            orig_st, existing_bytes = self._read_lease_snapshot(cur_slot_path)
+        except FileNotFoundError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease file vanished during concurrent acquisition"
+            ) from exc
+        except Exception as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease file unreadable during concurrent acquisition"
+            ) from exc
+
+        parsed, exp_dt = self._parse_valid_lease_payload(existing_bytes)
+        if parsed is None:
+            now_init = self._now_utc()
+            if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
+                raise ChainConcurrencyConflictError(
+                    "Chain lease file initializing by peer writer"
+                )
+            existing = {}
+        else:
+            existing = parsed
+
+        raw_lease_id = existing.get("lease_id") if isinstance(existing, dict) else None
+        lease_id_str = (
+            raw_lease_id if isinstance(raw_lease_id, str) and raw_lease_id else None
+        )
+        eff_exp_dt = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
+        is_released = self._is_lease_released(lease_path, lease_id_str)
+        now_chk = self._now_utc()
+        if not is_released and eff_exp_dt is not None and now_chk < eff_exp_dt:
+            raise ChainConcurrencyConflictError(
+                "Chain lease held by active writer: "
+                f"lease_id={existing.get('lease_id')!r}, "
+                f"pid={existing.get('pid')!r}, "
+                f"execution_id={existing.get('execution_id')!r}"
+            )
+
+        stale_sha = hashlib.sha256(existing_bytes).hexdigest()
+        raw_lease_id = existing.get("lease_id")
+        if isinstance(raw_lease_id, str) and raw_lease_id:
+            claim_basis = f"id:{raw_lease_id}:{stale_sha}"
+        else:
+            claim_basis = f"raw:{stale_sha}:{int(orig_st.st_mtime)}:{orig_st.st_size}"
+        claim_key = hashlib.sha256(claim_basis.encode("utf-8")).hexdigest()[:32]
+        reclaim_expires = now_chk + timedelta(seconds=max(300.0, float(lease_ttl_seconds)))
+        existing_claims = [
+            lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock"),
+            *sorted(lease_path.parent.glob(f".chain.lease.reclaim.{claim_key}.g*.lock")),
+        ]
+        for existing_claim_path in existing_claims:
+            try:
+                ex_st, ex_bytes = self._read_lease_snapshot(existing_claim_path)
+            except FileNotFoundError:
+                continue
+            except Exception as pexc:
+                raise ChainConcurrencyConflictError(
+                    "Stale chain lease reclamation already claimed by peer writer"
+                ) from pexc
+            if not self._is_reclaim_claim_expired(ex_st, ex_bytes, now_chk):
+                raise ChainConcurrencyConflictError(
+                    "Stale chain lease reclamation already claimed by peer writer"
+                )
+
+        won = False
+        for gen in range(self._MAX_RECLAIM_GENERATIONS):
+            reclaim_path = lease_path.with_name(
+                f".chain.lease.reclaim.{claim_key}.lock"
+                if gen == 0
+                else f".chain.lease.reclaim.{claim_key}.g{gen}.lock"
+            )
+            reclaim_bytes = (
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-reclaim-v1",
+                        "claim_key": claim_key,
+                        "generation": gen,
+                        "reclaimed_lease_id": raw_lease_id,
+                        "claimed_by_lease_id": lease_id,
+                        "claimed_at_utc": now_chk.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{now_chk.microsecond // 1000:03d}Z",
+                        "expires_at_utc": reclaim_expires.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{reclaim_expires.microsecond // 1000:03d}Z",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            reclaim_tmp_path = lease_path.with_name(
+                f".chain.lease.tmp.reclaim.{lease_id}.{gen}.lock"
+            )
+            try:
+                self._publish_exclusive_file(reclaim_path, reclaim_tmp_path, reclaim_bytes)
+                won = True
+                break
+            except FileExistsError as exc:
+                try:
+                    rc_st, rc_bytes = self._read_lease_snapshot(reclaim_path)
+                except FileNotFoundError as fnf:
+                    raise ChainConcurrencyConflictError(
+                        "Stale chain lease reclamation claim vanished during acquisition"
+                    ) from fnf
+                except Exception as pexc:
+                    raise ChainConcurrencyConflictError(
+                        "Stale chain lease reclamation already claimed by peer writer"
+                    ) from pexc
+                if not self._is_reclaim_claim_expired(rc_st, rc_bytes, now_chk):
+                    raise ChainConcurrencyConflictError(
+                        "Stale chain lease reclamation already claimed by peer writer"
+                    ) from exc
+                if self._latest_lease_slot(lease_path) != (cur_epoch, cur_slot_path):
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease epoch advanced during stale CAS reclamation"
+                    ) from exc
+                try:
+                    chk_st, chk_bytes = self._read_lease_snapshot(cur_slot_path)
+                except FileNotFoundError as fnf:
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease changed before stale CAS reclamation completed"
+                    ) from fnf
+                if (
+                    chk_st.st_dev != orig_st.st_dev
+                    or chk_st.st_ino != orig_st.st_ino
+                    or chk_bytes != existing_bytes
+                ):
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease identity changed during stale CAS reclamation"
+                    ) from exc
+                continue
+        if not won:
+            raise ChainConcurrencyConflictError(
+                "Stale chain lease reclamation generation budget exhausted"
+            )
+
+        if self._latest_lease_slot(lease_path) != (cur_epoch, cur_slot_path):
+            raise ChainConcurrencyConflictError(
+                "Chain lease epoch advanced before stale CAS reclamation completed"
+            )
+        try:
+            cur_st, cur_bytes = self._read_lease_snapshot(cur_slot_path)
+        except FileNotFoundError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease changed before stale CAS reclamation completed"
+            ) from exc
+        if (
+            cur_st.st_dev != orig_st.st_dev
+            or cur_st.st_ino != orig_st.st_ino
+            or cur_bytes != existing_bytes
+        ):
+            raise ChainConcurrencyConflictError(
+                "Chain lease identity changed during stale CAS reclamation"
+            )
+        recheck_exp = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
+        recheck_released = self._is_lease_released(lease_path, lease_id_str)
+        now_recheck = self._now_utc()
+        if not recheck_released and recheck_exp is not None and now_recheck < recheck_exp:
+            raise ChainConcurrencyConflictError(
+                "Chain lease renewed during stale CAS reclamation"
+            )
+        if now_recheck >= reclaim_expires:
+            raise ChainConcurrencyConflictError(
+                "Stale chain lease reclamation claim expired before publish"
+            )
+
+        next_epoch = cur_epoch + 1
+        next_slot_path = lease_path.with_name(f".chain.lease.epoch.{next_epoch}.json")
+        next_tmp_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.{next_epoch}.lock")
+        try:
+            self._publish_exclusive_file(
+                next_slot_path, next_tmp_path, _build_lease_bytes(next_epoch)
+            )
+        except FileExistsError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease epoch already claimed by peer writer"
+            ) from exc
+
+        if lease_id_str:
+            for renew_file in lease_path.parent.glob(f".chain.lease.renew.{lease_id_str}.*.json"):
+                try:
+                    renew_file.unlink()
+                except FileNotFoundError:
+                    pass
+            try:
+                lease_path.with_name(f".chain.lease.released.{lease_id_str}.json").unlink()
+            except FileNotFoundError:
+                pass
+        return lease_id
+
+    @staticmethod
+    def _is_lease_released(lease_path: Path, lease_id: str | None) -> bool:
+        if not isinstance(lease_id, str) or not lease_id:
+            return False
+        released_path = lease_path.with_name(f".chain.lease.released.{lease_id}.json")
+        try:
+            _, raw_bytes = ShadowLedger._read_lease_snapshot(released_path)
+            parsed = parse_json_no_duplicates(raw_bytes.decode("utf-8", errors="replace"))
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+        return (
+            isinstance(parsed, dict)
+            and parsed.get("schema_version") == "c-sh-chain-lease-released-v1"
+            and parsed.get("lease_id") == lease_id
+        )
+
+    @staticmethod
+    def _effective_lease_expiry(
+        lease_path: Path,
+        lease_id: str | None,
+        base_exp: datetime | None,
+    ) -> datetime | None:
+        eff = base_exp
+        if not isinstance(lease_id, str) or not lease_id:
+            return eff
+        for renew_path in sorted(lease_path.parent.glob(f".chain.lease.renew.{lease_id}.*.json")):
+            try:
+                _, raw_bytes = ShadowLedger._read_lease_snapshot(renew_path)
+                parsed = parse_json_no_duplicates(raw_bytes.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("schema_version") != "c-sh-chain-lease-renew-v1"
+                or parsed.get("lease_id") != lease_id
+            ):
+                continue
+            cand = ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc"))
+            if cand is not None and (eff is None or cand > eff):
+                eff = cand
+        return eff
+
+    def _renew_cross_instance_lease(
+        self,
+        lease_path: Path,
+        expected_lease_id: str,
+        *,
+        lease_ttl_seconds: float,
+    ) -> None:
+        """Extend an active owned lease via an immutable sidecar without overwriting displaced leases."""
+        latest = self._latest_lease_slot(lease_path)
+        if latest is None:
+            raise ChainConcurrencyConflictError("Chain lease vanished before renewal")
+        cur_epoch, cur_slot_path = latest
+        try:
+            cur_st, cur_bytes = self._read_lease_snapshot(cur_slot_path)
+            parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
+        except FileNotFoundError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease vanished before renewal"
+            ) from exc
+        except Exception as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease unreadable before renewal"
+            ) from exc
+
+        now_utc = self._now_utc()
+        base_exp = (
+            self._parse_iso_utc(parsed.get("expires_at_utc"))
+            if isinstance(parsed, dict)
+            else None
+        )
+        eff_exp = (
+            self._effective_lease_expiry(lease_path, expected_lease_id, base_exp)
+            if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id
+            else None
+        )
+        if (
+            not isinstance(parsed, dict)
+            or parsed.get("lease_id") != expected_lease_id
+            or eff_exp is None
+            or now_utc >= eff_exp
+            or self._is_lease_released(lease_path, expected_lease_id)
+        ):
+            raise ChainConcurrencyConflictError(
+                "Chain lease expired or displaced (or released) before renewal"
+            )
+
+        expires_utc = now_utc + timedelta(seconds=max(1.0, float(lease_ttl_seconds)))
+        renew_bytes = (
+            json.dumps(
+                {
+                    "schema_version": "c-sh-chain-lease-renew-v1",
+                    "lease_id": expected_lease_id,
+                    "renewed_at_utc": (
+                        now_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{now_utc.microsecond // 1000:03d}Z"
+                    ),
+                    "expires_at_utc": (
+                        expires_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{expires_utc.microsecond // 1000:03d}Z"
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        renew_id = uuid4().hex
+        renew_path = lease_path.with_name(f".chain.lease.renew.{expected_lease_id}.{renew_id}.json")
+        tmp_path = lease_path.with_name(f".chain.lease.tmp.renew.{expected_lease_id}.{renew_id}.lock")
+        self._publish_exclusive_file(renew_path, tmp_path, renew_bytes)
+
+        def _abort_renew(msg: str, cause: Exception | None = None) -> None:
+            try:
+                renew_path.unlink()
+            except FileNotFoundError:
+                pass
+            if cause is not None:
+                raise ChainConcurrencyConflictError(msg) from cause
+            raise ChainConcurrencyConflictError(msg)
+
+        if self._latest_lease_slot(lease_path) != (cur_epoch, cur_slot_path):
+            _abort_renew("Chain lease displaced during renewal")
+        try:
+            chk_st, verify_bytes = self._read_lease_snapshot(cur_slot_path)
+            verify_obj = parse_json_no_duplicates(verify_bytes.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            _abort_renew("Chain lease unreadable after renewal", exc)
+        if (
+            chk_st.st_dev != cur_st.st_dev
+            or chk_st.st_ino != cur_st.st_ino
+            or verify_bytes != cur_bytes
+            or not isinstance(verify_obj, dict)
+            or verify_obj.get("lease_id") != expected_lease_id
+        ):
+            _abort_renew("Chain lease displaced during renewal")
+        now_post = self._now_utc()
+        if now_post >= eff_exp:
+            _abort_renew("Chain lease expired during renewal")
+        if self._is_lease_released(lease_path, expected_lease_id):
+            _abort_renew("Chain lease released during renewal")
+
+        stale_sha = hashlib.sha256(cur_bytes).hexdigest()
+        claim_key = hashlib.sha256(
+            f"id:{expected_lease_id}:{stale_sha}".encode("utf-8")
+        ).hexdigest()[:32]
+        claim_paths = [
+            lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock"),
+            *sorted(lease_path.parent.glob(f".chain.lease.reclaim.{claim_key}.g*.lock")),
+        ]
+        for claim_path in claim_paths:
+            try:
+                rc_st, rc_bytes = self._read_lease_snapshot(claim_path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                _abort_renew("Chain lease reclamation in progress during renewal", exc)
+            if not self._is_reclaim_claim_expired(rc_st, rc_bytes, now_post):
+                _abort_renew("Chain lease reclamation in progress during renewal")
+
+    def assert_active_chain_lease(self) -> None:
+        """Fail closed if caller lacks or has lost its active unexpired cross-instance lease."""
+        key = str(self.root_dir.resolve())
+        locks = getattr(_CHAIN_LOCK_TLS, "locks", None)
+        entry = locks.get(key) if isinstance(locks, dict) else None
+        if entry is None:
+            raise ChainConcurrencyConflictError("Chain lease not held by active writer")
+        lease_id = entry["lease_id"]
+        lease_path = self.root_dir / ".chain.lease.json"
+        with entry["lease_mu"]:
+            if entry.get("lost_error"):
+                raise ChainConcurrencyConflictError(str(entry["lost_error"]))
+            latest = self._latest_lease_slot(lease_path)
+            if latest is None:
+                entry["lost_error"] = "Chain lease missing before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"])
+            try:
+                _, cur_bytes = self._read_lease_snapshot(latest[1])
+                parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
+            except FileNotFoundError as exc:
+                entry["lost_error"] = "Chain lease missing before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"]) from exc
+            except Exception as exc:
+                entry["lost_error"] = "Chain lease unreadable before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"]) from exc
+            exp_dt = (
+                self._effective_lease_expiry(
+                    lease_path,
+                    lease_id,
+                    self._parse_iso_utc(parsed.get("expires_at_utc")),
+                )
+                if isinstance(parsed, dict) and parsed.get("lease_id") == lease_id
+                else None
+            )
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("lease_id") != lease_id
+                or exp_dt is None
+                or self._now_utc() >= exp_dt
+                or self._is_lease_released(lease_path, lease_id)
+            ):
+                entry["lost_error"] = "Chain lease expired or displaced (or released) before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"])
+
+    @staticmethod
+    def _release_cross_instance_lease(lease_path: Path, expected_lease_id: str) -> None:
+        now_utc = ShadowLedger._now_utc()
+        latest = ShadowLedger._latest_lease_slot(lease_path)
+        if latest is not None:
+            try:
+                parsed = parse_json_no_duplicates(latest[1].read_text(encoding="utf-8"))
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
+                exp_dt = ShadowLedger._effective_lease_expiry(
+                    lease_path,
+                    expected_lease_id,
+                    ShadowLedger._parse_iso_utc(parsed.get("expires_at_utc")),
+                )
+                if exp_dt is None or now_utc < exp_dt:
+                    released_path = lease_path.with_name(
+                        f".chain.lease.released.{expected_lease_id}.json"
+                    )
+                    tmp_path = lease_path.with_name(
+                        f".chain.lease.tmp.released.{expected_lease_id}.{uuid4().hex}.lock"
+                    )
+                    released_bytes = (
+                        json.dumps(
+                            {
+                                "schema_version": "c-sh-chain-lease-released-v1",
+                                "lease_id": expected_lease_id,
+                                "released_at_utc": (
+                                    now_utc.strftime("%Y-%m-%dT%H:%M:%S.")
+                                    + f"{now_utc.microsecond // 1000:03d}Z"
+                                ),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    try:
+                        ShadowLedger._publish_exclusive_file(
+                            released_path, tmp_path, released_bytes
+                        )
+                    except FileExistsError:
+                        pass
+                    for renew_file in lease_path.parent.glob(
+                        f".chain.lease.renew.{expected_lease_id}.*.json"
+                    ):
+                        try:
+                            renew_file.unlink()
+                        except FileNotFoundError:
+                            pass
+        active_lease_id: str | None = None
+        post_latest = ShadowLedger._latest_lease_slot(lease_path)
+        if post_latest is not None:
+            try:
+                post_parsed = parse_json_no_duplicates(post_latest[1].read_text(encoding="utf-8"))
+            except Exception:
+                post_parsed = None
+            if isinstance(post_parsed, dict) and isinstance(post_parsed.get("lease_id"), str):
+                active_lease_id = post_parsed["lease_id"]
+        for rpath in lease_path.parent.glob(".chain.lease.reclaim.*.lock"):
+            try:
+                rst, rbytes = ShadowLedger._read_lease_snapshot(rpath)
+                if ShadowLedger._is_reclaim_claim_expired(rst, rbytes, now_utc):
+                    rpath.unlink()
+            except Exception:
+                pass
+        for rel_path in lease_path.parent.glob(".chain.lease.released.*.json"):
+            try:
+                _, rel_bytes = ShadowLedger._read_lease_snapshot(rel_path)
+                rel_obj = parse_json_no_duplicates(rel_bytes.decode("utf-8", errors="replace"))
+                rel_id = rel_obj.get("lease_id") if isinstance(rel_obj, dict) else None
+            except Exception:
+                continue
+            if (
+                isinstance(rel_id, str)
+                and rel_id
+                and rel_id != expected_lease_id
+                and rel_id != active_lease_id
+            ):
+                try:
+                    rel_path.unlink()
+                except FileNotFoundError:
+                    pass
+
     @contextmanager
-    def chain_lock(self) -> Iterator[None]:
-        """Acquire an exclusive per-chain file lock, safely re-entrant within the same thread."""
+    def chain_lock(
+        self,
+        *,
+        lease_ttl_seconds: float = 300.0,
+        renew_interval_seconds: float | None = None,
+    ) -> Iterator[None]:
+        """Acquire exclusive flock + atomic renewable .chain.lease.json cross-instance fencing lock."""
         self.root_dir.mkdir(parents=True, exist_ok=True)
         key = str(self.root_dir.resolve())
         locks = getattr(_CHAIN_LOCK_TLS, "locks", None)
@@ -1053,6 +2099,7 @@ class ShadowLedger:
             _CHAIN_LOCK_TLS.locks = locks
         entry = locks.get(key)
         if entry is not None:
+            self.assert_active_chain_lease()
             entry["depth"] += 1
             try:
                 yield
@@ -1061,14 +2108,58 @@ class ShadowLedger:
             return
 
         lock_path = self.root_dir / ".chain.lock"
+        lease_path = self.root_dir / ".chain.lease.json"
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            locks[key] = {"fd": fd, "depth": 1}
+            lease_id = self._acquire_cross_instance_lease(
+                lease_path, lease_ttl_seconds=lease_ttl_seconds
+            )
+            lease_mu = threading.Lock()
+            stop_event = threading.Event()
+            state: dict[str, object] = {
+                "fd": fd,
+                "depth": 1,
+                "lease_id": lease_id,
+                "lease_mu": lease_mu,
+                "lost_error": None,
+            }
+            locks[key] = state
+            interval = (
+                float(renew_interval_seconds)
+                if renew_interval_seconds is not None
+                else max(0.05, min(60.0, float(lease_ttl_seconds) / 3.0))
+            )
+
+            def _renew_loop() -> None:
+                while not stop_event.wait(interval):
+                    with lease_mu:
+                        if stop_event.is_set():
+                            return
+                        try:
+                            self._renew_cross_instance_lease(
+                                lease_path,
+                                lease_id,
+                                lease_ttl_seconds=lease_ttl_seconds,
+                            )
+                        except (ChainConcurrencyConflictError, OSError) as exc:
+                            state["lost_error"] = str(exc) or "Chain lease renewal failed"
+                            return
+
+            renew_thread = threading.Thread(
+                target=_renew_loop,
+                name=f"shadow-lease-renew-{lease_id[:8]}",
+                daemon=True,
+            )
+            renew_thread.start()
             try:
                 yield
             finally:
+                stop_event.set()
+                renew_thread.join(timeout=2.0)
                 locks.pop(key, None)
+                with lease_mu:
+                    self._release_cross_instance_lease(lease_path, lease_id)
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -1166,6 +2257,8 @@ class ShadowLedger:
                 record_body["policy_config_hash"],
                 record_body["code_version_sha"],
                 record_body["calendar_spec_digest"],
+                record_body["engine_hash"],
+                record_body["evaluator"]["spec_version"],
             )
             dedup_key = (
                 record_body["mode"],
@@ -1183,6 +2276,8 @@ class ShadowLedger:
                     pb["policy_config_hash"],
                     pb["code_version_sha"],
                     pb["calendar_spec_digest"],
+                    pb["engine_hash"],
+                    pb["evaluator"]["spec_version"],
                 )
                 if prior_identity != chain_identity:
                     raise LedgerAppendError(
@@ -1245,29 +2340,56 @@ class ShadowLedger:
                     post_marker_writes.append((ots_path, ots_bytes))
                 post_marker_writes.append((rcp_path, canonical_json_bytes(receipt_obj)))
 
+            self.assert_active_chain_lease()
             self.root_dir.mkdir(parents=True, exist_ok=True)
-            if allow_unanchored:
-                # Purge any stale orphan .receipt/.ots from an earlier crashed run before committing unanchored.
-                for orphan_path in (rcp_path, ots_path):
-                    if orphan_path.exists():
-                        orphan_path.unlink()
-            elif ots_bytes is None and ots_path.exists():
-                ots_path.unlink()
-
-            created_paths: list[Path] = []
+            created_artifacts: list[tuple[Path, bytes]] = []
             try:
                 if before_record_commit is not None:
+                    self.assert_active_chain_lease()
                     before_record_commit()
-                # Commit seq_NNNNNN.record.json BEFORE detached .ots/.receipt; rollback_sequence / except handler cleans up on Python exception.
-                _atomic_write_bytes(rec_path, canonical_json_bytes(envelope))
-                created_paths.append(rec_path)
-                for target_path, data in post_marker_writes:
-                    _atomic_write_bytes(target_path, data)
-                    created_paths.append(target_path)
+                self.assert_active_chain_lease()
+                # Commit seq_NNNNNN.record.json exclusively BEFORE detached .ots/.receipt so concurrent writers cannot overwrite a successor commit.
+                rec_bytes = canonical_json_bytes(envelope)
+                rec_tmp = rec_path.with_name(f".{rec_path.name}.tmp.{uuid4().hex}")
+                try:
+                    self._publish_exclusive_file(rec_path, rec_tmp, rec_bytes)
+                except FileExistsError as exc:
+                    raise ChainConcurrencyConflictError(
+                        f"target_sequence_already_exists_concurrently: {seq}"
+                    ) from exc
+                created_artifacts.append((rec_path, rec_bytes))
+
+                if allow_unanchored:
+                    # Purge any stale invalid orphan .receipt/.ots from an earlier crashed run before committing unanchored.
+                    for orphan_path in (rcp_path, ots_path):
+                        if orphan_path.exists():
+                            orphan_path.unlink()
+                else:
+                    if ots_bytes is None and ots_path.exists():
+                        ots_path.unlink()
+                    for target_path, data in post_marker_writes:
+                        if target_path.exists():
+                            target_path.unlink()
+                        target_tmp = target_path.with_name(
+                            f".{target_path.name}.tmp.{uuid4().hex}"
+                        )
+                        try:
+                            self._publish_exclusive_file(target_path, target_tmp, data)
+                        except FileExistsError as exc:
+                            raise ChainConcurrencyConflictError(
+                                f"target_detached_evidence_exists_concurrently: {target_path.name}"
+                            ) from exc
+                        created_artifacts.append((target_path, data))
             except Exception:
-                for created_path in reversed(created_paths):
-                    if created_path.exists():
-                        created_path.unlink()
+                try:
+                    self.assert_active_chain_lease()
+                    owns_lease = True
+                except ChainConcurrencyConflictError:
+                    owns_lease = False
+                if owns_lease:
+                    for created_path, expected_bytes in reversed(created_artifacts):
+                        if created_path.is_file() and created_path.read_bytes() == expected_bytes:
+                            created_path.unlink()
                 raise
             return envelope
 
@@ -1387,8 +2509,16 @@ class ShadowLedger:
         commitment_deadline_et: object | None = None,
         repo_root: str | Path | None = None,
         config_path: str | Path | None = None,
+        runtime_config: object | None = None,
     ) -> tuple[bool, list[object]]:
         """Require valid chain + non-empty ledger with timely OTS receipts verified against trusted Bitcoin headers & block timestamps."""
+        eff_commitment_deadline_et = commitment_deadline_et
+        if eff_commitment_deadline_et is None and runtime_config is not None:
+            eff_commitment_deadline_et = (
+                runtime_config.get("commitment_deadline_et")
+                if isinstance(runtime_config, Mapping)
+                else getattr(runtime_config, "commitment_deadline_et", None)
+            )
         chain_ok, bad_seq, chain_err = self.verify_chain()
         if not chain_ok:
             return False, [{"sequence": bad_seq, "reason": f"chain_invalid:{chain_err}"}]
@@ -1431,7 +2561,7 @@ class ShadowLedger:
                     raise ValueError("missing_session_date")
                 expected_deadline = compute_session_commitment_deadline_utc(
                     sess_date,
-                    commitment_deadline_et,
+                    eff_commitment_deadline_et,
                     repo_root=repo_root,
                     config_path=config_path,
                 )
@@ -1459,3 +2589,941 @@ class ShadowLedger:
             if not ok_btc:
                 issues.append({"sequence": seq, "reason": str(btc_err)})
         return len(issues) == 0, issues
+
+
+def save_row_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    chain_id: str,
+    sequence: int,
+    session_date: str,
+    record_sha256: str,
+    engine_hash: str,
+    spec_version: str,
+    next_row_state: dict,
+) -> Path:
+    """Persist next_row_state atomically for restart continuity with identity pins."""
+    if not isinstance(next_row_state, dict):
+        raise EngineIdentityError("next_row_state must be a dict")
+    s_dir = Path(snapshots_dir)
+    s_dir.mkdir(parents=True, exist_ok=True)
+    state_canonical = json.dumps(
+        next_row_state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    payload = {
+        "schema_version": "c-sh-state-snapshot-v1",
+        "chain_id": chain_id,
+        "sequence": sequence,
+        "session_date": session_date,
+        "record_sha256": record_sha256,
+        "engine_hash": engine_hash,
+        "spec_version": spec_version,
+        "state_sha256": hashlib.sha256(state_canonical).hexdigest(),
+        "next_row_state": next_row_state,
+    }
+    raw_bytes = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    seq_path = s_dir / f"seq_{sequence:06d}.state.json"
+    latest_path = s_dir / "latest.state.json"
+    _atomic_write_bytes(seq_path, raw_bytes)
+    _atomic_write_bytes(latest_path, raw_bytes)
+    return seq_path
+
+
+def load_row_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    expected_chain_id: str,
+    expected_engine_hash: str,
+    expected_spec_version: str,
+    expected_sequence: int | None = None,
+    expected_record_sha256: str | None = None,
+    expected_state_sha256: str | None = None,
+    allow_missing_at_genesis: bool = True,
+) -> tuple[dict, dict | None]:
+    """Load and verify persisted row state before next evaluation (fail closed on drift/corruption)."""
+    s_dir = Path(snapshots_dir)
+    target = (
+        s_dir / f"seq_{expected_sequence:06d}.state.json"
+        if expected_sequence is not None
+        else s_dir / "latest.state.json"
+    )
+    if not target.is_file():
+        if allow_missing_at_genesis and expected_sequence is None and not (s_dir / "latest.state.json").exists():
+            return {}, None
+        raise EngineIdentityError(f"Missing persisted row state snapshot: {target}")
+
+    try:
+        payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt row state snapshot {target}: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-state-snapshot-v1":
+        raise EngineIdentityError(f"Invalid row state snapshot schema in {target}")
+    if payload.get("chain_id") != expected_chain_id:
+        raise EngineIdentityError(
+            f"State snapshot chain_id mismatch: expected {expected_chain_id!r}, got {payload.get('chain_id')!r}"
+        )
+    if payload.get("engine_hash") != expected_engine_hash:
+        raise EngineIdentityError(
+            f"State snapshot engine_hash mismatch: expected {expected_engine_hash!r}, got {payload.get('engine_hash')!r}"
+        )
+    if payload.get("spec_version") != expected_spec_version:
+        raise EngineIdentityError(
+            f"State snapshot spec_version mismatch: expected {expected_spec_version!r}, got {payload.get('spec_version')!r}"
+        )
+    if expected_sequence is not None and payload.get("sequence") != expected_sequence:
+        raise EngineIdentityError(
+            f"State snapshot sequence mismatch: expected {expected_sequence}, got {payload.get('sequence')!r}"
+        )
+    if expected_record_sha256 is not None and payload.get("record_sha256") != expected_record_sha256:
+        raise EngineIdentityError("State snapshot record_sha256 mismatch")
+
+    state_obj = payload.get("next_row_state")
+    if not isinstance(state_obj, dict):
+        raise EngineIdentityError("State snapshot next_row_state must be a dict")
+    recomputed_sha = _sha256_canonical_state_dict(state_obj)
+    if payload.get("state_sha256") != recomputed_sha:
+        raise EngineIdentityError("State snapshot checksum mismatch")
+    if expected_state_sha256 is not None and (
+        recomputed_sha != expected_state_sha256 or payload.get("state_sha256") != expected_state_sha256
+    ):
+        raise EngineIdentityError(
+            f"State snapshot state_sha256 mismatch against committed ledger record: "
+            f"expected {expected_state_sha256}, got {recomputed_sha}"
+        )
+
+    return state_obj, payload
+
+
+def normalize_pending_authorized_events(
+    authorized_events: object | None,
+) -> list[dict[str, Any]]:
+    """Normalize dict/list FUSE-1 authorized_events cleanly without widening scope."""
+    if not authorized_events:
+        return []
+    candidates: list[dict[str, Any]] = []
+    if isinstance(authorized_events, Sequence) and not isinstance(
+        authorized_events, (str, bytes, bytearray)
+    ):
+        for item in authorized_events:
+            if isinstance(item, Mapping):
+                candidates.append(dict(copy.deepcopy(item)))
+    elif isinstance(authorized_events, Mapping):
+        for scope_key, ev_list in authorized_events.items():
+            if not isinstance(scope_key, str) or not isinstance(ev_list, list):
+                continue
+            for item in ev_list:
+                if not isinstance(item, Mapping):
+                    continue
+                if "scope" in item and item.get("scope") != scope_key:
+                    continue
+                ev_copy = dict(copy.deepcopy(item))
+                ev_copy["scope"] = scope_key
+                candidates.append(ev_copy)
+    else:
+        return []
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ev in candidates:
+        try:
+            key = json.dumps(ev, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except Exception:
+            continue
+        if key not in seen:
+            seen.add(key)
+            deduped.append(ev)
+    return deduped
+
+
+def build_pending_rejected_state_payload(
+    *,
+    chain_id: str,
+    base_sequence: int,
+    base_record_sha256: str,
+    rejected_session_date: str,
+    engine_hash: str,
+    spec_version: str,
+    next_row_state: dict,
+    base_prior_row_state: dict | None = None,
+    o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
+    authorized_events: dict | list | None = None,
+    pending_revision: int | None = None,
+) -> dict:
+    """Assemble a canonical c-sh-pending-rejected-state-v1 payload in memory."""
+    if not isinstance(next_row_state, dict):
+        raise EngineIdentityError("pending rejected next_row_state must be a dict")
+    eff_base_prior = base_prior_row_state if base_prior_row_state is not None else {}
+    if not isinstance(eff_base_prior, dict):
+        raise EngineIdentityError("pending rejected base_prior_row_state must be a dict")
+    if pending_revision is not None and (
+        isinstance(pending_revision, bool)
+        or not isinstance(pending_revision, int)
+        or pending_revision < 1
+    ):
+        raise EngineIdentityError("pending rejected pending_revision must be a positive integer")
+    payload: dict[str, Any] = {
+        "schema_version": "c-sh-pending-rejected-state-v1",
+        "chain_id": chain_id,
+        "base_sequence": base_sequence,
+        "base_record_sha256": base_record_sha256,
+        "rejected_session_date": rejected_session_date,
+        "engine_hash": engine_hash,
+        "spec_version": spec_version,
+        "state_sha256": _sha256_canonical_state_dict(next_row_state),
+        "next_row_state": next_row_state,
+        "base_prior_state_sha256": _sha256_canonical_state_dict(eff_base_prior),
+        "base_prior_row_state": eff_base_prior,
+    }
+    if o4_resolved_symbols:
+        payload["o4_resolved_symbols"] = sorted(
+            {str(s) for s in o4_resolved_symbols if isinstance(s, str) and s}
+        )
+    normalized_auth = normalize_pending_authorized_events(authorized_events)
+    if normalized_auth:
+        payload["authorized_events"] = normalized_auth
+    if pending_revision is not None:
+        payload["pending_revision"] = pending_revision
+    return payload
+
+
+def save_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    chain_id: str,
+    base_sequence: int,
+    base_record_sha256: str,
+    rejected_session_date: str,
+    engine_hash: str,
+    spec_version: str,
+    next_row_state: dict,
+    base_prior_row_state: dict | None = None,
+    o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
+    authorized_events: dict | list | None = None,
+    pending_revision: int | None = None,
+) -> Path:
+    """Persist next_row_state (plus session-start baseline) after an O1/O2-rejected evaluation."""
+    payload = build_pending_rejected_state_payload(
+        chain_id=chain_id,
+        base_sequence=base_sequence,
+        base_record_sha256=base_record_sha256,
+        rejected_session_date=rejected_session_date,
+        engine_hash=engine_hash,
+        spec_version=spec_version,
+        next_row_state=next_row_state,
+        base_prior_row_state=base_prior_row_state,
+        o4_resolved_symbols=o4_resolved_symbols,
+        authorized_events=authorized_events,
+        pending_revision=pending_revision,
+    )
+    s_dir = Path(snapshots_dir)
+    s_dir.mkdir(parents=True, exist_ok=True)
+    raw_bytes = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    target = s_dir / "pending_rejected_state.json"
+    _atomic_write_bytes(target, raw_bytes)
+    return target
+
+
+def compute_pending_rejected_state_sha256(payload: Mapping[str, Any]) -> str:
+    """Return canonical SHA-256 over a pending rejected state snapshot payload (allows FUSE floats)."""
+    return _sha256_canonical_state_dict(payload)
+
+
+def _max_elapsed_session_steps(
+    ref_dates: tuple[object, ...],
+    rej_ds: str,
+    *,
+    default_when_unknown: int = 1,
+) -> int:
+    """Return max calendar-day steps from the latest valid reference date to rej_ds."""
+    rej_date = date.fromisoformat(rej_ds)
+    parsed_refs: list[date] = []
+    for raw in ref_dates:
+        if isinstance(raw, str) and _DATE_YYYY_MM_DD_RE.fullmatch(raw):
+            try:
+                parsed_refs.append(date.fromisoformat(raw))
+            except ValueError:
+                continue
+    if not parsed_refs:
+        return default_when_unknown
+    return max(0, (rej_date - max(parsed_refs)).days)
+
+
+def _parse_valid_ymd(raw: object) -> str | None:
+    """Return stripped YYYY-MM-DD if valid calendar date, else None."""
+    if not isinstance(raw, str):
+        return None
+    cand = raw.strip()
+    if not _DATE_YYYY_MM_DD_RE.fullmatch(cand):
+        return None
+    try:
+        date.fromisoformat(cand)
+    except ValueError:
+        return None
+    return cand
+
+
+def _has_authorized_pending_clear(
+    authorized_events: Sequence[Mapping[str, Any]] | None,
+    *,
+    row_id: str,
+    scope_kind: str,
+    target: str | None = None,
+    rej_ds: str,
+    expected_base_session_date: str | None = None,
+    trip_session: object = None,
+    cooling_off_until: object = None,
+) -> bool:
+    """Validate whether pending authorized_events authorize clearing a committed row latch."""
+    if not authorized_events:
+        return False
+
+    base_ds = _parse_valid_ymd(expected_base_session_date)
+    trip_ds = _parse_valid_ymd(trip_session)
+    cool_ds = _parse_valid_ymd(cooling_off_until) if row_id == "L3" else None
+
+    for ev in authorized_events:
+        if not isinstance(ev, Mapping):
+            continue
+        ev_row = ev.get("row")
+        ev_row_id = ev.get("row_id")
+        if ev_row is not None and ev_row_id is not None and ev_row != ev_row_id:
+            continue
+        target_row = ev_row if ev_row is not None else ev_row_id
+
+        ev_type = ev.get("type")
+        if row_id == "O8":
+            if ev_type == "rearm":
+                if target_row != "O8":
+                    continue
+            elif ev_type == "kill_switch_clear":
+                if (ev_row is not None or ev_row_id is not None) and target_row != "O8":
+                    continue
+            else:
+                continue
+        else:
+            if ev_type != "rearm" or target_row != row_id:
+                continue
+
+        if scope_kind == "account":
+            if ev.get("fund") or ev.get("symbol"):
+                continue
+            if "scope" in ev and ev.get("scope") != "account":
+                continue
+        elif scope_kind == "fund":
+            if not target or ev.get("fund") != target or ev.get("symbol"):
+                continue
+            if "scope" in ev and ev.get("scope") != f"fund:{target}":
+                continue
+        elif scope_kind == "symbol":
+            if not target or ev.get("symbol") != target or ev.get("fund"):
+                continue
+            if "scope" in ev and ev.get("scope") != f"symbol:{target}":
+                continue
+        else:
+            continue
+
+        ev_sess_ds: str | None = None
+        if "session" in ev:
+            ev_sess_ds = _parse_valid_ymd(ev.get("session"))
+            if ev_sess_ds is None:
+                continue
+
+        ev_as_of_ds: str | None = None
+        if "as_of" in ev:
+            raw_as_of = ev.get("as_of")
+            if not isinstance(raw_as_of, str) or len(raw_as_of.strip()) < 10:
+                continue
+            ev_as_of_ds = _parse_valid_ymd(raw_as_of.strip()[:10])
+            if ev_as_of_ds is None:
+                continue
+
+        if ev_sess_ds is not None and ev_as_of_ds is not None and ev_sess_ds != ev_as_of_ds:
+            continue
+        ev_ds = ev_sess_ds if ev_sess_ds is not None else ev_as_of_ds
+        if ev_ds is None:
+            continue
+
+        if ev_ds > rej_ds:
+            continue
+        if base_ds is not None and ev_ds <= base_ds:
+            continue
+        if trip_ds is not None and ev_ds < trip_ds:
+            continue
+        if row_id == "L3":
+            if cool_ds is not None:
+                if ev_ds < cool_ds:
+                    continue
+            elif trip_ds is not None:
+                if (date.fromisoformat(ev_ds) - date.fromisoformat(trip_ds)).days < 30:
+                    continue
+        return True
+    return False
+
+
+def _assert_pending_state_preserves_committed_breakers(
+    committed_state: Mapping[str, Any],
+    pending_state: Mapping[str, Any],
+    *,
+    rej_ds: str,
+    expected_engine_hash: str,
+    expected_spec_version: str,
+    expected_base_session_date: str | None = None,
+    allowed_o4_resolved_symbols: set[str] | frozenset[str] | None = None,
+    authorized_events: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    """Enforce fail-closed monotonic latch/severity preservation from committed ledger state to pending state."""
+    if "engine_hash" in pending_state and pending_state["engine_hash"] != expected_engine_hash:
+        raise EngineIdentityError("Pending next_row_state engine_hash mismatch")
+    if "spec_version" in pending_state and pending_state["spec_version"] != expected_spec_version:
+        raise EngineIdentityError("Pending next_row_state spec_version mismatch")
+    if "loss_breakers_armed" in pending_state and pending_state["loss_breakers_armed"] is not False:
+        raise EngineIdentityError("Pending next_row_state loss_breakers_armed violation")
+    if (
+        "enforcement_mode" in pending_state
+        and pending_state["enforcement_mode"] != "shadow_would_have_tripped"
+    ):
+        raise EngineIdentityError("Pending next_row_state enforcement_mode violation")
+
+    for row_id in ("L2", "L3", "L4", "L6", "O3", "O6", "O7", "O8", "O9"):
+        c_entry = committed_state.get(row_id)
+        if isinstance(c_entry, Mapping) and c_entry.get("latched") is True:
+            p_entry = pending_state.get(row_id)
+            if _has_authorized_pending_clear(
+                authorized_events,
+                row_id=row_id,
+                scope_kind="account",
+                rej_ds=rej_ds,
+                expected_base_session_date=expected_base_session_date,
+                trip_session=c_entry.get("trip_session"),
+                cooling_off_until=c_entry.get("cooling_off_until"),
+            ):
+                if p_entry is not None and not isinstance(p_entry, Mapping):
+                    raise EngineIdentityError(f"Pending state invalid {row_id} entry")
+                continue
+            if not isinstance(p_entry, Mapping) or p_entry.get("latched") is not True:
+                raise EngineIdentityError(
+                    f"Pending state downgraded or cleared committed {row_id} latch"
+                )
+            if (
+                c_entry.get("trip_session") is not None
+                and p_entry.get("trip_session") != c_entry.get("trip_session")
+            ):
+                raise EngineIdentityError(
+                    f"Pending state altered committed {row_id} trip_session"
+                )
+            if (
+                row_id == "L3"
+                and c_entry.get("cooling_off_until") is not None
+                and p_entry.get("cooling_off_until") != c_entry.get("cooling_off_until")
+            ):
+                raise EngineIdentityError("Pending state altered committed L3 cooling_off_until")
+
+    c_o5 = committed_state.get("O5")
+    if isinstance(c_o5, Mapping):
+        c_cnt = c_o5.get("rejection_count", 0)
+        c_latched = c_o5.get("latched") is True
+        c_last_sess = c_o5.get("last_rejection_session")
+        p_o5 = pending_state.get("O5")
+        o5_authorized = c_latched and _has_authorized_pending_clear(
+            authorized_events,
+            row_id="O5",
+            scope_kind="account",
+            rej_ds=rej_ds,
+            expected_base_session_date=expected_base_session_date,
+            trip_session=c_o5.get("trip_session"),
+        )
+        if c_latched and not o5_authorized:
+            if not isinstance(p_o5, Mapping) or p_o5.get("latched") is not True:
+                raise EngineIdentityError("Pending state cleared committed O5 latch")
+        same_o5_session = (
+            c_last_sess is None
+            or c_last_sess == rej_ds
+            or (isinstance(p_o5, Mapping) and p_o5.get("last_rejection_session") == c_last_sess)
+        )
+        if (
+            not o5_authorized
+            and (c_latched or same_o5_session)
+            and isinstance(c_cnt, int)
+            and not isinstance(c_cnt, bool)
+            and c_cnt > 0
+        ):
+            p_cnt = p_o5.get("rejection_count", 0) if isinstance(p_o5, Mapping) else -1
+            if isinstance(p_cnt, bool) or not isinstance(p_cnt, int) or p_cnt < c_cnt:
+                raise EngineIdentityError("Pending state reduced committed O5 rejection_count")
+        elif isinstance(p_o5, Mapping) and "rejection_count" in p_o5:
+            p_cnt = p_o5.get("rejection_count")
+            if isinstance(p_cnt, bool) or not isinstance(p_cnt, int) or p_cnt < 0:
+                raise EngineIdentityError("Pending state invalid O5 rejection_count")
+
+    c_l5 = committed_state.get("L5")
+    if isinstance(c_l5, Mapping):
+        c_l5_fresh = c_l5.get("fresh_session_count", 0)
+        c_l5_fresh_int = (
+            c_l5_fresh
+            if isinstance(c_l5_fresh, int) and not isinstance(c_l5_fresh, bool)
+            else 0
+        )
+        p_l5 = pending_state.get("L5")
+        if (c_l5.get("active") is True or c_l5.get("latched") is True) and (
+            c_l5.get("trip_session") == rej_ds
+            or (c_l5.get("trip_session") is None and c_l5_fresh_int < 1)
+        ):
+            if not isinstance(p_l5, Mapping) or not (p_l5.get("active") or p_l5.get("latched")):
+                raise EngineIdentityError("Pending state cleared active L5 session interlock")
+        if isinstance(p_l5, Mapping):
+            p_l5_fresh = p_l5.get("fresh_session_count", 0)
+            if isinstance(p_l5_fresh, bool) or not isinstance(p_l5_fresh, int) or p_l5_fresh < 0:
+                raise EngineIdentityError("Pending state invalid L5 fresh_session_count")
+            l5_steps = _max_elapsed_session_steps(
+                (c_l5.get("last_session"), c_l5.get("trip_session"), expected_base_session_date),
+                rej_ds,
+                default_when_unknown=1,
+            )
+            if (c_l5.get("active") is True or c_l5.get("latched") is True) and p_l5_fresh > c_l5_fresh_int + l5_steps:
+                raise EngineIdentityError("Pending state forged L5 fresh_session_count advancement")
+
+    c_o1 = committed_state.get("O1")
+    c_o1_fresh = (
+        c_o1.get("fresh_session_count", 0)
+        if isinstance(c_o1, Mapping)
+        and isinstance(c_o1.get("fresh_session_count", 0), int)
+        and not isinstance(c_o1.get("fresh_session_count", 0), bool)
+        else 0
+    )
+    p_o1 = pending_state.get("O1")
+    if isinstance(p_o1, Mapping):
+        p_o1_fresh = p_o1.get("fresh_session_count", 0)
+        if isinstance(p_o1_fresh, bool) or not isinstance(p_o1_fresh, int) or p_o1_fresh < 0:
+            raise EngineIdentityError("Pending state invalid O1 fresh_session_count")
+        if isinstance(c_o1, Mapping) and c_o1.get("last_tripped_session") == rej_ds:
+            if p_o1.get("last_tripped_session") != rej_ds or p_o1_fresh != 0:
+                raise EngineIdentityError("Pending state cleared same-session O1 trip")
+        if p_o1.get("last_tripped_session") == rej_ds and p_o1_fresh != 0:
+            raise EngineIdentityError("Pending state inconsistent same-session O1 fresh_session_count")
+        if isinstance(c_o1, Mapping) or expected_base_session_date is not None:
+            o1_steps = _max_elapsed_session_steps(
+                (
+                    c_o1.get("last_session") if isinstance(c_o1, Mapping) else None,
+                    c_o1.get("last_tripped_session") if isinstance(c_o1, Mapping) else None,
+                    expected_base_session_date,
+                ),
+                rej_ds,
+                default_when_unknown=1,
+            )
+            if p_o1_fresh > c_o1_fresh + o1_steps:
+                raise EngineIdentityError("Pending state forged O1 fresh_session_count advancement")
+
+    for row_id in ("V1", "V3"):
+        c_map = committed_state.get(row_id)
+        if isinstance(c_map, Mapping):
+            p_map = pending_state.get(row_id)
+            for fund, cf in c_map.items():
+                if isinstance(cf, Mapping) and cf.get("latched") is True:
+                    pf = p_map.get(fund) if isinstance(p_map, Mapping) else None
+                    if _has_authorized_pending_clear(
+                        authorized_events,
+                        row_id=row_id,
+                        scope_kind="fund",
+                        target=str(fund),
+                        rej_ds=rej_ds,
+                        expected_base_session_date=expected_base_session_date,
+                        trip_session=cf.get("trip_session"),
+                    ):
+                        if pf is not None and not isinstance(pf, Mapping):
+                            raise EngineIdentityError(f"Pending state invalid {row_id}.{fund} entry")
+                        continue
+                    if not isinstance(pf, Mapping) or pf.get("latched") is not True:
+                        raise EngineIdentityError(
+                            f"Pending state cleared committed {row_id}.{fund} latch"
+                        )
+                    if (
+                        cf.get("trip_session") is not None
+                        and pf.get("trip_session") != cf.get("trip_session")
+                    ):
+                        raise EngineIdentityError(
+                            f"Pending state altered committed {row_id}.{fund} trip_session"
+                        )
+
+    c_v2 = committed_state.get("V2")
+    if isinstance(c_v2, Mapping):
+        p_v2 = pending_state.get("V2")
+        if p_v2 is not None and not isinstance(p_v2, Mapping):
+            raise EngineIdentityError("Pending state invalid V2 section")
+        c_latched = c_v2.get("latched_mismatches")
+        if isinstance(c_latched, Mapping):
+            p_latched = p_v2.get("latched_mismatches") if isinstance(p_v2, Mapping) else None
+            for fund, val in c_latched.items():
+                if val and not _has_authorized_pending_clear(
+                    authorized_events,
+                    row_id="V2",
+                    scope_kind="fund",
+                    target=str(fund),
+                    rej_ds=rej_ds,
+                    expected_base_session_date=expected_base_session_date,
+                    trip_session=c_v2.get("trip_session"),
+                ) and (not isinstance(p_latched, Mapping) or not p_latched.get(fund)):
+                    raise EngineIdentityError(
+                        f"Pending state cleared committed V2.latched_mismatches.{fund}"
+                    )
+        c_pending = c_v2.get("pending_adjustments")
+        if isinstance(c_pending, Mapping):
+            p_pending = p_v2.get("pending_adjustments") if isinstance(p_v2, Mapping) else None
+            latched_map = c_latched if isinstance(c_latched, Mapping) else {}
+            for fund, val in c_pending.items():
+                if val and latched_map.get(fund) and not _has_authorized_pending_clear(
+                    authorized_events,
+                    row_id="V2",
+                    scope_kind="fund",
+                    target=str(fund),
+                    rej_ds=rej_ds,
+                    expected_base_session_date=expected_base_session_date,
+                    trip_session=c_v2.get("trip_session"),
+                ) and (
+                    not isinstance(p_pending, Mapping) or not p_pending.get(fund)
+                ):
+                    raise EngineIdentityError(
+                        f"Pending state cleared committed V2.pending_adjustments.{fund}"
+                    )
+
+    c_v4 = committed_state.get("V4")
+    if isinstance(c_v4, Mapping):
+        p_v4 = pending_state.get("V4")
+        for fund, cf in c_v4.items():
+            if isinstance(cf, Mapping) and cf.get("clearing_counter") is not None:
+                c_cnt = cf["clearing_counter"]
+                c_last = cf.get("last_session_below_threshold")
+                if not isinstance(c_cnt, int) or isinstance(c_cnt, bool):
+                    raise EngineIdentityError(f"Invalid committed V4.{fund} clearing_counter")
+                max_steps = _max_elapsed_session_steps(
+                    (c_last, expected_base_session_date),
+                    rej_ds,
+                    default_when_unknown=1,
+                )
+                if not isinstance(p_v4, Mapping):
+                    raise EngineIdentityError(
+                        f"Pending state cleared active V4.{fund} clearing state"
+                    )
+                pf = p_v4.get(fund)
+                if pf is not None and not isinstance(pf, Mapping):
+                    raise EngineIdentityError(f"Invalid pending V4.{fund} clearing state")
+                p_cnt = pf.get("clearing_counter") if isinstance(pf, Mapping) else None
+                if pf is None or p_cnt is None:
+                    # FUSE-1 clear_v4_state removes V4[fund] only once clearing reaches 10 calm sessions
+                    if c_cnt + max_steps < 10:
+                        raise EngineIdentityError(
+                            f"Pending state cleared active V4.{fund} clearing state"
+                        )
+                    continue
+                if isinstance(p_cnt, bool) or not isinstance(p_cnt, int):
+                    raise EngineIdentityError(
+                        f"Pending state cleared active V4.{fund} clearing state"
+                    )
+                max_allowed = c_cnt + max_steps
+                if p_cnt < 0 or p_cnt >= 10 or p_cnt > max_allowed:
+                    raise EngineIdentityError(
+                        f"Pending state forged V4.{fund} clearing_counter jump ({c_cnt} -> {p_cnt})"
+                    )
+                if p_cnt > c_cnt:
+                    p_last = pf.get("last_session_below_threshold") if isinstance(pf, Mapping) else None
+                    if (
+                        not isinstance(p_last, str)
+                        or not _DATE_YYYY_MM_DD_RE.fullmatch(p_last)
+                        or p_last > rej_ds
+                    ):
+                        raise EngineIdentityError(
+                            f"Pending state V4.{fund} clearing_counter incremented without matching session"
+                        )
+                    try:
+                        date.fromisoformat(p_last)
+                    except ValueError as exc:
+                        raise EngineIdentityError(
+                            f"Pending state V4.{fund} clearing_counter invalid session date"
+                        ) from exc
+                    if (
+                        isinstance(c_last, str)
+                        and _DATE_YYYY_MM_DD_RE.fullmatch(c_last)
+                        and p_last <= c_last
+                    ) or (
+                        expected_base_session_date is not None
+                        and p_last <= expected_base_session_date
+                    ):
+                        raise EngineIdentityError(
+                            f"Pending state V4.{fund} clearing_counter incremented without newer session"
+                        )
+                    steps_to_p_last = _max_elapsed_session_steps(
+                        (c_last, expected_base_session_date),
+                        p_last,
+                        default_when_unknown=1,
+                    )
+                    if p_cnt > c_cnt + steps_to_p_last:
+                        raise EngineIdentityError(
+                            f"Pending state forged V4.{fund} clearing_counter jump ({c_cnt} -> {p_cnt})"
+                        )
+
+    c_v5 = committed_state.get("V5")
+    if isinstance(c_v5, Mapping):
+        p_v5 = pending_state.get("V5")
+        for fund, cf in c_v5.items():
+            if not isinstance(cf, Mapping):
+                continue
+            c_esc = bool(cf.get("escalated"))
+            c_cnt = cf.get("consecutive_beyond_tolerance", 0)
+            c_cnt_int = c_cnt if isinstance(c_cnt, int) and not isinstance(c_cnt, bool) else 0
+            c_last = cf.get("last_session")
+            pf = p_v5.get(fund) if isinstance(p_v5, Mapping) else None
+            if (c_esc or c_cnt_int >= 40) and not _has_authorized_pending_clear(
+                authorized_events,
+                row_id="V5",
+                scope_kind="fund",
+                target=str(fund),
+                rej_ds=rej_ds,
+                expected_base_session_date=expected_base_session_date,
+                trip_session=cf.get("trip_session"),
+            ):
+                p_cnt_val = pf.get("consecutive_beyond_tolerance", 0) if isinstance(pf, Mapping) else -1
+                if (
+                    not isinstance(pf, Mapping)
+                    or pf.get("escalated") is not True
+                    or isinstance(p_cnt_val, bool)
+                    or not isinstance(p_cnt_val, int)
+                    or p_cnt_val < c_cnt_int
+                ):
+                    raise EngineIdentityError(f"Pending state downgraded escalated V5.{fund}")
+            if isinstance(pf, Mapping):
+                p_cnt = pf.get("consecutive_beyond_tolerance", 0)
+                v5_steps = _max_elapsed_session_steps(
+                    (c_last, expected_base_session_date),
+                    rej_ds,
+                    default_when_unknown=1,
+                )
+                max_allowed = c_cnt_int + v5_steps
+                if (
+                    isinstance(p_cnt, bool)
+                    or not isinstance(p_cnt, int)
+                    or p_cnt < 0
+                    or p_cnt > max_allowed
+                ):
+                    raise EngineIdentityError(f"Pending state forged V5.{fund} counter")
+
+    c_o4 = committed_state.get("O4")
+    if isinstance(c_o4, Mapping):
+        p_o4 = pending_state.get("O4")
+        for sym, cs in c_o4.items():
+            if isinstance(cs, Mapping) and "original_order_id" in cs:
+                ps = p_o4.get(sym) if isinstance(p_o4, Mapping) else None
+                if ps is None and allowed_o4_resolved_symbols and sym in allowed_o4_resolved_symbols:
+                    continue
+                if _has_authorized_pending_clear(
+                    authorized_events,
+                    row_id="O4",
+                    scope_kind="symbol",
+                    target=str(sym),
+                    rej_ds=rej_ds,
+                    expected_base_session_date=expected_base_session_date,
+                    trip_session=cs.get("trip_session"),
+                ):
+                    continue
+                if not isinstance(ps, Mapping) or ps.get("original_order_id") != cs["original_order_id"]:
+                    raise EngineIdentityError(f"Pending state altered committed O4.{sym}")
+
+    c_by_tier = committed_state.get("_by_tier")
+    p_by_tier = pending_state.get("_by_tier")
+    if isinstance(c_by_tier, Mapping) and p_by_tier is not None:
+        if not isinstance(p_by_tier, Mapping):
+            raise EngineIdentityError("Pending state invalid _by_tier section")
+        for t_name, c_tier_state in c_by_tier.items():
+            if not isinstance(c_tier_state, Mapping):
+                continue
+            p_tier_state = p_by_tier.get(t_name)
+            if not isinstance(p_tier_state, Mapping):
+                raise EngineIdentityError(f"Pending state missing committed _by_tier.{t_name}")
+            _assert_pending_state_preserves_committed_breakers(
+                c_tier_state,
+                p_tier_state,
+                rej_ds=rej_ds,
+                expected_engine_hash=expected_engine_hash,
+                expected_spec_version=expected_spec_version,
+                expected_base_session_date=expected_base_session_date,
+                allowed_o4_resolved_symbols=allowed_o4_resolved_symbols,
+                authorized_events=authorized_events,
+            )
+
+
+def authenticate_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    expected_pending_state_sha256: str | None = None,
+    require_external_pending_auth: bool = False,
+) -> dict | None:
+    """Validate optional/required external digest authentication for pending_rejected_state.json."""
+    if expected_pending_state_sha256 is not None:
+        if not isinstance(expected_pending_state_sha256, str) or not _HEX64_RE.fullmatch(
+            expected_pending_state_sha256
+        ):
+            raise EngineIdentityError(
+                f"invalid_expected_pending_state_sha256:{expected_pending_state_sha256!r}"
+            )
+    if require_external_pending_auth and expected_pending_state_sha256 is None:
+        raise EngineIdentityError(
+            "production_pending_rejected_state_unauthenticated: require expected_pending_state_sha256 (or NO_PENDING_REJECTED_STATE_SHA256)"
+        )
+    s_dir = Path(snapshots_dir)
+    target = s_dir / "pending_rejected_state.json"
+    if not target.is_file():
+        if expected_pending_state_sha256 is not None and not hmac.compare_digest(
+            expected_pending_state_sha256,
+            NO_PENDING_REJECTED_STATE_SHA256,
+        ):
+            raise EngineIdentityError("production_pending_rejected_state_missing")
+        return None
+    if expected_pending_state_sha256 is not None and hmac.compare_digest(
+        expected_pending_state_sha256,
+        NO_PENDING_REJECTED_STATE_SHA256,
+    ):
+        raise EngineIdentityError(
+            "production_pending_rejected_state_unexpected: pending_rejected_state.json exists but NO_PENDING_REJECTED_STATE_SHA256 was provided"
+        )
+    try:
+        payload = parse_json_no_duplicates(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineIdentityError(f"Corrupt pending rejected state snapshot {target}: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != "c-sh-pending-rejected-state-v1":
+        raise EngineIdentityError(f"Invalid pending rejected state snapshot schema in {target}")
+    if expected_pending_state_sha256 is not None and not hmac.compare_digest(
+        compute_pending_rejected_state_sha256(payload),
+        expected_pending_state_sha256,
+    ):
+        raise EngineIdentityError("production_pending_rejected_state_mismatch")
+    return payload
+
+
+def load_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    expected_chain_id: str,
+    expected_base_sequence: int,
+    expected_base_record_sha256: str,
+    current_session_date: str,
+    expected_engine_hash: str,
+    expected_spec_version: str,
+    expected_base_prior_state_sha256: str | None = None,
+    committed_base_prior_row_state: Mapping[str, Any] | None = None,
+    expected_base_session_date: str | None = None,
+    expected_pending_state_sha256: str | None = None,
+    require_external_pending_auth: bool = False,
+) -> tuple[dict, dict] | None:
+    """Load and verify pending O1/O2 rejected-day row state if present (fail closed on tamper/drift)."""
+    payload = authenticate_pending_rejected_state_snapshot(
+        snapshots_dir,
+        expected_pending_state_sha256=expected_pending_state_sha256,
+        require_external_pending_auth=require_external_pending_auth,
+    )
+    if payload is None:
+        return None
+    if payload.get("chain_id") != expected_chain_id:
+        raise EngineIdentityError(
+            f"Pending state chain_id mismatch: expected {expected_chain_id!r}, got {payload.get('chain_id')!r}"
+        )
+    if payload.get("base_sequence") != expected_base_sequence:
+        raise EngineIdentityError(
+            f"Pending state base_sequence mismatch: expected {expected_base_sequence}, got {payload.get('base_sequence')!r}"
+        )
+    if payload.get("base_record_sha256") != expected_base_record_sha256:
+        raise EngineIdentityError("Pending state base_record_sha256 mismatch")
+    if payload.get("engine_hash") != expected_engine_hash:
+        raise EngineIdentityError("Pending state engine_hash mismatch")
+    if payload.get("spec_version") != expected_spec_version:
+        raise EngineIdentityError("Pending state spec_version mismatch")
+    rej_ds = payload.get("rejected_session_date")
+    if (
+        not isinstance(rej_ds, str)
+        or not _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds)
+        or rej_ds > current_session_date
+    ):
+        raise EngineIdentityError(
+            f"Pending state rejected_session_date invalid or after {current_session_date}: {rej_ds!r}"
+        )
+    try:
+        date.fromisoformat(rej_ds)
+    except ValueError as exc:
+        raise EngineIdentityError(f"Pending state rejected_session_date invalid: {rej_ds!r}") from exc
+
+    state_obj = payload.get("next_row_state")
+    if not isinstance(state_obj, dict):
+        raise EngineIdentityError("Pending state next_row_state must be a dict")
+    if payload.get("state_sha256") != _sha256_canonical_state_dict(state_obj):
+        raise EngineIdentityError("Pending state checksum mismatch")
+
+    base_obj: dict | None = None
+    if "base_prior_row_state" in payload:
+        raw_base = payload.get("base_prior_row_state")
+        if not isinstance(raw_base, dict):
+            raise EngineIdentityError("Pending state base_prior_row_state must be a dict")
+        base_sha = _sha256_canonical_state_dict(raw_base)
+        if (
+            "base_prior_state_sha256" in payload
+            and payload.get("base_prior_state_sha256") != base_sha
+        ):
+            raise EngineIdentityError("Pending state base_prior_state checksum mismatch")
+        if expected_base_prior_state_sha256 is not None and base_sha != expected_base_prior_state_sha256:
+            raise EngineIdentityError(
+                "Pending state base_prior_row_state does not match committed ledger state digest"
+            )
+        base_obj = raw_base
+    elif expected_base_prior_state_sha256 is not None:
+        raise EngineIdentityError("Pending state missing ledger-bound base_prior_row_state")
+
+    eff_committed: Mapping[str, Any] | None = committed_base_prior_row_state
+    if eff_committed is not None:
+        if (
+            expected_base_prior_state_sha256 is not None
+            and _sha256_canonical_state_dict(eff_committed) != expected_base_prior_state_sha256
+        ):
+            raise EngineIdentityError(
+                "Committed base row state digest mismatch while verifying pending rejected state"
+            )
+    elif expected_base_prior_state_sha256 is not None and base_obj is not None:
+        eff_committed = base_obj
+
+    raw_pend_rev = payload.get("pending_revision")
+    if raw_pend_rev is not None and (
+        isinstance(raw_pend_rev, bool)
+        or not isinstance(raw_pend_rev, int)
+        or raw_pend_rev < 1
+    ):
+        raise EngineIdentityError("Pending state pending_revision must be a positive integer")
+
+    raw_auth = payload.get("authorized_events")
+    if raw_auth is not None:
+        if not isinstance(raw_auth, list) or not all(isinstance(ev, dict) for ev in raw_auth):
+            raise EngineIdentityError("Pending state authorized_events must be a list of dicts")
+
+    if eff_committed is not None:
+        raw_resolved = payload.get("o4_resolved_symbols")
+        allowed_resolved = (
+            {str(s) for s in raw_resolved if isinstance(s, str) and s}
+            if isinstance(raw_resolved, list)
+            else set()
+        )
+        _assert_pending_state_preserves_committed_breakers(
+            eff_committed,
+            state_obj,
+            rej_ds=rej_ds,
+            expected_engine_hash=expected_engine_hash,
+            expected_spec_version=expected_spec_version,
+            expected_base_session_date=expected_base_session_date,
+            allowed_o4_resolved_symbols=allowed_resolved,
+            authorized_events=raw_auth,
+        )
+
+    return state_obj, payload
