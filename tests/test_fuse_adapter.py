@@ -2278,6 +2278,37 @@ class FuseAdapterTest(unittest.TestCase):
                 self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input", msg=label)
                 self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=label)
 
+    def test_missing_q_pre_fails_closed_via_o1_and_preserves_l6_latch(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+
+        si = json.loads(json.dumps(_valid_inputs()))
+        si["funds"]["TQQQ"].pop("q_pre", None)
+        si["index_one_session_returns"] = {"NDX": -0.10, "SEMI": -0.02}
+
+        built = build_record_body(
+            chain_id="prod-sh2-v1",
+            sequence=0,
+            prev_record_sha256="0" * 64,
+            mode="production",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=si,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state=None,
+            calendar_spec=spec,
+            discipline_labels={"forward_clock_credit_eligible": False},
+        )
+        self.assertFalse(built["appended"])
+        self.assertTrue(built["fail_closed"])
+        self.assertNotEqual(built["o1_output"]["state"], "NORMAL")
+        self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
+        self.assertTrue(built["next_row_state"]["L6"].get("latched"))
+
 
 if __name__ == "__main__":
     unittest.main()

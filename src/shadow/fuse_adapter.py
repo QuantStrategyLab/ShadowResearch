@@ -1169,7 +1169,7 @@ def build_fuse_validated_inputs(
         if not isinstance(fdata, Mapping):
             continue
         close_val = _finite_number(fdata.get("close_price"))
-        q_pre_val = _resolve_sizing_q_pre(fdata.get("q_pre", 0), tier)
+        q_pre_val = _resolve_sizing_q_pre(fdata.get("q_pre"), tier)
         sigma_val = _finite_number(fdata.get("sigma_forecast"))
         signal_ok = _is_valid_sizing_signal(fdata.get("s"))
         if sigma_val is None or sigma_val <= 0.0:
