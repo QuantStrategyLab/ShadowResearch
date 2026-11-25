@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import http.client
+import io
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -49,17 +51,17 @@ def _set_stream_socket_timeout(stream: Any, remaining: float) -> None:
                 stack.append(child)
 
 
-class _DeadlineStreamProxy:
-    """Wrap HTTPResponse.fp so header and chunked reads enforce a monotonic total deadline."""
+class _DeadlineSocketProxy:
+    """Wrap a socket/SSLSocket so every low-level recv/send/makefile enforces a monotonic deadline."""
 
     def __init__(
         self,
-        fp: Any,
+        sock: Any,
         *,
         deadline_monotonic: float,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._fp = fp
+        self._sock = sock
         self._deadline_monotonic = deadline_monotonic
         self._clock = clock
 
@@ -67,36 +69,83 @@ class _DeadlineStreamProxy:
         rem = _remaining_timeout(self._deadline_monotonic, clock=self._clock)
         if rem <= 0:
             raise TimeoutError("http_response_deadline_exceeded")
-        _set_stream_socket_timeout(self._fp, rem)
+        _set_stream_socket_timeout(self._sock, rem)
 
     def _call_with_deadline(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         self._enforce_before()
-        out = getattr(self._fp, method_name)(*args, **kwargs)
+        out = getattr(self._sock, method_name)(*args, **kwargs)
         if self._clock() > self._deadline_monotonic:
             raise TimeoutError("http_response_deadline_exceeded")
         return out
 
-    def readline(self, *args: Any) -> bytes:
-        return self._call_with_deadline("readline", *args)
+    def recv(self, *args: Any, **kwargs: Any) -> bytes:
+        return self._call_with_deadline("recv", *args, **kwargs)
 
-    def read(self, *args: Any) -> bytes:
-        return self._call_with_deadline("read", *args)
+    def recv_into(self, *args: Any, **kwargs: Any) -> int:
+        return self._call_with_deadline("recv_into", *args, **kwargs)
 
-    def read1(self, *args: Any) -> bytes:
-        return self._call_with_deadline("read1", *args)
+    def send(self, *args: Any, **kwargs: Any) -> int:
+        return self._call_with_deadline("send", *args, **kwargs)
 
-    def readinto(self, b: Any) -> int | None:
-        return self._call_with_deadline("readinto", b)
+    def sendall(self, *args: Any, **kwargs: Any) -> None:
+        self._call_with_deadline("sendall", *args, **kwargs)
 
-    def peek(self, *args: Any) -> bytes:
-        return self._call_with_deadline("peek", *args)
+    def makefile(
+        self,
+        mode: str = "r",
+        buffering: int | None = None,
+        *,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> Any:
+        if not set(mode) <= {"r", "w", "b"}:
+            raise ValueError(f"invalid mode: {mode!r}")
+        writing = "w" in mode
+        reading = "r" in mode or not writing
+        binary = "b" in mode
+        rawmode = ("r" if reading else "") + ("w" if writing else "")
+        raw = socket.SocketIO(self, rawmode)
+        if hasattr(self._sock, "_io_refs"):
+            self._sock._io_refs += 1
+        if buffering is None:
+            buffering = -1
+        if buffering < 0:
+            buffering = io.DEFAULT_BUFFER_SIZE
+        if buffering == 0:
+            if not binary:
+                raise ValueError("unbuffered streams must be binary")
+            return raw
+        if reading and writing:
+            buf: Any = io.BufferedRWPair(raw, raw, buffering)
+        elif reading:
+            buf = io.BufferedReader(raw, buffering)
+        else:
+            buf = io.BufferedWriter(raw, buffering)
+        if binary:
+            return buf
+        return io.TextIOWrapper(buf, encoding=encoding, errors=errors, newline=newline)
+
+    def _decref_socketios(self) -> None:
+        decref = getattr(self._sock, "_decref_socketios", None)
+        if callable(decref):
+            decref()
+        else:
+            self._sock.close()
+
+    def settimeout(self, timeout: float | None) -> None:
+        rem = _remaining_timeout(self._deadline_monotonic, clock=self._clock)
+        if rem <= 0:
+            raise TimeoutError("http_response_deadline_exceeded")
+        eff = rem if timeout is None else min(float(timeout), rem)
+        _set_stream_socket_timeout(self._sock, eff)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._fp, name)
+        return getattr(self._sock, name)
 
 
 class _DeadlineHTTPResponse(http.client.HTTPResponse):
-    """HTTPResponse whose underlying fp enforces an elapsed monotonic deadline."""
+    """HTTPResponse whose underlying socket enforces an elapsed monotonic deadline per socket op."""
 
     _deadline_monotonic: float = 0.0
     _deadline_clock: Callable[[], float] = staticmethod(time.monotonic)
@@ -108,12 +157,12 @@ class _DeadlineHTTPResponse(http.client.HTTPResponse):
         method: str | None = None,
         url: str | None = None,
     ) -> None:
-        super().__init__(sock, debuglevel=debuglevel, method=method, url=url)
-        self.fp = _DeadlineStreamProxy(
-            self.fp,
+        wrapped_sock = _DeadlineSocketProxy(
+            sock,
             deadline_monotonic=type(self)._deadline_monotonic,
             clock=type(self)._deadline_clock,
         )
+        super().__init__(wrapped_sock, debuglevel=debuglevel, method=method, url=url)
 
 
 class _DeadlineConnectionMixin:

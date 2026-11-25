@@ -2387,6 +2387,14 @@ class CloudRunJobTest(unittest.TestCase):
                         return
                     self._drip_bytes(b"X-Drip: 1\r\n", 8, 0.15)
                     return
+                if self.path == "/slow-single-header-line":
+                    try:
+                        self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    self._drip_bytes(b"a", 25, 0.05)
+                    return
                 if self.path == "/slow-500":
                     self.send_response(500)
                     self.send_header("Content-Length", "80")
@@ -2435,6 +2443,11 @@ class CloudRunJobTest(unittest.TestCase):
             with self.assertRaises(SourceUnavailableError):
                 urllib_fetch_bytes(f"{base}/slow-headers", timeout=0.20)
             self.assertLess(_time.monotonic() - t2, 0.50)
+
+            t2b = _time.monotonic()
+            with self.assertRaises(SourceUnavailableError):
+                urllib_fetch_bytes(f"{base}/slow-single-header-line", timeout=0.20)
+            self.assertLess(_time.monotonic() - t2b, 0.45)
 
             t3 = _time.monotonic()
             st_m, body_m = urllib_fetch_bytes(f"{base}/slow-500", timeout=0.20)

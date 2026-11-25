@@ -11,12 +11,13 @@ import re
 import sys
 import types
 from collections.abc import Mapping
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from shadow.evaluator import ALL_BREAKER_IDS, REQUIRED_MARKET_SERIES, StubEvaluator
 from shadow.sizing import (
+    INSTRUMENT_ORDER,
     TIER_CONFIGS,
     SizingInputError,
     canonical_decimal_str,
@@ -680,6 +681,17 @@ _INDEX_RETURN_LABELS = (
 )
 
 
+def _is_valid_sizing_signal(raw: object) -> bool:
+    """Return True when raw decodes to a finite Decimal signal within sizing's [0, 1] contract."""
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        dec = Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+    return dec.is_finite() and Decimal("0") <= dec <= Decimal("1")
+
+
 def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
     cur_f = _finite_number(cur_raw)
     prev_f = _finite_number(prev_raw)
@@ -1104,6 +1116,9 @@ def build_fuse_validated_inputs(
     conv_scale = _derive_conv_scale(session_inputs, bankroll_val, hwm_val)
     fuse_funds: dict[str, dict[str, Any]] = {}
     joint_exposure_dec: Decimal | None = Decimal("0") if conv_scale is not None else None
+    for req_inst in INSTRUMENT_ORDER:
+        if not isinstance(raw_funds.get(req_inst), Mapping):
+            mkt_ok = False
     for symbol in sorted(raw_funds.keys()):
         fdata = raw_funds[symbol]
         if not isinstance(fdata, Mapping):
@@ -1111,9 +1126,10 @@ def build_fuse_validated_inputs(
         close_val = _finite_number(fdata.get("close_price"))
         q_pre_val = _resolve_sizing_q_pre(fdata.get("q_pre", 0), tier)
         sigma_val = _finite_number(fdata.get("sigma_forecast"))
+        signal_ok = _is_valid_sizing_signal(fdata.get("s"))
         if sigma_val is None or sigma_val <= 0.0:
             vol_ok = False
-        if close_val is None or q_pre_val is None:
+        if close_val is None or close_val <= 0.0 or q_pre_val is None or not signal_ok:
             mkt_ok = False
         pos_val = (close_val * q_pre_val) if (close_val is not None and q_pre_val is not None) else 0.0
         if joint_exposure_dec is not None and conv_scale is not None:

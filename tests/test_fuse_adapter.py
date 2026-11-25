@@ -2187,6 +2187,41 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(rows2["V2"]["state"], "NORMAL")
         self.assertNotEqual(rows2["V2"].get("reason"), "pending_corporate_action_carried_TQQQ")
 
+    def test_invalid_or_missing_fund_signal_fails_closed_in_o1_preserving_l6(self) -> None:
+        from shadow.ledger import build_record_body
+
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+        for bad_s in ("2", "-0.1", "not-a-num", None):
+            si = json.loads(json.dumps(_valid_inputs()))
+            si["funds"]["TQQQ"]["s"] = bad_s
+            si["index_one_session_returns"] = {"NDX": -0.11, "SEMI": -0.02}
+            si["positions_source_record"] = {"as_of": "2026-01-05T22:00:00.000Z", "age_sessions": 0}
+            si["broker_reconciliation_source_record"] = {
+                "as_of": "2026-01-05T22:00:00.000Z",
+                "age_sessions": 0,
+            }
+            built = build_record_body(
+                chain_id="prod-sh2-v1",
+                sequence=0,
+                prev_record_sha256="0" * 64,
+                mode="production",
+                session_date="2026-01-05",
+                decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+                session_inputs=si,
+                calendar_session=cal,
+                code_version_sha="a" * 64,
+                evaluator=ev,
+                prior_row_state=None,
+                discipline_labels={"forward_clock_credit_eligible": False},
+            )
+            self.assertFalse(built["appended"], msg=f"bad_s={bad_s!r}")
+            self.assertTrue(built["fail_closed"], msg=f"bad_s={bad_s!r}")
+            self.assertEqual(built["o1_output"]["reason"], "stale_or_missing_input")
+            self.assertTrue(built["o1_output"].get("would_have_tripped"), msg=f"bad_s={bad_s!r}")
+            self.assertTrue(built["next_row_state"]["L6"].get("latched"), msg=f"bad_s={bad_s!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
