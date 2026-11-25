@@ -2025,6 +2025,29 @@ def run_production_cycle(
     )
 
 
+def _resolve_cycle_network_deadlines(
+    t_start: float,
+    cfg: DrillSchedulerConfig,
+) -> tuple[float, float]:
+    """Return (market_deadline, network_deadline) leaving reporting reserve before task_timeout."""
+    raw_task_timeout = (cfg.resource_caps or {}).get("task_timeout_seconds", 300)
+    task_timeout = (
+        float(raw_task_timeout)
+        if isinstance(raw_task_timeout, (int, float))
+        and not isinstance(raw_task_timeout, bool)
+        and float(raw_task_timeout) > 0
+        else 300.0
+    )
+    reporting_reserve = min(45.0, task_timeout * 0.25)
+    network_deadline = t_start + max(1.0, task_timeout - reporting_reserve)
+    ots_reserve = min(
+        float(cfg.ots_timeout_seconds) * 2.0,
+        max(0.0, (task_timeout - reporting_reserve) * 0.25),
+    )
+    market_deadline = max(t_start + 1.0, network_deadline - ots_reserve)
+    return market_deadline, network_deadline
+
+
 def _execute_cycle_with_config(
     *,
     t_start: float,
@@ -3573,6 +3596,7 @@ def _run_daily_drill_cycle_locked(
     )
 
     # Step 1 & 2: Fetch canonical 7-series (with per-provider timestamps) inside [session_close_utc, decision_cutoff_utc]
+    market_deadline, network_deadline = _resolve_cycle_network_deadlines(t_start, cfg)
     required_for_eval = REQUIRED_MARKET_SERIES
     if cfg.mode == "production" and fixtures_dir is not None:
         raise ValueError("production_mode_forbids_offline_fixtures")
@@ -3607,6 +3631,7 @@ def _run_daily_drill_cycle_locked(
             decision_cutoff_utc=decision_cutoff_utc,
             observation_class="decision_time_market" if cfg.mode == "production" else "synthetic",
             auto_advance_revision=True,
+            deadline_monotonic=market_deadline if (transport is None and clock is None) else None,
         )
 
     raw_integrity_failures: list[str] = []
@@ -3999,6 +4024,7 @@ def _run_daily_drill_cycle_locked(
         calendars=cfg.ots_calendars,
         transport=ots_transport,
         timeout=cfg.ots_timeout_seconds,
+        deadline_monotonic=network_deadline if (ots_client is None and ots_transport is None) else None,
     )
 
     ots_bytes: bytes | None = None

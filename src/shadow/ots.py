@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
@@ -12,7 +13,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from shadow.http_limits import read_bounded_error_body, read_bounded_http_body
+from shadow.http_limits import (
+    make_deadline_http_handlers,
+    read_bounded_error_body,
+    read_bounded_http_body,
+)
 
 OTS_HEADER_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
 OTS_VERSION = 1
@@ -548,12 +553,31 @@ def urllib_ots_transport(
     *,
     opener: urllib.request.OpenerDirector | None = None,
     max_bytes: int = DEFAULT_MAX_OTS_RESPONSE_BYTES,
+    deadline_monotonic: float | None = None,
 ) -> tuple[int, bytes]:
     """Perform stdlib HTTP POST/GET for OpenTimestamps calendar servers without following redirects."""
+    now = time.monotonic()
+    req_deadline = now + float(timeout)
+    eff_deadline = (
+        min(req_deadline, deadline_monotonic)
+        if deadline_monotonic is not None
+        else req_deadline
+    )
+    if eff_deadline <= now:
+        raise OtsSubmitError("ots_transport_error:deadline_exceeded")
     req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
-    active_opener = opener if opener is not None else urllib.request.build_opener(_NoOtsRedirectHandler())
+    if opener is None:
+        http_handler, https_handler = make_deadline_http_handlers(eff_deadline)
+        active_opener = urllib.request.build_opener(
+            http_handler,
+            https_handler,
+            _NoOtsRedirectHandler(),
+        )
+    else:
+        active_opener = opener
     try:
-        with active_opener.open(req, timeout=timeout) as resp:
+        remaining = max(0.001, eff_deadline - time.monotonic())
+        with active_opener.open(req, timeout=remaining) as resp:
             content_len = (
                 resp.headers.get("Content-Length") if getattr(resp, "headers", None) is not None else None
             )
@@ -563,10 +587,15 @@ def urllib_ots_transport(
                 error_cls=OtsSubmitError,
                 error_prefix="ots_response_too_large",
                 content_length_header=content_len,
+                deadline_monotonic=eff_deadline,
             )
             return int(resp.status), payload
     except urllib.error.HTTPError as exc:
-        err_body = read_bounded_error_body(exc, max_bytes=max_bytes)
+        err_body = read_bounded_error_body(
+            exc,
+            max_bytes=max_bytes,
+            deadline_monotonic=eff_deadline,
+        )
         return int(exc.code), err_body
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise OtsSubmitError(f"ots_transport_error:{type(exc).__name__}") from exc
@@ -581,12 +610,24 @@ class OpenTimestampsClient:
         calendars: Sequence[str] = DEFAULT_OTS_CALENDARS,
         transport: OtsTransport | None = None,
         timeout: float = 10.0,
+        deadline_monotonic: float | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.calendars = tuple(c.rstrip("/") for c in calendars)
         if not self.calendars:
             raise ValueError("At least one OpenTimestamps calendar URL is required")
         self._transport = transport if transport is not None else urllib_ots_transport
         self.timeout = float(timeout)
+        self.deadline_monotonic = deadline_monotonic
+        self._clock = clock if clock is not None else time.monotonic
+
+    def _remaining_request_timeout(self) -> float | None:
+        if self.deadline_monotonic is None:
+            return self.timeout
+        rem = self.deadline_monotonic - self._clock()
+        if rem <= 0:
+            return None
+        return min(self.timeout, rem)
 
     def stamp_digest(self, record_sha256: str) -> tuple[bytes, dict]:
         """Submit record_sha256 to calendars and return (ots_bytes, proof_metadata)."""
@@ -604,9 +645,13 @@ class OpenTimestampsClient:
         errors: list[str] = []
 
         for cal_url in self.calendars:
+            req_timeout = self._remaining_request_timeout()
+            if req_timeout is None:
+                errors.append(f"{cal_url}:ots_budget_exhausted")
+                break
             endpoint = f"{cal_url}/digest"
             try:
-                status, resp_bytes = self._transport("POST", endpoint, digest_bytes, headers, self.timeout)
+                status, resp_bytes = self._transport("POST", endpoint, digest_bytes, headers, req_timeout)
             except Exception as exc:
                 errors.append(f"{cal_url}:{exc}")
                 continue
@@ -659,8 +704,11 @@ class OpenTimestampsClient:
                 continue
             commit_hex = att.commitment_bytes.hex()
             endpoint = f"{cal_url}/timestamp/{commit_hex}"
+            req_timeout = self._remaining_request_timeout()
+            if req_timeout is None:
+                break
             try:
-                status, resp_bytes = self._transport("GET", endpoint, None, headers, self.timeout)
+                status, resp_bytes = self._transport("GET", endpoint, None, headers, req_timeout)
             except Exception:
                 continue
             if status != 200 or not resp_bytes:

@@ -29,7 +29,12 @@ from shadow.feeder import (
     select_treasury_tbill_row,
     select_yahoo_close,
 )
-from shadow.http_limits import read_bounded_error_body, read_bounded_http_body
+from shadow.http_limits import (
+    DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS,
+    make_deadline_http_handlers,
+    read_bounded_error_body,
+    read_bounded_http_body,
+)
 from shadow.sizing import canonical_decimal_str
 
 MAX_TIINGO_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -183,15 +188,31 @@ def urllib_fetch_bytes(
     url: str,
     headers: Mapping[str, str] | None = None,
     *,
-    timeout: float = 30.0,
+    timeout: float = DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS,
     max_bytes: int | None = None,
+    deadline_monotonic: float | None = None,
 ) -> tuple[int, bytes]:
-    """Perform an HTTP GET via stdlib urllib with cross-host auth redirect protection and byte cap."""
+    """Perform an HTTP GET via stdlib urllib with auth redirect protection, byte cap, and total deadline."""
     limit = max_bytes if max_bytes is not None else _default_max_bytes_for_url(url)
+    now = time.monotonic()
+    req_deadline = now + float(timeout)
+    eff_deadline = (
+        min(req_deadline, deadline_monotonic)
+        if deadline_monotonic is not None
+        else req_deadline
+    )
+    if eff_deadline <= now:
+        raise SourceUnavailableError("transport_error:deadline_exceeded")
     req = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
-    opener = urllib.request.build_opener(_NoCrossHostAuthRedirectHandler())
+    http_handler, https_handler = make_deadline_http_handlers(eff_deadline)
+    opener = urllib.request.build_opener(
+        http_handler,
+        https_handler,
+        _NoCrossHostAuthRedirectHandler(),
+    )
     try:
-        with opener.open(req, timeout=timeout) as resp:
+        remaining = max(0.001, eff_deadline - time.monotonic())
+        with opener.open(req, timeout=remaining) as resp:
             content_len = (
                 resp.headers.get("Content-Length") if getattr(resp, "headers", None) is not None else None
             )
@@ -201,10 +222,15 @@ def urllib_fetch_bytes(
                 error_cls=SourceUnavailableError,
                 error_prefix="response_too_large",
                 content_length_header=content_len,
+                deadline_monotonic=eff_deadline,
             )
             return int(resp.status), payload
     except urllib.error.HTTPError as exc:
-        body = read_bounded_error_body(exc, max_bytes=limit)
+        body = read_bounded_error_body(
+            exc,
+            max_bytes=limit,
+            deadline_monotonic=eff_deadline,
+        )
         return int(exc.code), body
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise SourceUnavailableError(f"transport_error:{type(exc).__name__}") from exc
@@ -309,6 +335,7 @@ class YahooChartAdapter:
         sleeper: Callable[[float], None] | None = None,
         min_spacing_seconds: float = 20.0,
         retry_backoff_seconds: float = 30.0,
+        deadline_monotonic: float | None = None,
     ) -> None:
         self._transport = _resolve_transport(transport)
         self.symbol_map = dict(symbol_map) if symbol_map is not None else dict(DEFAULT_YAHOO_SYMBOL_MAP)
@@ -316,6 +343,7 @@ class YahooChartAdapter:
         self._sleeper = sleeper if sleeper is not None else time.sleep
         self.min_spacing_seconds = float(min_spacing_seconds)
         self.retry_backoff_seconds = float(retry_backoff_seconds)
+        self.deadline_monotonic = deadline_monotonic
         self._last_request_ts: float | None = None
 
     def resolve_symbol(self, series_id: str) -> str:
@@ -366,15 +394,28 @@ class YahooChartAdapter:
                 ) from exc
             raise SourceUnavailableError(f"yahoo_parse_error:{exc}") from exc
 
+    def _sleep_within_budget(self, seconds: float, *, throttled: bool = False) -> None:
+        if seconds <= 0:
+            return
+        if self.deadline_monotonic is not None:
+            rem = self.deadline_monotonic - self._clock()
+            if rem <= seconds:
+                if throttled:
+                    raise SourceThrottledError("yahoo_429_budget_exhausted")
+                raise SourceUnavailableError("fetch_budget_exhausted")
+        self._sleeper(seconds)
+
     def _wait_spacing(self) -> None:
         if self._last_request_ts is not None:
             elapsed = self._clock() - self._last_request_ts
             remaining = self.min_spacing_seconds - elapsed
             if remaining > 0:
-                self._sleeper(remaining)
+                self._sleep_within_budget(remaining, throttled=False)
 
     def _request(self, url: str, headers: Mapping[str, str]) -> tuple[int, bytes]:
         self._wait_spacing()
+        if self.deadline_monotonic is not None and self._clock() >= self.deadline_monotonic:
+            raise SourceUnavailableError("fetch_budget_exhausted")
         self._last_request_ts = self._clock()
         return self._transport(url, headers)
 
@@ -387,7 +428,9 @@ class YahooChartAdapter:
         }
         status, body = self._request(url, headers)
         if status == 429:
-            self._sleeper(self.retry_backoff_seconds)
+            self._sleep_within_budget(self.retry_backoff_seconds, throttled=True)
+            if self.deadline_monotonic is not None and self._clock() >= self.deadline_monotonic:
+                raise SourceThrottledError("yahoo_429_budget_exhausted")
             self._last_request_ts = self._clock()
             status, body = self._transport(url, headers)
             if status == 429:
@@ -691,6 +734,7 @@ def emit_live_market_records(
     decision_cutoff_utc: str | None = None,
     observation_class: str = "live",
     auto_advance_revision: bool = True,
+    deadline_monotonic: float | None = None,
 ) -> list[dict]:
     """Fetch all 7 live series with individual post-response UTC timestamps and emit C-SH-MKT."""
     spec = calendar_spec if calendar_spec is not None else load_spec(DEFAULT_SPEC_DIR)
@@ -700,13 +744,30 @@ def emit_live_market_records(
     if eff_decision_cutoff is None and cal.get("is_trading_day"):
         eff_decision_cutoff = default_eod_decision_cutoff_utc(session_date, cal)
 
-    resolved_transport = _resolve_transport(transport)
+    budget_clock = clock if clock is not None else time.monotonic
+    if transport is None and deadline_monotonic is not None:
+
+        def _budgeted_transport(url: str, headers: Mapping[str, str]) -> tuple[int, bytes]:
+            rem = deadline_monotonic - budget_clock()
+            if rem <= 0:
+                raise SourceUnavailableError("transport_error:fetch_budget_exhausted")
+            return urllib_fetch_bytes(
+                url,
+                headers,
+                timeout=min(DEFAULT_HTTP_TOTAL_TIMEOUT_SECONDS, rem),
+                deadline_monotonic=deadline_monotonic,
+            )
+
+        resolved_transport: Transport = _budgeted_transport
+    else:
+        resolved_transport = _resolve_transport(transport)
     tiingo = TiingoDailyAdapter(transport=resolved_transport, environ=environ)
     yahoo = YahooChartAdapter(
         transport=resolved_transport,
         symbol_map=yahoo_symbol_map,
         clock=clock,
         sleeper=sleeper,
+        deadline_monotonic=deadline_monotonic,
     )
     nyfed = NyFedSofrAdapter(transport=resolved_transport)
     treasury = TreasuryYieldAdapter(transport=resolved_transport, endpoint=treasury_endpoint)
@@ -724,6 +785,18 @@ def emit_live_market_records(
 
     for inst, series_id, kind in LIVE_SERIES:
         provider = LIVE_PROVIDERS[inst]
+        if deadline_monotonic is not None and budget_clock() >= deadline_monotonic:
+            payloads[inst] = None
+            missing_reasons[inst] = (
+                f"source_unavailable:{provider}",
+                {"detail": "fetch_budget_exhausted"},
+            )
+            per_inst_retrieval_utc[inst] = (
+                _format_utc_ms(utc_fn())
+                if (utc_clock is not None or retrieval_time_utc is None)
+                else retrieval_time_utc
+            )
+            continue
         try:
             if kind == "etf_tiingo":
                 payloads[inst] = tiingo.fetch_bytes_for_session(

@@ -2358,6 +2358,145 @@ class CloudRunJobTest(unittest.TestCase):
                     self.assertEqual(slot1[0], 1)
                     peer.assert_active_chain_lease()
 
+    def test_http_total_deadline_enforced_across_headers_body_errors_and_budget(self) -> None:
+        import threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from shadow.feeder_live import emit_live_market_records
+
+        stop_evt = threading.Event()
+
+        class _SlowHandler(BaseHTTPRequestHandler):
+            def _drip_bytes(self, chunk: bytes, count: int, interval: float) -> None:
+                for _ in range(count):
+                    if stop_evt.is_set():
+                        return
+                    _time.sleep(interval)
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except OSError:
+                        return
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/slow-headers":
+                    try:
+                        self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    self._drip_bytes(b"X-Drip: 1\r\n", 8, 0.15)
+                    return
+                if self.path == "/slow-500":
+                    self.send_response(500)
+                    self.send_header("Content-Length", "80")
+                    self.end_headers()
+                    self._drip_bytes(b"err123", 10, 0.15)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "60")
+                self.end_headers()
+                self._drip_bytes(b"abcdef", 10, 0.15)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0") or "0")
+                if cl > 0:
+                    self.rfile.read(cl)
+                if self.path == "/slow-500/digest":
+                    self.send_response(500)
+                    self.send_header("Content-Length", "80")
+                    self.end_headers()
+                    self._drip_bytes(b"err123", 10, 0.15)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "60")
+                self.end_headers()
+                self._drip_bytes(b"abcdef", 10, 0.15)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowHandler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            t0 = _time.monotonic()
+            with self.assertRaises(SourceUnavailableError):
+                urllib_fetch_bytes(f"{base}/slow-body", timeout=0.20)
+            self.assertLess(_time.monotonic() - t0, 0.50)
+
+            t1 = _time.monotonic()
+            with self.assertRaises(OtsSubmitError):
+                urllib_ots_transport("POST", f"{base}/slow-ots/digest", b"x" * 32, {}, 0.20)
+            self.assertLess(_time.monotonic() - t1, 0.50)
+
+            t2 = _time.monotonic()
+            with self.assertRaises(SourceUnavailableError):
+                urllib_fetch_bytes(f"{base}/slow-headers", timeout=0.20)
+            self.assertLess(_time.monotonic() - t2, 0.50)
+
+            t3 = _time.monotonic()
+            st_m, body_m = urllib_fetch_bytes(f"{base}/slow-500", timeout=0.20)
+            self.assertLess(_time.monotonic() - t3, 0.50)
+            self.assertEqual(st_m, 500)
+            self.assertLess(len(body_m), 60)
+
+            t4 = _time.monotonic()
+            st_o, body_o = urllib_ots_transport("POST", f"{base}/slow-500/digest", b"x" * 32, {}, 0.20)
+            self.assertLess(_time.monotonic() - t4, 0.50)
+            self.assertEqual(st_o, 500)
+            self.assertLess(len(body_o), 60)
+        finally:
+            stop_evt.set()
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=2.0)
+
+        calls: list[str] = []
+
+        def _counting_transport(url: str, _headers: object) -> tuple[int, bytes]:
+            calls.append(url)
+            return 200, b"{}"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recs = emit_live_market_records(
+                session_date="2026-01-05",
+                archive_dir=Path(tmpdir) / "arch",
+                transport=_counting_transport,
+                environ={"TIINGO_API_KEY": "tok"},
+                clock=_time.monotonic,
+                deadline_monotonic=_time.monotonic() - 1.0,
+            )
+            self.assertEqual(calls, [])
+            self.assertEqual(len(recs), 7)
+            for rec in recs:
+                self.assertFalse(rec["eligibility"]["eligible"])
+                self.assertTrue(str(rec["eligibility"]["reason"]).startswith("source_unavailable:"))
+                self.assertEqual(rec["disclosures"].get("detail"), "fetch_budget_exhausted")
+
+        ots_calls: list[str] = []
+
+        def _counting_ots(
+            _method: str,
+            url: str,
+            _body: object,
+            _headers: object,
+            _timeout: float,
+        ) -> tuple[int, bytes]:
+            ots_calls.append(url)
+            return 200, b""
+
+        client = OpenTimestampsClient(
+            calendars=["https://a.pool.opentimestamps.org"],
+            transport=_counting_ots,
+            timeout=10.0,
+            deadline_monotonic=_time.monotonic() - 1.0,
+        )
+        with self.assertRaisesRegex(OtsSubmitError, "ots_budget_exhausted"):
+            client.stamp_digest("11" * 32)
+        self.assertEqual(ots_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
