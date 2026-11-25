@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import (
@@ -1543,7 +1544,10 @@ def _commit_drill_session_atomically(
                     pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
                     now_utc=anchor_updated_at_utc or rcp_obtained_utc,
                 )
-                prior_anchor_bytes = trusted_head_anchor_path.read_bytes()
+                _, prior_anchor_bytes = _load_trusted_head_anchor(
+                    trusted_head_anchor_path,
+                    expected_chain_id=cfg.chain_id,
+                )
             _update_replay_bundle(
                 bundle_dir,
                 cfg=cfg,
@@ -2601,15 +2605,35 @@ def _validate_trusted_head_anchor_path(
     return resolved_anchor
 
 
-def _load_trusted_head_anchor(
-    anchor_path: Path,
-    *,
-    expected_chain_id: str,
-) -> tuple[dict | None, bytes | None]:
-    if not anchor_path.exists():
-        return None, None
+def _anchor_version_slot_path(anchor_path: Path, version: int) -> Path:
+    if version == 1:
+        return anchor_path
+    return anchor_path.with_name(f"{anchor_path.name}.v{version}.json")
+
+
+def _list_trusted_head_anchor_version_slots(anchor_path: Path) -> list[tuple[int, Path]]:
+    if not anchor_path.parent.is_dir():
+        return []
+    prefix = f"{anchor_path.name}.v"
+    suffix = ".json"
+    slots: list[tuple[int, Path]] = []
+    for cand in anchor_path.parent.glob(f"{anchor_path.name}.v*.json"):
+        name = cand.name
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            continue
+        ver_str = name[len(prefix) : -len(suffix)]
+        if not (ver_str.isascii() and ver_str.isdigit()):
+            continue
+        ver = int(ver_str)
+        if ver < 2 or str(ver) != ver_str:
+            continue
+        slots.append((ver, cand))
+    slots.sort(key=lambda item: item[0])
+    return slots
+
+
+def _parse_trusted_head_anchor_bytes(raw_bytes: bytes, *, expected_chain_id: str) -> dict:
     try:
-        raw_bytes = anchor_path.read_bytes()
         obj = parse_json_no_duplicates(raw_bytes.decode("utf-8"))
     except Exception as exc:
         raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
@@ -2653,7 +2677,38 @@ def _load_trusted_head_anchor(
         or pend_rev < 1
     ):
         raise EngineIdentityError("invalid_trusted_head_anchor:malformed_fields")
-    return obj, raw_bytes
+    return obj
+
+
+def _load_trusted_head_anchor(
+    anchor_path: Path,
+    *,
+    expected_chain_id: str,
+) -> tuple[dict | None, bytes | None]:
+    version_slots = _list_trusted_head_anchor_version_slots(anchor_path)
+    if not anchor_path.exists():
+        if version_slots:
+            raise EngineIdentityError(
+                "production_trusted_head_anchor_missing: primary anchor deleted while history exists"
+            )
+        return None, None
+    try:
+        best_bytes = anchor_path.read_bytes()
+    except Exception as exc:
+        raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
+    best_obj = _parse_trusted_head_anchor_bytes(best_bytes, expected_chain_id=expected_chain_id)
+    for slot_ver, slot_path in version_slots:
+        try:
+            slot_bytes = slot_path.read_bytes()
+        except Exception as exc:
+            raise EngineIdentityError(f"invalid_trusted_head_anchor:{exc}") from exc
+        slot_obj = _parse_trusted_head_anchor_bytes(slot_bytes, expected_chain_id=expected_chain_id)
+        if int(slot_obj["anchor_version"]) != slot_ver:
+            raise EngineIdentityError("invalid_trusted_head_anchor:slot_version_mismatch")
+        if int(slot_obj["anchor_version"]) > int(best_obj["anchor_version"]):
+            best_obj = slot_obj
+            best_bytes = slot_bytes
+    return best_obj, best_bytes
 
 
 def _advance_trusted_head_anchor(
@@ -2710,16 +2765,23 @@ def _advance_trusted_head_anchor(
             new_bytes = (
                 json.dumps(new_obj, sort_keys=True, separators=(",", ":")) + "\n"
             ).encode("utf-8")
-            tmp_path = anchor_path.with_name(
-                f".{anchor_path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
-            )
-            tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            slot_path = _anchor_version_slot_path(anchor_path, next_version)
+            tmp_path = slot_path.with_name(f".{slot_path.name}.tmp.{uuid4().hex}")
             try:
-                os.write(tfd, new_bytes)
-                os.fsync(tfd)
-            finally:
-                os.close(tfd)
-            os.replace(tmp_path, anchor_path)
+                ShadowLedger._publish_exclusive_file(slot_path, tmp_path, new_bytes)
+            except FileExistsError as exc:
+                msg = (
+                    "production_trusted_head_rollback_rejected: anchor appeared concurrently"
+                    if next_version == 1
+                    else "production_trusted_head_rollback_rejected: anchor modified concurrently"
+                )
+                raise EngineIdentityError(msg) from exc
+            if next_version >= 2:
+                existing_versions = [
+                    v for v, _ in _list_trusted_head_anchor_version_slots(anchor_path)
+                ]
+                if max(existing_versions, default=1) == next_version:
+                    _atomic_write_bytes(anchor_path, new_bytes)
             dfd = os.open(str(anchor_path.parent), os.O_RDONLY)
             try:
                 os.fsync(dfd)
@@ -4030,7 +4092,10 @@ def _run_daily_drill_cycle_locked(
                 pending_rejected_revision=next_pending_revision,
                 now_utc=_format_utc_ms(clock_fn()),
             )
-            anchor_bytes = anchor_resolved.read_bytes()
+            _, anchor_bytes = _load_trusted_head_anchor(
+                anchor_resolved,
+                expected_chain_id=cfg.chain_id,
+            )
         return pending_sha_val
 
     if not built["appended"]:

@@ -40,6 +40,18 @@ from shadow.ots import (  # noqa: E402
 )
 
 
+def _reset_anchor_to_snapshot(anchor_path: Path, snap_bytes: bytes) -> None:
+    snap_ver = int(json.loads(snap_bytes.decode("utf-8"))["anchor_version"])
+    prefix = f"{anchor_path.name}.v"
+    for p in anchor_path.parent.glob(f"{anchor_path.name}.v*.json"):
+        name = p.name
+        if name.startswith(prefix) and name.endswith(".json"):
+            ver_str = name[len(prefix) : -len(".json")]
+            if ver_str.isdigit() and int(ver_str) > snap_ver:
+                p.unlink()
+    anchor_path.write_bytes(snap_bytes)
+
+
 class CloudRunJobTest(unittest.TestCase):
     def test_cloudrun_job_refuses_locked_production_chain_with_zero_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1299,7 +1311,7 @@ class CloudRunJobTest(unittest.TestCase):
             head_1 = str(r1["record_sha256"])
 
             # Simulate interruption after append_record(seq=1) before _advance_trusted_head_anchor
-            anchor_path.write_bytes(anchor_seq0_bytes)
+            _reset_anchor_to_snapshot(anchor_path, anchor_seq0_bytes)
             # Supplying stale head_0 still fails closed (no rollback)
             with self.assertRaises(EngineIdentityError) as stale_ctx:
                 run_cloudrun_job(
@@ -1362,7 +1374,7 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(r2["sequence"], 2)
 
             # 2-step lag (anchor stuck at seq=0 when ledger at seq=2) still fails closed
-            anchor_path.write_bytes(anchor_seq0_bytes)
+            _reset_anchor_to_snapshot(anchor_path, anchor_seq0_bytes)
             with self.assertRaises(EngineIdentityError) as gap_ctx:
                 run_cloudrun_job(
                     data_dir=ddir,
@@ -1458,7 +1470,7 @@ class CloudRunJobTest(unittest.TestCase):
             pend_jan6_bytes = (ddir / "state_snapshots" / "pending_rejected_state.json").read_bytes()
 
             # Simulate interruption after saving pending_rejected_state.json before _advance_trusted_head_anchor()
-            anchor_path.write_bytes(anchor_jan5_bytes)
+            _reset_anchor_to_snapshot(anchor_path, anchor_jan5_bytes)
 
             # Old NO_PENDING digest must still fail closed (prevents stripping pending state!)
             with self.assertRaises(EngineIdentityError):
@@ -1657,7 +1669,7 @@ class CloudRunJobTest(unittest.TestCase):
 
             # Interrupted update recovery: restore rev=2 pending file with stale rev=1 anchor -> Jan 7 catches up & commits seq=1
             pend_path.write_bytes(pend_rev2_bytes)
-            anchor_path.write_bytes(anchor_rev1_bytes)
+            _reset_anchor_to_snapshot(anchor_path, anchor_rev1_bytes)
             ok7 = run_cloudrun_job(
                 data_dir=ddir,
                 config_path=unlocked_cfg,
@@ -2849,6 +2861,112 @@ class CloudRunJobTest(unittest.TestCase):
                     successor_bytes["receipt"],
                 )
                 self.assertTrue(ShadowLedger(ddir / "ledger").verify_chain()[0])
+
+    def test_displaced_writer_cannot_regress_trusted_anchor_across_hosts(self) -> None:
+        import fcntl
+        from unittest import mock
+
+        from shadow import scheduler as sched_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            anchor_path = Path(tmpdir) / "ext" / "trusted_anchor.json"
+            v1 = sched_mod._advance_trusted_head_anchor(
+                anchor_path,
+                chain_id="prod-sh2-v1",
+                expected_prior_bytes=None,
+                sequence=-1,
+                session_date=None,
+                head_sha256=GENESIS_PREV_HASH,
+                pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                now_utc="2026-01-05T22:30:00.000Z",
+            )
+            self.assertEqual(v1["anchor_version"], 1)
+            _, v1_bytes = sched_mod._load_trusted_head_anchor(
+                anchor_path, expected_chain_id="prod-sh2-v1"
+            )
+            assert v1_bytes is not None
+
+            orig_pub = ShadowLedger.__dict__["_publish_exclusive_file"]
+            paused_once = [False]
+            peer_v3_bytes: list[bytes] = []
+
+            @staticmethod
+            def _paused_anchor_publish(target_path: Path, tmp_path: Path, payload: bytes) -> None:
+                if target_path.name == "trusted_anchor.json.v2.json" and not paused_once[0]:
+                    paused_once[0] = True
+                    v2_peer = sched_mod._advance_trusted_head_anchor(
+                        anchor_path,
+                        chain_id="prod-sh2-v1",
+                        expected_prior_bytes=v1_bytes,
+                        sequence=0,
+                        session_date="2026-01-05",
+                        head_sha256="a" * 64,
+                        pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                        now_utc="2026-01-05T22:31:00.000Z",
+                    )
+                    self.assertEqual(v2_peer["anchor_version"], 2)
+                    _, v2_bytes = sched_mod._load_trusted_head_anchor(
+                        anchor_path, expected_chain_id="prod-sh2-v1"
+                    )
+                    v3_peer = sched_mod._advance_trusted_head_anchor(
+                        anchor_path,
+                        chain_id="prod-sh2-v1",
+                        expected_prior_bytes=v2_bytes,
+                        sequence=1,
+                        session_date="2026-01-06",
+                        head_sha256="b" * 64,
+                        pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                        now_utc="2026-01-06T22:30:00.000Z",
+                    )
+                    self.assertEqual(v3_peer["anchor_version"], 3)
+                    _, v3_bytes = sched_mod._load_trusted_head_anchor(
+                        anchor_path, expected_chain_id="prod-sh2-v1"
+                    )
+                    assert v3_bytes is not None
+                    peer_v3_bytes.append(v3_bytes)
+                orig_pub.__func__(target_path, tmp_path, payload)  # type: ignore[attr-defined]
+
+            ShadowLedger._publish_exclusive_file = _paused_anchor_publish  # type: ignore[method-assign]
+            try:
+                with mock.patch.object(fcntl, "flock", lambda _fd, _op: None):
+                    with self.assertRaisesRegex(
+                        EngineIdentityError, "production_trusted_head_rollback_rejected"
+                    ):
+                        sched_mod._advance_trusted_head_anchor(
+                            anchor_path,
+                            chain_id="prod-sh2-v1",
+                            expected_prior_bytes=v1_bytes,
+                            sequence=0,
+                            session_date="2026-01-05",
+                            head_sha256="c" * 64,
+                            pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                            now_utc="2026-01-05T22:30:30.000Z",
+                        )
+            finally:
+                ShadowLedger._publish_exclusive_file = orig_pub  # type: ignore[assignment]
+
+            loaded_obj, loaded_bytes = sched_mod._load_trusted_head_anchor(
+                anchor_path, expected_chain_id="prod-sh2-v1"
+            )
+            self.assertIsNotNone(loaded_obj)
+            assert loaded_obj is not None
+            self.assertEqual(loaded_obj["sequence"], 1)
+            self.assertEqual(loaded_obj["anchor_version"], 3)
+            self.assertEqual(loaded_obj["head_sha256"], "b" * 64)
+            self.assertEqual(loaded_bytes, peer_v3_bytes[0])
+
+            # Even if convenience pointer anchor_path is stale-overwritten with v2, immutable v3 slot still wins
+            anchor_path.write_bytes(
+                anchor_path.with_name("trusted_anchor.json.v2.json").read_bytes()
+            )
+            reg_obj, reg_bytes = sched_mod._load_trusted_head_anchor(
+                anchor_path, expected_chain_id="prod-sh2-v1"
+            )
+            self.assertIsNotNone(reg_obj)
+            assert reg_obj is not None
+            self.assertEqual(reg_obj["sequence"], 1)
+            self.assertEqual(reg_obj["anchor_version"], 3)
+            self.assertEqual(reg_bytes, peer_v3_bytes[0])
 
 
 if __name__ == "__main__":
