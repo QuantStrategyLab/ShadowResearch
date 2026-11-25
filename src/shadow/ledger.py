@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -646,6 +648,138 @@ def _sha256_canonical_state_dict(state_obj: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _extract_o4_resolved_symbols(
+    o4_row: Mapping[str, Any] | object,
+    prior_state: Mapping[str, Any] | None,
+    next_state: Mapping[str, Any] | None,
+) -> list[str]:
+    """Identify O4 symbols legitimately cleared by a definitive terminal status or authorized re-arm."""
+    if not isinstance(prior_state, Mapping) or not isinstance(prior_state.get("O4"), Mapping):
+        return []
+    if not isinstance(o4_row, Mapping):
+        return []
+    terminal_reasons = (
+        "original_order_terminal_status_received",
+        "order_filled",
+        "authorized_rearm",
+    )
+    reason_raw = str(o4_row.get("reason") or "")
+    reason_by_sym: dict[str, str] = {}
+    if ":" in reason_raw:
+        for part in reason_raw.split(","):
+            if ":" in part:
+                s_key, s_val = part.split(":", 1)
+                reason_by_sym[s_key.strip()] = s_val.strip()
+    prior_o4 = prior_state["O4"]
+    next_o4 = next_state.get("O4") if isinstance(next_state, Mapping) else None
+    outputs = o4_row.get("outputs") if isinstance(o4_row.get("outputs"), Mapping) else None
+    resolved: list[str] = []
+    for sym, cs in prior_o4.items():
+        if not isinstance(cs, Mapping) or "original_order_id" not in cs:
+            continue
+        if isinstance(next_o4, Mapping) and sym in next_o4:
+            continue
+        sym_out = outputs.get(sym) if isinstance(outputs, Mapping) else None
+        sym_reason = (
+            str(sym_out.get("reason") or "")
+            if isinstance(sym_out, Mapping)
+            else reason_by_sym.get(str(sym), reason_raw)
+        )
+        if sym_reason in terminal_reasons:
+            resolved.append(str(sym))
+    return sorted(resolved)
+
+
+def evaluate_non_stub_tiers(
+    *,
+    evaluator: object,
+    session_inputs: Mapping[str, Any],
+    calendar_session: dict,
+    policy_hash: str,
+    session_date: str,
+    decision_timestamp_utc: str,
+    prior_row_state: Mapping[str, Any] | None,
+    authorized_events: object | None = None,
+) -> dict[str, Any]:
+    """Evaluate all 3 sizing tiers with vendored FUSE-1 while preserving the primary tier's outputs."""
+    primary_tier = str(session_inputs.get("tier") or "balanced")
+    prior = prior_row_state if prior_row_state is not None else {}
+    prior_by_tier = prior.get("_by_tier") if isinstance(prior.get("_by_tier"), Mapping) else {}
+    clean_base_prior = {k: v for k, v in prior.items() if k != "_by_tier"}
+    primary_tier_change = (
+        session_inputs.get("tier_change_event")
+        if isinstance(session_inputs.get("tier_change_event"), Mapping)
+        else None
+    )
+
+    tiers_to_eval = list(TIER_ORDER)
+    if primary_tier not in TIER_ORDER:
+        tiers_to_eval.append(primary_tier)
+
+    rows_by_tier: dict[str, dict] = {}
+    eff_scope_by_tier: dict[str, dict[str, str]] = {}
+    next_state_by_tier: dict[str, dict] = {}
+    for tier_id in tiers_to_eval:
+        tier_inputs = dict(session_inputs)
+        tier_inputs["tier"] = tier_id
+        if (
+            tier_id != primary_tier
+            and primary_tier_change is not None
+            and primary_tier_change.get("to") == primary_tier
+        ):
+            tier_inputs.pop("tier_change_event", None)
+        tier_prior_raw = prior_by_tier.get(tier_id)
+        tier_prior = (
+            {k: v for k, v in tier_prior_raw.items() if k != "_by_tier"}
+            if isinstance(tier_prior_raw, Mapping)
+            else copy.deepcopy(clean_base_prior)
+        )
+        eval_inputs = build_fuse_validated_inputs(
+            tier_inputs,
+            calendar_session,
+            policy_hash=policy_hash,
+            session_date=session_date,
+            as_of=decision_timestamp_utc,
+        )
+        t_rows, t_eff, t_next = evaluator.evaluate(  # type: ignore[attr-defined]
+            spec_version=evaluator.spec_version,  # type: ignore[attr-defined]
+            engine_hash=evaluator.engine_hash,  # type: ignore[attr-defined]
+            policy_hash=policy_hash,
+            session=session_date,
+            as_of=decision_timestamp_utc,
+            mode="shadow",
+            validated_inputs=eval_inputs,
+            prior_row_state=tier_prior,
+            authorized_events=authorized_events,
+        )
+        rows_by_tier[tier_id] = t_rows
+        eff_scope_by_tier[tier_id] = t_eff
+        next_state_by_tier[tier_id] = (
+            {k: v for k, v in t_next.items() if k != "_by_tier"}
+            if isinstance(t_next, dict)
+            else {}
+        )
+
+    rows_by_id = rows_by_tier[primary_tier]
+    eff_scope = eff_scope_by_tier[primary_tier]
+    next_state = copy.deepcopy(next_state_by_tier[primary_tier])
+    next_state["_by_tier"] = copy.deepcopy(next_state_by_tier)
+    o4_resolved_symbols = _extract_o4_resolved_symbols(
+        rows_by_id.get("O4"),
+        clean_base_prior,
+        next_state_by_tier[primary_tier],
+    )
+    return {
+        "primary_tier": primary_tier,
+        "rows_by_id": rows_by_id,
+        "effective_state_by_scope": eff_scope,
+        "next_row_state": next_state,
+        "rows_by_tier": rows_by_tier,
+        "eff_scope_by_tier": eff_scope_by_tier,
+        "o4_resolved_symbols": o4_resolved_symbols,
+    }
+
+
 def build_record_body(
     *,
     chain_id: str,
@@ -677,33 +811,43 @@ def build_record_body(
     )
     prior = prior_row_state if prior_row_state is not None else {}
 
+    rows_by_tier: dict[str, dict] | None = None
+    eff_scope_by_tier: dict[str, dict[str, str]] | None = None
+    o4_resolved_symbols: list[str] = []
+
     if is_stub_evaluator(ev):
         eval_inputs = dict(session_inputs)
         eval_inputs["calendar"] = calendar_session
         eval_mode = mode
         auth_events = None
+        rows_by_id, eff_scope, next_state = ev.evaluate(
+            spec_version=ev.spec_version,
+            engine_hash=ev.engine_hash,
+            policy_hash=p_hash,
+            session=session_date,
+            as_of=decision_timestamp_utc,
+            mode=eval_mode,
+            validated_inputs=eval_inputs,
+            prior_row_state=prior,
+            authorized_events=auth_events,
+        )
     else:
-        eval_inputs = build_fuse_validated_inputs(
-            session_inputs,
-            calendar_session,
+        tiered_eval = evaluate_non_stub_tiers(
+            evaluator=ev,
+            session_inputs=session_inputs,
+            calendar_session=calendar_session,
             policy_hash=p_hash,
             session_date=session_date,
-            as_of=decision_timestamp_utc,
+            decision_timestamp_utc=decision_timestamp_utc,
+            prior_row_state=prior,
+            authorized_events=session_inputs.get("authorized_events"),
         )
-        eval_mode = "shadow"
-        auth_events = session_inputs.get("authorized_events")
-
-    rows_by_id, eff_scope, next_state = ev.evaluate(
-        spec_version=ev.spec_version,
-        engine_hash=ev.engine_hash,
-        policy_hash=p_hash,
-        session=session_date,
-        as_of=decision_timestamp_utc,
-        mode=eval_mode,
-        validated_inputs=eval_inputs,
-        prior_row_state=prior,
-        authorized_events=auth_events,
-    )
+        rows_by_id = tiered_eval["rows_by_id"]
+        eff_scope = tiered_eval["effective_state_by_scope"]
+        next_state = tiered_eval["next_row_state"]
+        rows_by_tier = tiered_eval["rows_by_tier"]
+        eff_scope_by_tier = tiered_eval["eff_scope_by_tier"]
+        o4_resolved_symbols = tiered_eval["o4_resolved_symbols"]
 
     if o1_blocks_session_commit(rows_by_id["O1"]) or rows_by_id["O2"]["would_have_tripped"]:
         return {
@@ -713,6 +857,7 @@ def build_record_body(
             "o2_output": rows_by_id["O2"],
             "effective_state_by_scope": eff_scope,
             "next_row_state": next_state,
+            "o4_resolved_symbols": o4_resolved_symbols,
         }
 
     if canonical_decimal_str(session_inputs.get("H", "0")) != "0":
@@ -721,11 +866,20 @@ def build_record_body(
     account_state, fund_states, overall_state = resolve_account_and_fund_control_states(
         eff_scope, INSTRUMENT_ORDER
     )
+    tier_control_states: dict[str, tuple[str, Mapping[str, str] | None]] | None = None
+    if eff_scope_by_tier is not None:
+        tier_control_states = {}
+        for tier_id in TIER_ORDER:
+            t_acct, t_funds, _ = resolve_account_and_fund_control_states(
+                eff_scope_by_tier[tier_id], INSTRUMENT_ORDER
+            )
+            tier_control_states[tier_id] = (t_acct, t_funds)
 
     sizing_res = compute_session_sizing(
         session_inputs,
         active_control_state=account_state,
         fund_control_states=fund_states,
+        tier_control_states=tier_control_states,
     )
 
     inputs_digest = compute_inputs_digest(
@@ -762,6 +916,14 @@ def build_record_body(
         "effective_state_by_scope": eff_scope,
         "breakers": serialized_breakers,
     }
+    if rows_by_tier is not None and eff_scope_by_tier is not None:
+        evaluator_block["by_tier"] = {
+            tier_id: {
+                "effective_state_by_scope": eff_scope_by_tier[tier_id],
+                "breakers": serialize_breakers_for_ledger(rows_by_tier[tier_id]),
+            }
+            for tier_id in TIER_ORDER
+        }
     if not is_stub_evaluator(ev):
         evaluator_block["next_row_state_sha256"] = _sha256_canonical_state_dict(
             next_state if isinstance(next_state, dict) else {}
@@ -1278,22 +1440,52 @@ class ShadowLedger:
         ).encode("utf-8")
 
         for attempt in range(2):
+            tmp_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.{attempt}.lock")
             try:
-                lfd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 try:
-                    os.write(lfd, lease_bytes)
-                    os.fsync(lfd)
+                    tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    try:
+                        os.write(tfd, lease_bytes)
+                        os.fsync(tfd)
+                    finally:
+                        os.close(tfd)
+                    try:
+                        os.link(str(tmp_path), str(lease_path))
+                    except OSError as link_exc:
+                        if isinstance(link_exc, FileExistsError):
+                            raise
+                        if link_exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EPERM):
+                            raise
+                        lfd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        try:
+                            os.write(lfd, lease_bytes)
+                            os.fsync(lfd)
+                        finally:
+                            os.close(lfd)
                 finally:
-                    os.close(lfd)
+                    try:
+                        tmp_path.unlink()
+                    except FileNotFoundError:
+                        pass
                 return lease_id
             except FileExistsError:
                 existing: dict = {}
                 try:
                     orig_st, existing_bytes = self._read_lease_snapshot(lease_path)
                     existing_raw = existing_bytes.decode("utf-8", errors="replace")
-                    parsed = parse_json_no_duplicates(existing_raw) if existing_raw.strip() else {}
+                    if not existing_raw.strip():
+                        now_init = datetime.now(timezone.utc)
+                        if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
+                            raise ChainConcurrencyConflictError(
+                                "Chain lease file initializing by peer writer"
+                            )
+                        parsed = {}
+                    else:
+                        parsed = parse_json_no_duplicates(existing_raw)
                     if isinstance(parsed, dict):
                         existing = parsed
+                except ChainConcurrencyConflictError:
+                    raise
                 except FileNotFoundError:
                     continue
                 except Exception:
@@ -2051,8 +2243,7 @@ def load_row_state_snapshot(
     return state_obj, payload
 
 
-def save_pending_rejected_state_snapshot(
-    snapshots_dir: str | Path,
+def build_pending_rejected_state_payload(
     *,
     chain_id: str,
     base_sequence: int,
@@ -2062,16 +2253,15 @@ def save_pending_rejected_state_snapshot(
     spec_version: str,
     next_row_state: dict,
     base_prior_row_state: dict | None = None,
-) -> Path:
-    """Persist next_row_state (plus session-start baseline) after an O1/O2-rejected evaluation."""
+    o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    """Assemble a canonical c-sh-pending-rejected-state-v1 payload in memory."""
     if not isinstance(next_row_state, dict):
         raise EngineIdentityError("pending rejected next_row_state must be a dict")
     eff_base_prior = base_prior_row_state if base_prior_row_state is not None else {}
     if not isinstance(eff_base_prior, dict):
         raise EngineIdentityError("pending rejected base_prior_row_state must be a dict")
-    s_dir = Path(snapshots_dir)
-    s_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": "c-sh-pending-rejected-state-v1",
         "chain_id": chain_id,
         "base_sequence": base_sequence,
@@ -2084,6 +2274,40 @@ def save_pending_rejected_state_snapshot(
         "base_prior_state_sha256": _sha256_canonical_state_dict(eff_base_prior),
         "base_prior_row_state": eff_base_prior,
     }
+    if o4_resolved_symbols:
+        payload["o4_resolved_symbols"] = sorted(
+            {str(s) for s in o4_resolved_symbols if isinstance(s, str) and s}
+        )
+    return payload
+
+
+def save_pending_rejected_state_snapshot(
+    snapshots_dir: str | Path,
+    *,
+    chain_id: str,
+    base_sequence: int,
+    base_record_sha256: str,
+    rejected_session_date: str,
+    engine_hash: str,
+    spec_version: str,
+    next_row_state: dict,
+    base_prior_row_state: dict | None = None,
+    o4_resolved_symbols: list[str] | tuple[str, ...] | None = None,
+) -> Path:
+    """Persist next_row_state (plus session-start baseline) after an O1/O2-rejected evaluation."""
+    payload = build_pending_rejected_state_payload(
+        chain_id=chain_id,
+        base_sequence=base_sequence,
+        base_record_sha256=base_record_sha256,
+        rejected_session_date=rejected_session_date,
+        engine_hash=engine_hash,
+        spec_version=spec_version,
+        next_row_state=next_row_state,
+        base_prior_row_state=base_prior_row_state,
+        o4_resolved_symbols=o4_resolved_symbols,
+    )
+    s_dir = Path(snapshots_dir)
+    s_dir.mkdir(parents=True, exist_ok=True)
     raw_bytes = (
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
     ).encode("utf-8")
@@ -2125,6 +2349,7 @@ def _assert_pending_state_preserves_committed_breakers(
     expected_engine_hash: str,
     expected_spec_version: str,
     expected_base_session_date: str | None = None,
+    allowed_o4_resolved_symbols: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Enforce fail-closed monotonic latch/severity preservation from committed ledger state to pending state."""
     if "engine_hash" in pending_state and pending_state["engine_hash"] != expected_engine_hash:
@@ -2409,8 +2634,31 @@ def _assert_pending_state_preserves_committed_breakers(
         for sym, cs in c_o4.items():
             if isinstance(cs, Mapping) and "original_order_id" in cs:
                 ps = p_o4.get(sym) if isinstance(p_o4, Mapping) else None
+                if ps is None and allowed_o4_resolved_symbols and sym in allowed_o4_resolved_symbols:
+                    continue
                 if not isinstance(ps, Mapping) or ps.get("original_order_id") != cs["original_order_id"]:
                     raise EngineIdentityError(f"Pending state altered committed O4.{sym}")
+
+    c_by_tier = committed_state.get("_by_tier")
+    p_by_tier = pending_state.get("_by_tier")
+    if isinstance(c_by_tier, Mapping) and p_by_tier is not None:
+        if not isinstance(p_by_tier, Mapping):
+            raise EngineIdentityError("Pending state invalid _by_tier section")
+        for t_name, c_tier_state in c_by_tier.items():
+            if not isinstance(c_tier_state, Mapping):
+                continue
+            p_tier_state = p_by_tier.get(t_name)
+            if not isinstance(p_tier_state, Mapping):
+                raise EngineIdentityError(f"Pending state missing committed _by_tier.{t_name}")
+            _assert_pending_state_preserves_committed_breakers(
+                c_tier_state,
+                p_tier_state,
+                rej_ds=rej_ds,
+                expected_engine_hash=expected_engine_hash,
+                expected_spec_version=expected_spec_version,
+                expected_base_session_date=expected_base_session_date,
+                allowed_o4_resolved_symbols=allowed_o4_resolved_symbols,
+            )
 
 
 def authenticate_pending_rejected_state_snapshot(
@@ -2551,6 +2799,12 @@ def load_pending_rejected_state_snapshot(
         eff_committed = base_obj
 
     if eff_committed is not None:
+        raw_resolved = payload.get("o4_resolved_symbols")
+        allowed_resolved = (
+            {str(s) for s in raw_resolved if isinstance(s, str) and s}
+            if isinstance(raw_resolved, list)
+            else set()
+        )
         _assert_pending_state_preserves_committed_breakers(
             eff_committed,
             state_obj,
@@ -2558,6 +2812,7 @@ def load_pending_rejected_state_snapshot(
             expected_engine_hash=expected_engine_hash,
             expected_spec_version=expected_spec_version,
             expected_base_session_date=expected_base_session_date,
+            allowed_o4_resolved_symbols=allowed_resolved,
         )
 
     return state_obj, payload

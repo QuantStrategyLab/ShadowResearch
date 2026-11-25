@@ -1296,6 +1296,94 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertTrue(rows_mkt["O1"]["would_have_tripped"])
 
+    def test_v6_missing_observations_not_fabricated_and_per_tier_controls_isolated(self) -> None:
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+
+        # 1. PRRT_kwDOV2RNAc67rRKk: omitting V6 observations keeps them missing_input (no fabricated 0.0 / 0.04)
+        vin_missing_v6 = build_fuse_validated_inputs(
+            _valid_inputs(),
+            cal6,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertIsNone(vin_missing_v6["funds"]["TQQQ"]["carrying_cost_measured"])
+        self.assertIsNone(vin_missing_v6["funds"]["TQQQ"]["excess_return_shrunk"])
+        rows_v6, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            vin_missing_v6,
+            {},
+            None,
+        )
+        self.assertEqual(rows_v6["V6"]["reason"], "missing_input")
+        self.assertTrue(rows_v6["V6"]["would_have_tripped"])
+        self.assertTrue(rows_v6["V6"]["outputs"]["notify"])
+
+        # 2. PRRT_kwDOV2RNAc67rRKh: E=44000, E_star=50000, L=6000, prior_E=44000, q_pre=0
+        # balanced stays NORMAL and buys, while conservative latches L2 (10% threshold) and blocks increases.
+        si_tier = _valid_inputs()
+        si_tier.update(
+            {
+                "E": "44000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "6000",
+                "prior_E": "44000",
+                "tier": "balanced",
+            }
+        )
+        for sym in ("TQQQ", "SOXL"):
+            si_tier["funds"][sym]["q_pre"] = 0
+        si_tier["positions_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_tier["broker_reconciliation_source_record"]["as_of"] = "2026-01-06T22:00:00.000Z"
+        si_tier["market_records"] = [
+            {
+                "instrument": inst,
+                "normalized_value": 50.0,
+                "calendar_spec_digest": str(cal6["spec_digest"]),
+                "eligibility": {"eligible": True},
+            }
+            for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
+        ]
+
+        code_sha = compute_code_manifest_hash()
+        built = build_record_body(
+            chain_id="drill-tier-iso-v1",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=si_tier,
+            calendar_session=cal6,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state={},
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built["appended"])
+        rb = built["record_body"]
+        by_tier_ev = rb["evaluator"]["by_tier"]
+        self.assertEqual(by_tier_ev["balanced"]["effective_state_by_scope"]["account"], "NORMAL")
+        self.assertEqual(by_tier_ev["conservative"]["effective_state_by_scope"]["account"], "NO-NEW-RISK")
+        cons_l2 = next(b for b in by_tier_ev["conservative"]["breakers"] if b["id"] == "L2")
+        self.assertEqual(cons_l2["state"], "NO-NEW-RISK")
+        self.assertTrue(cons_l2["latched"])
+
+        tiers_by_name = {t["tier_id"]: t for t in rb["tiers"]}
+        bal_funds = {f["instrument"]: f for f in tiers_by_name["balanced"]["funds"]}
+        con_funds = {f["instrument"]: f for f in tiers_by_name["conservative"]["funds"]}
+        self.assertGreater(int(bal_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["TQQQ"]["q_ideal"]), 0)
+        self.assertEqual(int(con_funds["SOXL"]["q_ideal"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

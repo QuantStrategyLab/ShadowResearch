@@ -60,12 +60,14 @@ from shadow.ledger import (
     _atomic_write_bytes,
     _sha256_canonical_state_dict,
     authenticate_pending_rejected_state_snapshot,
+    build_pending_rejected_state_payload,
     build_record_body,
     canonical_json_bytes,
     compute_code_manifest_hash,
     compute_inputs_digest,
     compute_pending_rejected_state_sha256,
     compute_session_commitment_deadline_utc,
+    evaluate_non_stub_tiers,
     has_committed_detached_evidence,
     is_receipt_timely,
     is_utc_ms_timestamp,
@@ -2616,6 +2618,7 @@ def _authenticate_production_history(
     bitcoin_merkle_roots: Mapping[int, object] | None,
     data_dir: Path | None = None,
     trusted_head_anchor_path: str | Path | None = None,
+    now_utc_fn: Callable[[], str] | None = None,
 ) -> tuple[Path | None, bytes | None]:
     """Fail closed if persisted production history or pending state is unauthenticated before reuse."""
     if cfg.mode != "production":
@@ -2706,9 +2709,85 @@ def _authenticate_production_history(
         raise EngineIdentityError(
             f"production_trusted_head_rollback_rejected: ledger sequence {actual_seq} < trusted anchor sequence {anchor_obj['sequence']}"
         )
-    if actual_seq > int(anchor_obj["sequence"]) or not isinstance(head_rec_sha, str) or not hmac.compare_digest(
-        head_rec_sha,
-        str(anchor_obj["head_sha256"]),
+    anchor_seq = int(anchor_obj["sequence"])
+    pend_file = snapshots_dir / "pending_rejected_state.json" if snapshots_dir is not None else None
+    catchup_body = (
+        prior_records[-1].get("record_body")
+        if prior_records and isinstance(prior_records[-1], Mapping)
+        else None
+    )
+    catchup_ds = str(catchup_body.get("session_date") or "") if isinstance(catchup_body, Mapping) else ""
+    superseded_pending_ok = False
+    if pend_file is not None and pend_file.is_file() and catchup_ds:
+        try:
+            p_raw = parse_json_no_duplicates(pend_file.read_text(encoding="utf-8"))
+            superseded_pending_ok = (
+                isinstance(p_raw, Mapping)
+                and p_raw.get("schema_version") == "c-sh-pending-rejected-state-v1"
+                and p_raw.get("chain_id") == cfg.chain_id
+                and isinstance(p_raw.get("base_sequence"), int)
+                and not isinstance(p_raw.get("base_sequence"), bool)
+                and p_raw["base_sequence"] < actual_seq
+                and isinstance(p_raw.get("rejected_session_date"), str)
+                and p_raw["rejected_session_date"] <= catchup_ds
+            )
+        except Exception:
+            superseded_pending_ok = False
+    can_catchup_interrupted_commit = (
+        actual_seq == anchor_seq + 1
+        and isinstance(head_rec_sha, str)
+        and hmac.compare_digest(head_rec_sha, expected_prior_head_sha256)
+        and isinstance(catchup_body, Mapping)
+        and bool(catchup_ds)
+        and hmac.compare_digest(
+            str(catchup_body.get("prev_record_sha256") or ""),
+            str(anchor_obj["head_sha256"]),
+        )
+        and (
+            expected_pending_state_sha256 is None
+            or hmac.compare_digest(expected_pending_state_sha256, NO_PENDING_REJECTED_STATE_SHA256)
+        )
+        and (pend_file is None or not pend_file.is_file() or superseded_pending_ok)
+    )
+    if can_catchup_interrupted_commit:
+        if bitcoin_merkle_roots is not None:
+            ok_credit, credit_issues = ledger.assess_receipt_creditability(
+                bitcoin_merkle_roots=bitcoin_merkle_roots,
+                commitment_deadline_et=cfg.commitment_deadline_et,
+                runtime_config=cfg,
+            )
+            if not ok_credit:
+                raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
+        if superseded_pending_ok and snapshots_dir is not None:
+            _retire_superseded_pending_rejected_state(
+                snapshots_dir,
+                committed_seq=actual_seq,
+                committed_session_date=catchup_ds,
+                expected_chain_id=cfg.chain_id,
+            )
+        catchup_now = (
+            now_utc_fn()
+            if now_utc_fn is not None
+            else _format_utc_ms(datetime.now(timezone.utc))
+        )
+        _advance_trusted_head_anchor(
+            anchor_resolved,
+            chain_id=cfg.chain_id,
+            expected_prior_bytes=anchor_bytes,
+            sequence=actual_seq,
+            session_date=catchup_ds,
+            head_sha256=head_rec_sha,
+            pending_rejected_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+            now_utc=catchup_now,
+        )
+        anchor_obj, anchor_bytes = _load_trusted_head_anchor(
+            anchor_resolved, expected_chain_id=cfg.chain_id
+        )
+    if (
+        anchor_obj is None
+        or actual_seq != int(anchor_obj["sequence"])
+        or not isinstance(head_rec_sha, str)
+        or not hmac.compare_digest(head_rec_sha, str(anchor_obj["head_sha256"]))
     ):
         raise EngineIdentityError("production_trusted_head_mismatch:diverges_from_anchor")
     if not hmac.compare_digest(head_rec_sha, expected_prior_head_sha256):
@@ -2863,6 +2942,7 @@ def _run_daily_drill_cycle_locked(
         bitcoin_merkle_roots=bitcoin_merkle_roots,
         data_dir=root,
         trusted_head_anchor_path=trusted_head_anchor_path,
+        now_utc_fn=lambda: _format_utc_ms(clock_fn()),
     )
     prior_streak = _count_consecutive_trading_sessions(
         prior_records,
@@ -3464,8 +3544,13 @@ def _run_daily_drill_cycle_locked(
             expected_pending_state_sha256=expected_pending_state_sha256,
             require_external_pending_auth=(cfg.mode == "production"),
         )
+        prior_o4_resolved_symbols: list[str] = []
         if pending_rej is not None:
             prior_state = pending_rej[0]
+            prior_o4_resolved_symbols = [
+                str(s) for s in (pending_rej[1].get("o4_resolved_symbols") or ())
+                if isinstance(s, str) and s
+            ]
             prior_row_state_used = copy.deepcopy(prior_state)
             session_base_prior_state = (
                 copy.deepcopy(committed_base_state) if head_env is not None else {}
@@ -3474,11 +3559,14 @@ def _run_daily_drill_cycle_locked(
             prior_state = committed_base_state
             session_base_prior_state = copy.deepcopy(committed_base_state)
     elif head_env is not None:
+        prior_o4_resolved_symbols = []
         breakers = head_env["record_body"]["evaluator"]["breakers"]
         prior_state = {
             b["id"]: {"state": b["state"], "latched": b["latched"], "reason": b["reason"]}
             for b in breakers
         }
+    else:
+        prior_o4_resolved_symbols = []
 
     decision_utc = _format_utc_ms(clock_fn())
     prior_closes: dict[str, str] = {}
@@ -3527,26 +3615,33 @@ def _run_daily_drill_cycle_locked(
             eval_inputs["calendar"] = cal
             ev_validated = eval_inputs
             ev_mode = cfg.mode
+            rows_by_id, eff_scope, next_state = ev.evaluate(
+                spec_version=ev.spec_version,
+                engine_hash=ev.engine_hash,
+                policy_hash=p_hash,
+                session=session_date,
+                as_of=decision_utc,
+                mode=ev_mode,
+                validated_inputs=ev_validated,
+                prior_row_state=prior_state,
+                authorized_events=None,
+            )
+            o4_resolved: list[str] = []
         else:
-            ev_validated = build_fuse_validated_inputs(
-                eval_inputs,
-                cal,
+            tiered_eval = evaluate_non_stub_tiers(
+                evaluator=ev,
+                session_inputs=eval_inputs,
+                calendar_session=cal,
                 policy_hash=p_hash,
                 session_date=session_date,
-                as_of=decision_utc,
+                decision_timestamp_utc=decision_utc,
+                prior_row_state=prior_state,
+                authorized_events=None,
             )
-            ev_mode = "shadow"
-        rows_by_id, eff_scope, next_state = ev.evaluate(
-            spec_version=ev.spec_version,
-            engine_hash=ev.engine_hash,
-            policy_hash=p_hash,
-            session=session_date,
-            as_of=decision_utc,
-            mode=ev_mode,
-            validated_inputs=ev_validated,
-            prior_row_state=prior_state,
-            authorized_events=None,
-        )
+            rows_by_id = tiered_eval["rows_by_id"]
+            eff_scope = tiered_eval["effective_state_by_scope"]
+            next_state = tiered_eval["next_row_state"]
+            o4_resolved = tiered_eval["o4_resolved_symbols"]
         if o1_blocks_session_commit(rows_by_id["O1"]) or rows_by_id["O2"]["would_have_tripped"]:
             built = {
                 "appended": False,
@@ -3555,6 +3650,7 @@ def _run_daily_drill_cycle_locked(
                 "o2_output": rows_by_id["O2"],
                 "effective_state_by_scope": eff_scope,
                 "next_row_state": next_state,
+                "o4_resolved_symbols": o4_resolved,
             }
         else:
             mkt_digest = sha256_canonical(mkt_recs)
@@ -3605,7 +3701,26 @@ def _run_daily_drill_cycle_locked(
         nonlocal anchor_bytes
         if is_stub_evaluator(ev) or not isinstance(built.get("next_row_state"), dict):
             return None
-        pending_path = save_pending_rejected_state_snapshot(
+        merged_o4_resolved = sorted(
+            set(prior_o4_resolved_symbols)
+            | {
+                str(s)
+                for s in (built.get("o4_resolved_symbols") or ())
+                if isinstance(s, str) and s
+            }
+        )
+        pending_payload = build_pending_rejected_state_payload(
+            chain_id=cfg.chain_id,
+            base_sequence=seq - 1,
+            base_record_sha256=head_hash,
+            rejected_session_date=session_date,
+            engine_hash=ev.engine_hash,
+            spec_version=ev.spec_version,
+            next_row_state=built["next_row_state"],
+            base_prior_row_state=session_base_prior_state,
+            o4_resolved_symbols=merged_o4_resolved,
+        )
+        save_pending_rejected_state_snapshot(
             snapshots_dir,
             chain_id=cfg.chain_id,
             base_sequence=seq - 1,
@@ -3615,10 +3730,9 @@ def _run_daily_drill_cycle_locked(
             spec_version=ev.spec_version,
             next_row_state=built["next_row_state"],
             base_prior_row_state=session_base_prior_state,
+            o4_resolved_symbols=merged_o4_resolved,
         )
-        pending_sha_val = compute_pending_rejected_state_sha256(
-            parse_json_no_duplicates(pending_path.read_text(encoding="utf-8"))
-        )
+        pending_sha_val = compute_pending_rejected_state_sha256(pending_payload)
         if anchor_resolved is not None:
             prior_head_ds = (
                 str(prior_records[-1]["record_body"]["session_date"])

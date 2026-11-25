@@ -2650,6 +2650,172 @@ class Sh2PipelineTest(unittest.TestCase):
                     expected_base_session_date="2026-01-05",
                 )
 
+    def test_o4_terminal_clearing_during_o1_rejection_preserved_in_pending_anchor(self) -> None:
+        from shadow.ledger import build_pending_rejected_state_payload
+
+        ev = VendoredFuseEvaluator()
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal5 = resolve_session("XNYS", "2026-01-05", spec=spec_v2)
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+        cfg = load_scheduler_config(_REPO_ROOT / "config" / "drill-scheduler.json")
+        code_sha = compute_code_manifest_hash()
+
+        def _base_si(ts: str) -> dict:
+            return {
+                "E": "50000",
+                "E_star": "50000",
+                "H": "0",
+                "L": "0",
+                "positions_source_record": {"as_of": ts, "age_sessions": 0},
+                "broker_reconciliation_source_record": {"as_of": ts, "age_sessions": 0},
+                "index_one_session_returns": {"NDX": 0.0, "SEMI": 0.0},
+                "market_records": [
+                    {
+                        "instrument": inst,
+                        "normalized_value": 50.0,
+                        "calendar_spec_digest": str(cal5["spec_digest"]),
+                        "eligibility": {"eligible": True},
+                    }
+                    for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
+                ],
+                "funds": {
+                    "TQQQ": {
+                        "s": "1",
+                        "close_price": "50",
+                        "q_pre": 100,
+                        "sigma_forecast": "0.24",
+                        "fund_return": 0.0,
+                        "index_return": 0.0,
+                    },
+                    "SOXL": {
+                        "s": "1",
+                        "close_price": "40",
+                        "q_pre": 100,
+                        "sigma_forecast": "0.22",
+                        "fund_return": 0.0,
+                        "index_return": 0.0,
+                    },
+                },
+            }
+
+        si5 = _base_si("2026-01-05T22:00:00.000Z")
+        si5["pending_orders"] = {
+            "TQQQ": {"order_id": "ord-123", "status": "unknown", "timed_out": True}
+        }
+        b0 = build_record_body(
+            chain_id=cfg.chain_id,
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:00:00.000Z",
+            session_inputs=si5,
+            calendar_session=cal5,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state={},
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(b0["appended"])
+        committed_state = b0["next_row_state"]
+        self.assertIn("TQQQ", committed_state["O4"])
+        committed_sha = _sha256_canonical_state_dict(committed_state)
+        rec0_sha = sha256_canonical(b0["record_body"])
+
+        # Jan 6: TQQQ terminal status="filled" clears O4.TQQQ while missing positions triggers O1 reject
+        si6 = _base_si("2026-01-06T22:00:00.000Z")
+        si6["positions_source_record"] = None
+        si6["pending_orders"] = {"TQQQ": {"order_id": "ord-123", "status": "filled"}}
+        b1_rej = build_record_body(
+            chain_id=cfg.chain_id,
+            sequence=1,
+            prev_record_sha256=rec0_sha,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:00:00.000Z",
+            session_inputs=si6,
+            calendar_session=cal6,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            prior_row_state=committed_state,
+            calendar_spec=spec_v2,
+        )
+        self.assertFalse(b1_rej["appended"])
+        self.assertEqual(b1_rej["o4_resolved_symbols"], ["TQQQ"])
+        self.assertEqual(b1_rej["next_row_state"].get("O4", {}), {})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sdir = Path(tmpdir) / "state_snapshots"
+            pending_payload = build_pending_rejected_state_payload(
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=b1_rej["next_row_state"],
+                base_prior_row_state=committed_state,
+                o4_resolved_symbols=b1_rej["o4_resolved_symbols"],
+            )
+            p_path = save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=b1_rej["next_row_state"],
+                base_prior_row_state=committed_state,
+                o4_resolved_symbols=b1_rej["o4_resolved_symbols"],
+            )
+            self.assertEqual(
+                compute_pending_rejected_state_sha256(pending_payload),
+                compute_pending_rejected_state_sha256(
+                    json.loads(p_path.read_text(encoding="utf-8"))
+                ),
+            )
+            loaded_state, loaded_payload = load_pending_rejected_state_snapshot(
+                sdir,
+                expected_chain_id=cfg.chain_id,
+                expected_base_sequence=0,
+                expected_base_record_sha256=rec0_sha,
+                current_session_date="2026-01-07",
+                expected_engine_hash=ev.engine_hash,
+                expected_spec_version=ev.spec_version,
+                expected_base_prior_state_sha256=committed_sha,
+                committed_base_prior_row_state=committed_state,
+                expected_base_session_date="2026-01-05",
+            )
+            self.assertEqual(loaded_state.get("O4", {}), {})
+            self.assertEqual(loaded_payload.get("o4_resolved_symbols"), ["TQQQ"])
+
+            # Without o4_resolved_symbols, dropping O4.TQQQ is still rejected as tampering
+            save_pending_rejected_state_snapshot(
+                sdir,
+                chain_id=cfg.chain_id,
+                base_sequence=0,
+                base_record_sha256=rec0_sha,
+                rejected_session_date="2026-01-06",
+                engine_hash=ev.engine_hash,
+                spec_version=ev.spec_version,
+                next_row_state=b1_rej["next_row_state"],
+                base_prior_row_state=committed_state,
+            )
+            with self.assertRaises(EngineIdentityError):
+                load_pending_rejected_state_snapshot(
+                    sdir,
+                    expected_chain_id=cfg.chain_id,
+                    expected_base_sequence=0,
+                    expected_base_record_sha256=rec0_sha,
+                    current_session_date="2026-01-07",
+                    expected_engine_hash=ev.engine_hash,
+                    expected_spec_version=ev.spec_version,
+                    expected_base_prior_state_sha256=committed_sha,
+                    committed_base_prior_row_state=committed_state,
+                    expected_base_session_date="2026-01-05",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

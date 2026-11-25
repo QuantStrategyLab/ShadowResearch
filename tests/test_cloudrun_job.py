@@ -1198,6 +1198,168 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertIn("production_trusted_head_anchor_missing", miss_out["reason"])
             self.assertEqual(len(ShadowLedger(ddir / "ledger").load_records()), 1)
 
+    def test_initializing_lease_not_stolen_and_interrupted_commit_anchor_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. PRRT_kwDOV2RNAc67rRKq: fresh 0-byte initializing lease must NOT be stolen
+            init_dir = Path(tmpdir) / "init_lease_dir"
+            ledger = ShadowLedger(init_dir / "ledger")
+            lease_path = ledger.root_dir / ".chain.lease.json"
+            lease_path.write_bytes(b"")
+            with self.assertRaises(ChainConcurrencyConflictError):
+                ledger._acquire_cross_instance_lease(lease_path, lease_ttl_seconds=300.0)
+            self.assertTrue(lease_path.exists())
+            self.assertEqual(lease_path.read_bytes(), b"")
+
+            # 2. PRRT_kwDOV2RNAc67rRKY: commit seq=1 interrupted before anchor update recovers cleanly
+            raw_cfg = json.loads(
+                (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+            )
+            raw_cfg["production_chain_locked"] = False
+            raw_cfg["clk01_active"] = True
+            unlocked_cfg = Path(tmpdir) / "unlocked-production.json"
+            unlocked_cfg.write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+            heights = {"2026-01-05": 880100, "2026-01-06": 880101, "2026-01-07": 880102}
+
+            def _make_ots(session_date: str):
+                class _Ots(OpenTimestampsClient):
+                    def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                        ots_b, _ = build_synthetic_ots_fixture(
+                            sha256_hex, bitcoin_height=heights[session_date]
+                        )
+                        return ots_b, "https://a.pool.opentimestamps.org"
+
+                return _Ots()
+
+            tick = [3000.0]
+
+            def _fast_clk() -> float:
+                tick[0] += 25.0
+                return tick[0]
+
+            ddir = Path(tmpdir) / "interrupted_anchor_data"
+            anchor_path = Path(tmpdir) / "external_anchor.json"
+            r0 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": GENESIS_PREV_HASH,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                ots_client=_make_ots("2026-01-05"),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            head_0 = str(r0["record_sha256"])
+            anchor_seq0_bytes = anchor_path.read_bytes()
+
+            r1 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-06",
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                ots_client=_make_ots("2026-01-06"),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            head_1 = str(r1["record_sha256"])
+
+            # Simulate interruption after append_record(seq=1) before _advance_trusted_head_anchor
+            anchor_path.write_bytes(anchor_seq0_bytes)
+            # Supplying stale head_0 still fails closed (no rollback)
+            with self.assertRaises(EngineIdentityError) as stale_ctx:
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-07",
+                    transport=build_live_mock_transport("2026-01-07"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": head_0,
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    },
+                    ots_client=_make_ots("2026-01-07"),
+                    wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clk,
+                    sleeper=lambda _s: None,
+                    trusted_head_anchor_path=anchor_path,
+                )
+            self.assertIn("production_trusted_head_mismatch:diverges_from_anchor", str(stale_ctx.exception))
+
+            # Supplying actual committed head_1 catches anchor up to seq=1 on retry, and Jan 7 advances to seq=2
+            retry1 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-06",
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_1,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(retry1["status"], "already_committed_no_op")
+            caught_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            self.assertEqual(caught_anchor["sequence"], 1)
+            self.assertEqual(caught_anchor["head_sha256"], head_1)
+
+            r2 = run_cloudrun_job(
+                data_dir=ddir,
+                config_path=unlocked_cfg,
+                mode="production",
+                session_date="2026-01-07",
+                transport=build_live_mock_transport("2026-01-07"),
+                environ={
+                    "TIINGO_API_KEY": "test-dummy-token",
+                    "SHADOW_TRUSTED_HEAD_SHA256": head_1,
+                    "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                },
+                ots_client=_make_ots("2026-01-07"),
+                wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clk,
+                sleeper=lambda _s: None,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(r2["status"], "committed")
+            self.assertEqual(r2["sequence"], 2)
+
+            # 2-step lag (anchor stuck at seq=0 when ledger at seq=2) still fails closed
+            anchor_path.write_bytes(anchor_seq0_bytes)
+            with self.assertRaises(EngineIdentityError) as gap_ctx:
+                run_cloudrun_job(
+                    data_dir=ddir,
+                    config_path=unlocked_cfg,
+                    mode="production",
+                    session_date="2026-01-08",
+                    transport=build_live_mock_transport("2026-01-08"),
+                    environ={
+                        "TIINGO_API_KEY": "test-dummy-token",
+                        "SHADOW_TRUSTED_HEAD_SHA256": str(r2["record_sha256"]),
+                        "SHADOW_TRUSTED_PENDING_STATE_SHA256": NO_PENDING_REJECTED_STATE_SHA256,
+                    },
+                    wall_clock=lambda: datetime(2026, 1, 8, 22, 30, tzinfo=timezone.utc),
+                    trusted_head_anchor_path=anchor_path,
+                )
+            self.assertIn("production_trusted_head_mismatch:diverges_from_anchor", str(gap_ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

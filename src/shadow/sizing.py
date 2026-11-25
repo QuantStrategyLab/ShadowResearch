@@ -434,6 +434,7 @@ def compute_session_sizing(
     inputs: dict,
     active_control_state: str = "NORMAL",
     fund_control_states: Mapping[str, str] | None = None,
+    tier_control_states: Mapping[str, tuple[str, Mapping[str, str] | None]] | None = None,
 ) -> dict:
     """Compute the 10-step policy_v0_pre notional sizing stack across all 3 tiers."""
     with localcontext() as ctx:
@@ -535,10 +536,15 @@ def compute_session_sizing(
                 denom = beta_soxl if inst == "SOXL" else Decimal("1")
                 x_pre[inst] = (s_i * cap_23 * v_i) / denom
 
+            t_acct_state = active_control_state
+            t_fund_states = fund_control_states
+            if tier_control_states is not None and tier_id in tier_control_states:
+                t_acct_state, t_fund_states = tier_control_states[tier_id]
+
             eff_states: dict[str, str] = {
                 inst: _most_restrictive_sizing_state(
-                    active_control_state,
-                    (fund_control_states or {}).get(inst),
+                    t_acct_state,
+                    (t_fund_states or {}).get(inst),
                 )
                 for inst in INSTRUMENT_ORDER
             }
