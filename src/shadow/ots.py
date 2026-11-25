@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from shadow.http_limits import read_bounded_error_body, read_bounded_http_body
+
 OTS_HEADER_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
 OTS_VERSION = 1
 
@@ -534,6 +536,9 @@ class _NoOtsRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise OtsSubmitError(f"ots_redirect_rejected:{code}:{newurl}")
 
 
+DEFAULT_MAX_OTS_RESPONSE_BYTES = 262_144
+
+
 def urllib_ots_transport(
     method: str,
     url: str,
@@ -542,15 +547,26 @@ def urllib_ots_transport(
     timeout: float,
     *,
     opener: urllib.request.OpenerDirector | None = None,
+    max_bytes: int = DEFAULT_MAX_OTS_RESPONSE_BYTES,
 ) -> tuple[int, bytes]:
     """Perform stdlib HTTP POST/GET for OpenTimestamps calendar servers without following redirects."""
     req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
     active_opener = opener if opener is not None else urllib.request.build_opener(_NoOtsRedirectHandler())
     try:
         with active_opener.open(req, timeout=timeout) as resp:
-            return int(resp.status), resp.read()
+            content_len = (
+                resp.headers.get("Content-Length") if getattr(resp, "headers", None) is not None else None
+            )
+            payload = read_bounded_http_body(
+                resp,
+                max_bytes=max_bytes,
+                error_cls=OtsSubmitError,
+                error_prefix="ots_response_too_large",
+                content_length_header=content_len,
+            )
+            return int(resp.status), payload
     except urllib.error.HTTPError as exc:
-        err_body = exc.read() if exc.fp is not None else b""
+        err_body = read_bounded_error_body(exc, max_bytes=max_bytes)
         return int(exc.code), err_body
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise OtsSubmitError(f"ots_transport_error:{type(exc).__name__}") from exc

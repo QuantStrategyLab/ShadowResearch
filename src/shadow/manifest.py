@@ -18,6 +18,7 @@ RUNTIME_MODULE_FILES: tuple[str, ...] = (
     "src/shadow/feeder.py",
     "src/shadow/feeder_live.py",
     "src/shadow/fuse_adapter.py",
+    "src/shadow/http_limits.py",
     "src/shadow/ledger.py",
     "src/shadow/manifest.py",
     "src/shadow/ots.py",

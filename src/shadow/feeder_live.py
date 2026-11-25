@@ -29,7 +29,14 @@ from shadow.feeder import (
     select_treasury_tbill_row,
     select_yahoo_close,
 )
+from shadow.http_limits import read_bounded_error_body, read_bounded_http_body
 from shadow.sizing import canonical_decimal_str
+
+MAX_TIINGO_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_YAHOO_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_NYFED_SOFR_RESPONSE_BYTES = 1 * 1024 * 1024
+MAX_TREASURY_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_MARKET_RESPONSE_BYTES = 4 * 1024 * 1024
 
 Transport = Callable[[str, Mapping[str, str]], tuple[int, bytes]]
 
@@ -159,20 +166,45 @@ class _NoCrossHostAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new_req
 
 
+def _default_max_bytes_for_url(url: str) -> int:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host == "tiingo.com" or host.endswith(".tiingo.com"):
+        return MAX_TIINGO_RESPONSE_BYTES
+    if host == "yahoo.com" or host.endswith(".yahoo.com"):
+        return MAX_YAHOO_RESPONSE_BYTES
+    if host == "newyorkfed.org" or host.endswith(".newyorkfed.org"):
+        return MAX_NYFED_SOFR_RESPONSE_BYTES
+    if host == "treasury.gov" or host.endswith(".treasury.gov"):
+        return MAX_TREASURY_RESPONSE_BYTES
+    return DEFAULT_MAX_MARKET_RESPONSE_BYTES
+
+
 def urllib_fetch_bytes(
     url: str,
     headers: Mapping[str, str] | None = None,
     *,
     timeout: float = 30.0,
+    max_bytes: int | None = None,
 ) -> tuple[int, bytes]:
-    """Perform an HTTP GET via stdlib urllib with cross-host auth redirect protection."""
+    """Perform an HTTP GET via stdlib urllib with cross-host auth redirect protection and byte cap."""
+    limit = max_bytes if max_bytes is not None else _default_max_bytes_for_url(url)
     req = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
     opener = urllib.request.build_opener(_NoCrossHostAuthRedirectHandler())
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return int(resp.status), resp.read()
+            content_len = (
+                resp.headers.get("Content-Length") if getattr(resp, "headers", None) is not None else None
+            )
+            payload = read_bounded_http_body(
+                resp,
+                max_bytes=limit,
+                error_cls=SourceUnavailableError,
+                error_prefix="response_too_large",
+                content_length_header=content_len,
+            )
+            return int(resp.status), payload
     except urllib.error.HTTPError as exc:
-        body = exc.read() if exc.fp is not None else b""
+        body = read_bounded_error_body(exc, max_bytes=limit)
         return int(exc.code), body
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise SourceUnavailableError(f"transport_error:{type(exc).__name__}") from exc

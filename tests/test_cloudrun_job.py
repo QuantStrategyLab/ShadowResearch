@@ -24,13 +24,20 @@ if _DEMO not in sys.path:
 from run_sh2_demo import _build_session_fixture_files, build_live_mock_transport  # noqa: E402
 from shadow.cloudrun_job import run_cloudrun_job  # noqa: E402
 from shadow.fuse_adapter import EngineIdentityError, PINNED_FUSE_ENGINE_HASH, ProductionChainLockedError  # noqa: E402
+from shadow.feeder_live import SourceUnavailableError, urllib_fetch_bytes  # noqa: E402
 from shadow.ledger import (
     ChainConcurrencyConflictError,
     GENESIS_PREV_HASH,
     NO_PENDING_REJECTED_STATE_SHA256,
     ShadowLedger,
 )
-from shadow.ots import OpenTimestampsClient, build_synthetic_ots_fixture  # noqa: E402
+from shadow.ots import (  # noqa: E402
+    OTS_HEADER_MAGIC,
+    OpenTimestampsClient,
+    OtsSubmitError,
+    build_synthetic_ots_fixture,
+    urllib_ots_transport,
+)
 
 
 class CloudRunJobTest(unittest.TestCase):
@@ -1661,6 +1668,107 @@ class CloudRunJobTest(unittest.TestCase):
             self.assertEqual(final_anchor["sequence"], 1)
             self.assertEqual(final_anchor["pending_rejected_state_sha256"], NO_PENDING_REJECTED_STATE_SHA256)
             self.assertIsNone(final_anchor["pending_rejected_revision"])
+
+    def test_upstream_http_transports_bound_response_bodies_and_error_streams(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        digest_hex = "a" * 64
+        full_ots, _ = build_synthetic_ots_fixture(digest_hex, bitcoin_height=880100)
+        ots_stamp_body = full_ots[len(OTS_HEADER_MAGIC) + 34 :]
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+            def _send_bytes(self, code: int, body: bytes, *, include_cl: bool = True) -> None:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/octet-stream")
+                if include_cl:
+                    self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for offset in range(0, len(body), 65_536):
+                        self.wfile.write(body[offset : offset + 65_536])
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/oversized-market":
+                    self._send_bytes(200, b"m" * (5 * 1024 * 1024), include_cl=False)
+                elif self.path == "/oversized-cl":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "536870912")
+                    self.end_headers()
+                elif self.path == "/oversized-500":
+                    self._send_bytes(500, b"e" * (256 * 1024), include_cl=True)
+                elif self.path == "/ok-market":
+                    self._send_bytes(200, b'{"ok":true}', include_cl=True)
+                else:
+                    self._send_bytes(404, b"not_found", include_cl=True)
+
+            def do_POST(self) -> None:  # noqa: N802
+                cl = int(self.headers.get("Content-Length", "0") or "0")
+                if cl > 0:
+                    self.rfile.read(cl)
+                if self.path == "/oversized-ots/digest":
+                    self._send_bytes(200, b"o" * (512 * 1024), include_cl=False)
+                elif self.path == "/oversized-cl/digest":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "536870912")
+                    self.end_headers()
+                elif self.path == "/oversized-500/digest":
+                    self._send_bytes(500, b"e" * (256 * 1024), include_cl=True)
+                elif self.path == "/ok-ots/digest":
+                    self._send_bytes(200, ots_stamp_body, include_cl=True)
+                else:
+                    self._send_bytes(404, b"not_found", include_cl=True)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            with self.assertRaisesRegex(SourceUnavailableError, "response_too_large"):
+                urllib_fetch_bytes(f"{base}/oversized-market", max_bytes=32_768)
+            with self.assertRaisesRegex(SourceUnavailableError, "response_too_large"):
+                urllib_fetch_bytes(f"{base}/oversized-market")
+            with self.assertRaisesRegex(SourceUnavailableError, "content_length_exceeds_"):
+                urllib_fetch_bytes(f"{base}/oversized-cl")
+
+            st_err_m, body_err_m = urllib_fetch_bytes(f"{base}/oversized-500")
+            self.assertEqual(st_err_m, 500)
+            self.assertLessEqual(len(body_err_m), 65_536)
+
+            st_ok_m, body_ok_m = urllib_fetch_bytes(f"{base}/ok-market")
+            self.assertEqual(st_ok_m, 200)
+            self.assertEqual(body_ok_m, b'{"ok":true}')
+
+            with self.assertRaisesRegex(OtsSubmitError, "ots_response_too_large"):
+                urllib_ots_transport("POST", f"{base}/oversized-ots/digest", b"x" * 32, {}, 5.0)
+            with self.assertRaisesRegex(OtsSubmitError, "content_length_exceeds_"):
+                urllib_ots_transport("POST", f"{base}/oversized-cl/digest", b"x" * 32, {}, 5.0)
+
+            st_err_o, body_err_o = urllib_ots_transport(
+                "POST", f"{base}/oversized-500/digest", b"x" * 32, {}, 5.0
+            )
+            self.assertEqual(st_err_o, 500)
+            self.assertLessEqual(len(body_err_o), 65_536)
+
+            client = OpenTimestampsClient(
+                calendars=[f"{base}/oversized-ots", f"{base}/ok-ots"],
+                timeout=5.0,
+            )
+            stamped_bytes, meta = client.stamp_digest(digest_hex)
+            self.assertTrue(stamped_bytes.startswith(OTS_HEADER_MAGIC))
+            self.assertEqual(meta["submitted_calendars"], [f"{base}/ok-ots"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":
