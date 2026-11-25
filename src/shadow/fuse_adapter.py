@@ -1098,7 +1098,12 @@ def build_fuse_validated_inputs(
 
         # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
         ca_obj = copy.deepcopy(fdata.get("corporate_action"))
-        if ca_obj is None and symbol in by_inst:
+        if (
+            ca_obj is None
+            and not bad_market_payload
+            and symbol not in bad_market_insts
+            and symbol in by_inst
+        ):
             ca_obj = _map_market_corporate_action(
                 by_inst[symbol].get("corporate_action")  # type: ignore[arg-type]
             )

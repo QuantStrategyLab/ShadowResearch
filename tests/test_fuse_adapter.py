@@ -2089,6 +2089,104 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertFalse(nxt.get("V1", {}).get("latched", False))
         self.assertNotEqual(rows["V1"].get("reason"), "tracking_deviation_exceeds_0_75pp")
 
+    def test_ineligible_fund_corporate_action_is_excluded_from_v2_state(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal1 = resolve_session("XNYS", "2026-01-05", spec=spec)
+        cal2 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        si1 = json.loads(json.dumps(_valid_inputs()))
+        si1["funds"]["TQQQ"].pop("corporate_action", None)
+        si1["funds"]["TQQQ"]["close_price"] = "25"
+        si1["funds"]["TQQQ"]["fund_return"] = 0.0
+        si1["funds"]["TQQQ"]["index_return"] = 0.0
+        si1["market_records"] = [
+            {
+                "instrument": "TQQQ",
+                "normalized_value": "25",
+                "eligibility": {"eligible": False, "reason": "stale_fund_bar"},
+                "calendar_spec_digest": cal1["spec_digest"],
+                "corporate_action": {"split_ratio": "2", "ex_date": "2026-01-05"},
+            },
+            {
+                "instrument": "SOXL",
+                "normalized_value": "40",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal1["spec_digest"],
+            },
+            {
+                "instrument": "XNDX",
+                "normalized_value": "20000",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal1["spec_digest"],
+            },
+            {
+                "instrument": "SEMI",
+                "normalized_value": "5000",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal1["spec_digest"],
+            },
+            {
+                "instrument": "SOFR",
+                "normalized_value": "0.045",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal1["spec_digest"],
+            },
+            {
+                "instrument": "TBILL_3M",
+                "normalized_value": "0.042",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal1["spec_digest"],
+            },
+        ]
+        vin1 = build_fuse_validated_inputs(
+            si1,
+            cal1,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNone(vin1["funds"]["TQQQ"]["corporate_action"])
+        rows1, _, nxt1 = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin1,
+            {},
+            None,
+        )
+        self.assertEqual(rows1["O1"]["state"], "NO-NEW-RISK")
+
+        si2 = json.loads(json.dumps(_valid_inputs()))
+        si2["positions_source_record"] = {"as_of": "2026-01-06T22:00:00.000Z", "age_sessions": 0}
+        si2["broker_reconciliation_source_record"] = {
+            "as_of": "2026-01-06T22:00:00.000Z",
+            "age_sessions": 0,
+        }
+        vin2 = build_fuse_validated_inputs(
+            si2,
+            cal2,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        rows2, _, _ = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-06",
+            "2026-01-06T22:00:00.000Z",
+            "shadow",
+            vin2,
+            nxt1,
+            None,
+        )
+        self.assertEqual(rows2["V2"]["state"], "NORMAL")
+        self.assertNotEqual(rows2["V2"].get("reason"), "pending_corporate_action_carried_TQQQ")
+
 
 if __name__ == "__main__":
     unittest.main()

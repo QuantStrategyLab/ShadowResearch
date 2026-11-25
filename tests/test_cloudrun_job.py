@@ -328,15 +328,20 @@ class CloudRunJobTest(unittest.TestCase):
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             )
             self.assertEqual(r_ok["status"], "committed")
-            released_obj = json.loads(lease_path.read_text(encoding="utf-8"))
+            slot_after = ShadowLedger._latest_lease_slot(lease_path)
+            self.assertIsNotNone(slot_after)
+            released_obj = json.loads(slot_after[1].read_text(encoding="utf-8"))
             self.assertTrue(
                 ShadowLedger._is_lease_released(lease_path, released_obj["lease_id"])
             )
 
             # 3. Mismatched lease_id overwritten by another writer must NOT be unlinked on exit
             with ledger.chain_lock():
-                self.assertTrue(lease_path.is_file())
-                lease_path.write_text(
+                cur_slot = ShadowLedger._latest_lease_slot(lease_path)
+                self.assertIsNotNone(cur_slot)
+                cur_slot_path = cur_slot[1]
+                self.assertTrue(cur_slot_path.is_file())
+                cur_slot_path.write_text(
                     json.dumps(
                         {
                             "schema_version": "c-sh-chain-lease-v1",
@@ -348,8 +353,8 @@ class CloudRunJobTest(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-            self.assertTrue(lease_path.is_file())
-            self.assertEqual(json.loads(lease_path.read_text(encoding="utf-8"))["lease_id"], "someone-elses-lease")
+            self.assertTrue(cur_slot_path.is_file())
+            self.assertEqual(json.loads(cur_slot_path.read_text(encoding="utf-8"))["lease_id"], "someone-elses-lease")
 
     def test_cloudrun_production_history_authentication_and_exit3_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -835,11 +840,13 @@ class CloudRunJobTest(unittest.TestCase):
 
             self.assertEqual(len(winners), 1, f"winners={winners}, conflicts={conflicts}")
             self.assertEqual(len(conflicts), 1, f"winners={winners}, conflicts={conflicts}")
-            active = json.loads(lease_path.read_text(encoding="utf-8"))
+            active_slot = ShadowLedger._latest_lease_slot(lease_path)
+            self.assertIsNotNone(active_slot)
+            active = json.loads(active_slot[1].read_text(encoding="utf-8"))
             self.assertEqual(active["lease_id"], winners[0])
 
-            # Expired lease must NOT be unlinked by its former holder after TTL expiry
-            lease_path.write_text(
+            # Expired lease must NOT be marked released or unlinked by its former holder after TTL expiry
+            active_slot[1].write_text(
                 json.dumps(
                     {
                         "schema_version": "c-sh-chain-lease-v1",
@@ -850,7 +857,8 @@ class CloudRunJobTest(unittest.TestCase):
                 encoding="utf-8",
             )
             ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
-            self.assertTrue(lease_path.is_file())
+            self.assertTrue(active_slot[1].is_file())
+            self.assertFalse(ShadowLedger._is_lease_released(lease_path, winners[0]))
 
     def test_expired_reclaim_claim_recovery_and_trusted_anchor_rollback_rejected(self) -> None:
         import hashlib
@@ -932,7 +940,9 @@ class CloudRunJobTest(unittest.TestCase):
 
             self.assertEqual(len(winners), 1, f"winners={winners}, conflicts={conflicts}")
             self.assertEqual(len(conflicts), 1, f"winners={winners}, conflicts={conflicts}")
-            active = json.loads(lease_path.read_text(encoding="utf-8"))
+            rec_slot = ShadowLedger._latest_lease_slot(lease_path)
+            self.assertIsNotNone(rec_slot)
+            active = json.loads(rec_slot[1].read_text(encoding="utf-8"))
             self.assertEqual(active["lease_id"], winners[0])
             ShadowLedger._release_cross_instance_lease(lease_path, winners[0])
             self.assertTrue(ShadowLedger._is_lease_released(lease_path, winners[0]))
@@ -2027,7 +2037,9 @@ class CloudRunJobTest(unittest.TestCase):
                     race_ledger._renew_cross_instance_lease(
                         race_lease, first_id, lease_ttl_seconds=300.0
                     )
-                cur_obj = json.loads(race_lease.read_text(encoding="utf-8"))
+                latest_race = ShadowLedger._latest_lease_slot(race_lease)
+                self.assertIsNotNone(latest_race)
+                cur_obj = json.loads(latest_race[1].read_text(encoding="utf-8"))
                 self.assertEqual(cur_obj["lease_id"], peer_id_box[0])
                 self.assertNotEqual(cur_obj["lease_id"], first_id)
                 self.assertEqual(
@@ -2099,7 +2111,9 @@ class CloudRunJobTest(unittest.TestCase):
                 ShadowLedger._release_cross_instance_lease(rel_lease, first_rel_id)
                 ShadowLedger._publish_exclusive_file = orig_rel_pub  # type: ignore[assignment]
 
-                cur_rel_obj = json.loads(rel_lease.read_text(encoding="utf-8"))
+                latest_rel = ShadowLedger._latest_lease_slot(rel_lease)
+                self.assertIsNotNone(latest_rel)
+                cur_rel_obj = json.loads(latest_rel[1].read_text(encoding="utf-8"))
                 self.assertEqual(len(rel_peer_box), 1)
                 self.assertEqual(cur_rel_obj["lease_id"], rel_peer_box[0])
                 self.assertNotEqual(cur_rel_obj["lease_id"], first_rel_id)
@@ -2118,16 +2132,79 @@ class CloudRunJobTest(unittest.TestCase):
             seq_ledger = ShadowLedger(Path(tmpdir) / "seq_release" / "ledger")
             seq_lease = seq_ledger.root_dir / ".chain.lease.json"
             with seq_ledger.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
-                id1 = json.loads(seq_lease.read_text(encoding="utf-8"))["lease_id"]
+                seq_slot1 = ShadowLedger._latest_lease_slot(seq_lease)
+                self.assertIsNotNone(seq_slot1)
+                id1 = json.loads(seq_slot1[1].read_text(encoding="utf-8"))["lease_id"]
             self.assertTrue(ShadowLedger._is_lease_released(seq_lease, id1))
             seq_peer = ShadowLedger(seq_ledger.root_dir)
             with seq_peer.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
-                id2 = json.loads(seq_lease.read_text(encoding="utf-8"))["lease_id"]
+                seq_slot2 = ShadowLedger._latest_lease_slot(seq_lease)
+                self.assertIsNotNone(seq_slot2)
+                id2 = json.loads(seq_slot2[1].read_text(encoding="utf-8"))["lease_id"]
                 self.assertNotEqual(id2, id1)
                 seq_peer.assert_active_chain_lease()
                 self.assertFalse(
                     seq_lease.with_name(f".chain.lease.released.{id1}.json").exists()
                 )
+
+            # 5. Paused reclaimer resuming after 301s cannot delete or replace peer's recovered epoch lease
+            rc_ledger = ShadowLedger(Path(tmpdir) / "reclaim_fence" / "ledger")
+            rc_lease = rc_ledger.root_dir / ".chain.lease.json"
+            base_rc = datetime.now(timezone.utc)
+            rc_lease.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-v1",
+                        "lease_id": "expired-reclaim-target",
+                        "expires_at_utc": (base_rc - timedelta(minutes=5)).strftime(
+                            "%Y-%m-%dT%H:%M:%S.000Z"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            orig_rc_now = ShadowLedger.__dict__["_now_utc"]
+            orig_rc_pub = ShadowLedger.__dict__["_publish_exclusive_file"]
+            rc_box = [base_rc]
+            ShadowLedger._now_utc = staticmethod(lambda: rc_box[0])  # type: ignore[method-assign]
+            try:
+                rc_peer = ShadowLedger(rc_ledger.root_dir)
+                rc_peer_box: list[str] = []
+                pause_done = [False]
+
+                @staticmethod
+                def _paused_reclaim_publish(
+                    dest_path: Path, tmp_path: Path, payload_bytes: bytes
+                ) -> None:
+                    if dest_path.name == ".chain.lease.epoch.1.json" and not pause_done[0]:
+                        pause_done[0] = True
+                        rc_box[0] = base_rc + timedelta(seconds=301)
+                        rc_peer_box.append(
+                            rc_peer._acquire_cross_instance_lease(
+                                rc_lease, lease_ttl_seconds=300.0
+                            )
+                        )
+                    orig_rc_pub.__func__(dest_path, tmp_path, payload_bytes)  # type: ignore[attr-defined]
+
+                ShadowLedger._publish_exclusive_file = _paused_reclaim_publish  # type: ignore[method-assign]
+                with self.assertRaises(ChainConcurrencyConflictError):
+                    rc_ledger._acquire_cross_instance_lease(rc_lease, lease_ttl_seconds=300.0)
+                ShadowLedger._publish_exclusive_file = orig_rc_pub  # type: ignore[assignment]
+
+                self.assertEqual(len(rc_peer_box), 1)
+                latest_rc = ShadowLedger._latest_lease_slot(rc_lease)
+                self.assertIsNotNone(latest_rc)
+                self.assertEqual(latest_rc[0], 1)
+                cur_rc_obj = json.loads(latest_rc[1].read_text(encoding="utf-8"))
+                self.assertEqual(cur_rc_obj["lease_id"], rc_peer_box[0])
+                third_rc = ShadowLedger(rc_ledger.root_dir)
+                with self.assertRaisesRegex(
+                    ChainConcurrencyConflictError, "held by active writer"
+                ):
+                    third_rc._acquire_cross_instance_lease(rc_lease, lease_ttl_seconds=300.0)
+            finally:
+                ShadowLedger._publish_exclusive_file = orig_rc_pub  # type: ignore[assignment]
+                ShadowLedger._now_utc = orig_rc_now  # type: ignore[assignment]
 
 
 if __name__ == "__main__":

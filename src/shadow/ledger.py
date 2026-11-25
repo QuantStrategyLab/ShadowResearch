@@ -1471,6 +1471,29 @@ class ShadowLedger:
     def _now_utc() -> datetime:
         return datetime.now(timezone.utc)
 
+    @staticmethod
+    def _latest_lease_slot(lease_path: Path) -> tuple[int, Path] | None:
+        prefix = ".chain.lease.epoch."
+        suffix = ".json"
+        best: tuple[int, Path] | None = None
+        for cand in lease_path.parent.glob(".chain.lease.epoch.*.json"):
+            name = cand.name
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            epoch_str = name[len(prefix) : -len(suffix)]
+            if not (epoch_str.isascii() and epoch_str.isdigit()):
+                continue
+            epoch = int(epoch_str)
+            if epoch < 1 or str(epoch) != epoch_str:
+                continue
+            if best is None or epoch > best[0]:
+                best = (epoch, cand)
+        if best is not None:
+            return best
+        if lease_path.is_file():
+            return (0, lease_path)
+        return None
+
     def _acquire_cross_instance_lease(
         self,
         lease_path: Path,
@@ -1478,214 +1501,235 @@ class ShadowLedger:
         lease_ttl_seconds: float,
     ) -> str:
         lease_id = uuid4().hex
-        now_utc = self._now_utc()
-        expires_utc = now_utc + timedelta(seconds=max(1.0, lease_ttl_seconds))
-        lease_payload = {
-            "schema_version": "c-sh-chain-lease-v1",
-            "lease_id": lease_id,
-            "pid": os.getpid(),
-            "execution_id": os.environ.get("CLOUD_RUN_EXECUTION", ""),
-            "acquired_at_utc": now_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_utc.microsecond // 1000:03d}Z",
-            "expires_at_utc": expires_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{expires_utc.microsecond // 1000:03d}Z",
-        }
-        lease_bytes = (
-            json.dumps(lease_payload, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode("utf-8")
 
-        for attempt in range(2):
-            tmp_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.{attempt}.lock")
+        def _build_lease_bytes(target_epoch: int) -> bytes:
+            now_pub = self._now_utc()
+            expires_pub = now_pub + timedelta(seconds=max(1.0, float(lease_ttl_seconds)))
+            lease_payload = {
+                "schema_version": "c-sh-chain-lease-v1",
+                "epoch": target_epoch,
+                "lease_id": lease_id,
+                "pid": os.getpid(),
+                "execution_id": os.environ.get("CLOUD_RUN_EXECUTION", ""),
+                "acquired_at_utc": (
+                    now_pub.strftime("%Y-%m-%dT%H:%M:%S.")
+                    + f"{now_pub.microsecond // 1000:03d}Z"
+                ),
+                "expires_at_utc": (
+                    expires_pub.strftime("%Y-%m-%dT%H:%M:%S.")
+                    + f"{expires_pub.microsecond // 1000:03d}Z"
+                ),
+            }
+            return (
+                json.dumps(lease_payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+
+        latest = self._latest_lease_slot(lease_path)
+        if latest is None:
+            tmp0_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.0.lock")
             try:
-                self._publish_exclusive_file(lease_path, tmp_path, lease_bytes)
+                self._publish_exclusive_file(lease_path, tmp0_path, _build_lease_bytes(0))
                 return lease_id
             except FileExistsError:
-                existing: dict = {}
-                try:
-                    orig_st, existing_bytes = self._read_lease_snapshot(lease_path)
-                    existing_raw = existing_bytes.decode("utf-8", errors="replace")
-                    if not existing_raw.strip():
-                        now_init = self._now_utc()
-                        if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
-                            raise ChainConcurrencyConflictError(
-                                "Chain lease file initializing by peer writer"
-                            )
-                        parsed = {}
-                    else:
-                        parsed = parse_json_no_duplicates(existing_raw)
-                    if isinstance(parsed, dict):
-                        existing = parsed
-                except ChainConcurrencyConflictError:
-                    raise
-                except FileNotFoundError:
-                    continue
-                except Exception:
+                latest = self._latest_lease_slot(lease_path)
+                if latest is None:
                     raise ChainConcurrencyConflictError(
-                        "Chain lease file unreadable during concurrent acquisition"
+                        "Failed to acquire cross-instance chain lease"
                     )
 
-                exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
-                raw_lease_id = existing.get("lease_id") if isinstance(existing, dict) else None
-                lease_id_str = (
-                    raw_lease_id if isinstance(raw_lease_id, str) and raw_lease_id else None
-                )
-                eff_exp_dt = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
-                is_released = self._is_lease_released(lease_path, lease_id_str)
-                now_chk = self._now_utc()
-                if not is_released and eff_exp_dt is not None and now_chk < eff_exp_dt:
+        cur_epoch, cur_slot_path = latest
+        existing: dict = {}
+        try:
+            orig_st, existing_bytes = self._read_lease_snapshot(cur_slot_path)
+            existing_raw = existing_bytes.decode("utf-8", errors="replace")
+            if not existing_raw.strip():
+                now_init = self._now_utc()
+                if (now_init.timestamp() - orig_st.st_mtime) < 5.0:
                     raise ChainConcurrencyConflictError(
-                        "Chain lease held by active writer: "
-                        f"lease_id={existing.get('lease_id')!r}, "
-                        f"pid={existing.get('pid')!r}, "
-                        f"execution_id={existing.get('execution_id')!r}"
+                        "Chain lease file initializing by peer writer"
                     )
-                if attempt == 0:
-                    stale_sha = hashlib.sha256(existing_bytes).hexdigest()
-                    raw_lease_id = existing.get("lease_id")
-                    if isinstance(raw_lease_id, str) and raw_lease_id:
-                        claim_basis = f"id:{raw_lease_id}:{stale_sha}"
-                    else:
-                        claim_basis = (
-                            f"raw:{stale_sha}:{int(orig_st.st_mtime)}:{orig_st.st_size}"
-                        )
-                    claim_key = hashlib.sha256(claim_basis.encode("utf-8")).hexdigest()[:32]
-                    reclaim_expires = now_chk + timedelta(
-                        seconds=max(300.0, float(lease_ttl_seconds))
-                    )
-                    existing_claims = [
-                        lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock"),
-                        *sorted(lease_path.parent.glob(f".chain.lease.reclaim.{claim_key}.g*.lock")),
-                    ]
-                    for existing_claim_path in existing_claims:
-                        try:
-                            ex_st, ex_bytes = self._read_lease_snapshot(existing_claim_path)
-                        except FileNotFoundError:
-                            continue
-                        except Exception as pexc:
-                            raise ChainConcurrencyConflictError(
-                                "Stale chain lease reclamation already claimed by peer writer"
-                            ) from pexc
-                        if not self._is_reclaim_claim_expired(ex_st, ex_bytes, now_chk):
-                            raise ChainConcurrencyConflictError(
-                                "Stale chain lease reclamation already claimed by peer writer"
-                            )
+                parsed = {}
+            else:
+                parsed = parse_json_no_duplicates(existing_raw)
+            if isinstance(parsed, dict):
+                existing = parsed
+        except ChainConcurrencyConflictError:
+            raise
+        except FileNotFoundError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease file vanished during concurrent acquisition"
+            ) from exc
+        except Exception as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease file unreadable during concurrent acquisition"
+            ) from exc
 
-                    won = False
-                    for gen in range(self._MAX_RECLAIM_GENERATIONS):
-                        reclaim_path = lease_path.with_name(
-                            f".chain.lease.reclaim.{claim_key}.lock"
-                            if gen == 0
-                            else f".chain.lease.reclaim.{claim_key}.g{gen}.lock"
-                        )
-                        reclaim_bytes = (
-                            json.dumps(
-                                {
-                                    "schema_version": "c-sh-chain-lease-reclaim-v1",
-                                    "claim_key": claim_key,
-                                    "generation": gen,
-                                    "reclaimed_lease_id": raw_lease_id,
-                                    "claimed_by_lease_id": lease_id,
-                                    "claimed_at_utc": now_chk.strftime("%Y-%m-%dT%H:%M:%S.")
-                                    + f"{now_chk.microsecond // 1000:03d}Z",
-                                    "expires_at_utc": reclaim_expires.strftime(
-                                        "%Y-%m-%dT%H:%M:%S."
-                                    )
-                                    + f"{reclaim_expires.microsecond // 1000:03d}Z",
-                                },
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                            + "\n"
-                        ).encode("utf-8")
-                        reclaim_tmp_path = lease_path.with_name(
-                            f".chain.lease.tmp.reclaim.{lease_id}.{gen}.lock"
-                        )
-                        try:
-                            self._publish_exclusive_file(
-                                reclaim_path, reclaim_tmp_path, reclaim_bytes
-                            )
-                            won = True
-                            break
-                        except FileExistsError as exc:
-                            try:
-                                rc_st, rc_bytes = self._read_lease_snapshot(reclaim_path)
-                            except FileNotFoundError as fnf:
-                                raise ChainConcurrencyConflictError(
-                                    "Stale chain lease reclamation claim vanished during acquisition"
-                                ) from fnf
-                            except Exception as pexc:
-                                raise ChainConcurrencyConflictError(
-                                    "Stale chain lease reclamation already claimed by peer writer"
-                                ) from pexc
-                            if not self._is_reclaim_claim_expired(rc_st, rc_bytes, now_chk):
-                                raise ChainConcurrencyConflictError(
-                                    "Stale chain lease reclamation already claimed by peer writer"
-                                ) from exc
-                            try:
-                                chk_st, chk_bytes = self._read_lease_snapshot(lease_path)
-                            except FileNotFoundError as fnf:
-                                raise ChainConcurrencyConflictError(
-                                    "Chain lease changed before stale CAS reclamation completed"
-                                ) from fnf
-                            if (
-                                chk_st.st_dev != orig_st.st_dev
-                                or chk_st.st_ino != orig_st.st_ino
-                                or chk_bytes != existing_bytes
-                            ):
-                                raise ChainConcurrencyConflictError(
-                                    "Chain lease identity changed during stale CAS reclamation"
-                                )
-                            continue
-                    if not won:
-                        raise ChainConcurrencyConflictError(
-                            "Stale chain lease reclamation generation budget exhausted"
-                        )
+        exp_dt = self._parse_iso_utc(existing.get("expires_at_utc"))
+        raw_lease_id = existing.get("lease_id") if isinstance(existing, dict) else None
+        lease_id_str = (
+            raw_lease_id if isinstance(raw_lease_id, str) and raw_lease_id else None
+        )
+        eff_exp_dt = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
+        is_released = self._is_lease_released(lease_path, lease_id_str)
+        now_chk = self._now_utc()
+        if not is_released and eff_exp_dt is not None and now_chk < eff_exp_dt:
+            raise ChainConcurrencyConflictError(
+                "Chain lease held by active writer: "
+                f"lease_id={existing.get('lease_id')!r}, "
+                f"pid={existing.get('pid')!r}, "
+                f"execution_id={existing.get('execution_id')!r}"
+            )
 
-                    try:
-                        cur_st, cur_bytes = self._read_lease_snapshot(lease_path)
-                    except FileNotFoundError as exc:
-                        raise ChainConcurrencyConflictError(
-                            "Chain lease changed before stale CAS reclamation completed"
-                        ) from exc
-                    if (
-                        cur_st.st_dev != orig_st.st_dev
-                        or cur_st.st_ino != orig_st.st_ino
-                        or cur_bytes != existing_bytes
-                    ):
-                        raise ChainConcurrencyConflictError(
-                            "Chain lease identity changed during stale CAS reclamation"
-                        )
-                    recheck_exp = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
-                    recheck_released = self._is_lease_released(lease_path, lease_id_str)
-                    if (
-                        not recheck_released
-                        and recheck_exp is not None
-                        and self._now_utc() < recheck_exp
-                    ):
-                        raise ChainConcurrencyConflictError(
-                            "Chain lease renewed during stale CAS reclamation"
-                        )
-                    try:
-                        os.unlink(str(lease_path))
-                    except FileNotFoundError:
-                        pass
-                    if lease_id_str:
-                        for renew_file in lease_path.parent.glob(
-                            f".chain.lease.renew.{lease_id_str}.*.json"
-                        ):
-                            try:
-                                renew_file.unlink()
-                            except FileNotFoundError:
-                                pass
-                        try:
-                            lease_path.with_name(
-                                f".chain.lease.released.{lease_id_str}.json"
-                            ).unlink()
-                        except FileNotFoundError:
-                            pass
-                    continue
+        stale_sha = hashlib.sha256(existing_bytes).hexdigest()
+        raw_lease_id = existing.get("lease_id")
+        if isinstance(raw_lease_id, str) and raw_lease_id:
+            claim_basis = f"id:{raw_lease_id}:{stale_sha}"
+        else:
+            claim_basis = f"raw:{stale_sha}:{int(orig_st.st_mtime)}:{orig_st.st_size}"
+        claim_key = hashlib.sha256(claim_basis.encode("utf-8")).hexdigest()[:32]
+        reclaim_expires = now_chk + timedelta(seconds=max(300.0, float(lease_ttl_seconds)))
+        existing_claims = [
+            lease_path.with_name(f".chain.lease.reclaim.{claim_key}.lock"),
+            *sorted(lease_path.parent.glob(f".chain.lease.reclaim.{claim_key}.g*.lock")),
+        ]
+        for existing_claim_path in existing_claims:
+            try:
+                ex_st, ex_bytes = self._read_lease_snapshot(existing_claim_path)
+            except FileNotFoundError:
+                continue
+            except Exception as pexc:
                 raise ChainConcurrencyConflictError(
-                    "Chain lease creation conflicted after stale reclamation retry"
+                    "Stale chain lease reclamation already claimed by peer writer"
+                ) from pexc
+            if not self._is_reclaim_claim_expired(ex_st, ex_bytes, now_chk):
+                raise ChainConcurrencyConflictError(
+                    "Stale chain lease reclamation already claimed by peer writer"
                 )
-        raise ChainConcurrencyConflictError("Failed to acquire cross-instance chain lease")
+
+        won = False
+        for gen in range(self._MAX_RECLAIM_GENERATIONS):
+            reclaim_path = lease_path.with_name(
+                f".chain.lease.reclaim.{claim_key}.lock"
+                if gen == 0
+                else f".chain.lease.reclaim.{claim_key}.g{gen}.lock"
+            )
+            reclaim_bytes = (
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-chain-lease-reclaim-v1",
+                        "claim_key": claim_key,
+                        "generation": gen,
+                        "reclaimed_lease_id": raw_lease_id,
+                        "claimed_by_lease_id": lease_id,
+                        "claimed_at_utc": now_chk.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{now_chk.microsecond // 1000:03d}Z",
+                        "expires_at_utc": reclaim_expires.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{reclaim_expires.microsecond // 1000:03d}Z",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            reclaim_tmp_path = lease_path.with_name(
+                f".chain.lease.tmp.reclaim.{lease_id}.{gen}.lock"
+            )
+            try:
+                self._publish_exclusive_file(reclaim_path, reclaim_tmp_path, reclaim_bytes)
+                won = True
+                break
+            except FileExistsError as exc:
+                try:
+                    rc_st, rc_bytes = self._read_lease_snapshot(reclaim_path)
+                except FileNotFoundError as fnf:
+                    raise ChainConcurrencyConflictError(
+                        "Stale chain lease reclamation claim vanished during acquisition"
+                    ) from fnf
+                except Exception as pexc:
+                    raise ChainConcurrencyConflictError(
+                        "Stale chain lease reclamation already claimed by peer writer"
+                    ) from pexc
+                if not self._is_reclaim_claim_expired(rc_st, rc_bytes, now_chk):
+                    raise ChainConcurrencyConflictError(
+                        "Stale chain lease reclamation already claimed by peer writer"
+                    ) from exc
+                if self._latest_lease_slot(lease_path) != (cur_epoch, cur_slot_path):
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease epoch advanced during stale CAS reclamation"
+                    ) from exc
+                try:
+                    chk_st, chk_bytes = self._read_lease_snapshot(cur_slot_path)
+                except FileNotFoundError as fnf:
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease changed before stale CAS reclamation completed"
+                    ) from fnf
+                if (
+                    chk_st.st_dev != orig_st.st_dev
+                    or chk_st.st_ino != orig_st.st_ino
+                    or chk_bytes != existing_bytes
+                ):
+                    raise ChainConcurrencyConflictError(
+                        "Chain lease identity changed during stale CAS reclamation"
+                    ) from exc
+                continue
+        if not won:
+            raise ChainConcurrencyConflictError(
+                "Stale chain lease reclamation generation budget exhausted"
+            )
+
+        if self._latest_lease_slot(lease_path) != (cur_epoch, cur_slot_path):
+            raise ChainConcurrencyConflictError(
+                "Chain lease epoch advanced before stale CAS reclamation completed"
+            )
+        try:
+            cur_st, cur_bytes = self._read_lease_snapshot(cur_slot_path)
+        except FileNotFoundError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease changed before stale CAS reclamation completed"
+            ) from exc
+        if (
+            cur_st.st_dev != orig_st.st_dev
+            or cur_st.st_ino != orig_st.st_ino
+            or cur_bytes != existing_bytes
+        ):
+            raise ChainConcurrencyConflictError(
+                "Chain lease identity changed during stale CAS reclamation"
+            )
+        recheck_exp = self._effective_lease_expiry(lease_path, lease_id_str, exp_dt)
+        recheck_released = self._is_lease_released(lease_path, lease_id_str)
+        now_recheck = self._now_utc()
+        if not recheck_released and recheck_exp is not None and now_recheck < recheck_exp:
+            raise ChainConcurrencyConflictError(
+                "Chain lease renewed during stale CAS reclamation"
+            )
+        if now_recheck >= reclaim_expires:
+            raise ChainConcurrencyConflictError(
+                "Stale chain lease reclamation claim expired before publish"
+            )
+
+        next_epoch = cur_epoch + 1
+        next_slot_path = lease_path.with_name(f".chain.lease.epoch.{next_epoch}.json")
+        next_tmp_path = lease_path.with_name(f".chain.lease.tmp.{lease_id}.{next_epoch}.lock")
+        try:
+            self._publish_exclusive_file(
+                next_slot_path, next_tmp_path, _build_lease_bytes(next_epoch)
+            )
+        except FileExistsError as exc:
+            raise ChainConcurrencyConflictError(
+                "Chain lease epoch already claimed by peer writer"
+            ) from exc
+
+        if lease_id_str:
+            for renew_file in lease_path.parent.glob(f".chain.lease.renew.{lease_id_str}.*.json"):
+                try:
+                    renew_file.unlink()
+                except FileNotFoundError:
+                    pass
+            try:
+                lease_path.with_name(f".chain.lease.released.{lease_id_str}.json").unlink()
+            except FileNotFoundError:
+                pass
+        return lease_id
 
     @staticmethod
     def _is_lease_released(lease_path: Path, lease_id: str | None) -> bool:
@@ -1739,8 +1783,12 @@ class ShadowLedger:
         lease_ttl_seconds: float,
     ) -> None:
         """Extend an active owned lease via an immutable sidecar without overwriting displaced leases."""
+        latest = self._latest_lease_slot(lease_path)
+        if latest is None:
+            raise ChainConcurrencyConflictError("Chain lease vanished before renewal")
+        cur_epoch, cur_slot_path = latest
         try:
-            cur_st, cur_bytes = self._read_lease_snapshot(lease_path)
+            cur_st, cur_bytes = self._read_lease_snapshot(cur_slot_path)
             parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
         except FileNotFoundError as exc:
             raise ChainConcurrencyConflictError(
@@ -1808,8 +1856,10 @@ class ShadowLedger:
                 raise ChainConcurrencyConflictError(msg) from cause
             raise ChainConcurrencyConflictError(msg)
 
+        if self._latest_lease_slot(lease_path) != (cur_epoch, cur_slot_path):
+            _abort_renew("Chain lease displaced during renewal")
         try:
-            chk_st, verify_bytes = self._read_lease_snapshot(lease_path)
+            chk_st, verify_bytes = self._read_lease_snapshot(cur_slot_path)
             verify_obj = parse_json_no_duplicates(verify_bytes.decode("utf-8", errors="replace"))
         except Exception as exc:
             _abort_renew("Chain lease unreadable after renewal", exc)
@@ -1857,8 +1907,12 @@ class ShadowLedger:
         with entry["lease_mu"]:
             if entry.get("lost_error"):
                 raise ChainConcurrencyConflictError(str(entry["lost_error"]))
+            latest = self._latest_lease_slot(lease_path)
+            if latest is None:
+                entry["lost_error"] = "Chain lease missing before write"
+                raise ChainConcurrencyConflictError(entry["lost_error"])
             try:
-                _, cur_bytes = self._read_lease_snapshot(lease_path)
+                _, cur_bytes = self._read_lease_snapshot(latest[1])
                 parsed = parse_json_no_duplicates(cur_bytes.decode("utf-8", errors="replace"))
             except FileNotFoundError as exc:
                 entry["lost_error"] = "Chain lease missing before write"
@@ -1888,14 +1942,12 @@ class ShadowLedger:
     @staticmethod
     def _release_cross_instance_lease(lease_path: Path, expected_lease_id: str) -> None:
         now_utc = ShadowLedger._now_utc()
-        active_lease_id: str | None = None
-        if lease_path.is_file():
+        latest = ShadowLedger._latest_lease_slot(lease_path)
+        if latest is not None:
             try:
-                parsed = parse_json_no_duplicates(lease_path.read_text(encoding="utf-8"))
+                parsed = parse_json_no_duplicates(latest[1].read_text(encoding="utf-8"))
             except Exception:
                 parsed = None
-            if isinstance(parsed, dict) and isinstance(parsed.get("lease_id"), str):
-                active_lease_id = parsed["lease_id"]
             if isinstance(parsed, dict) and parsed.get("lease_id") == expected_lease_id:
                 exp_dt = ShadowLedger._effective_lease_expiry(
                     lease_path,
@@ -1937,6 +1989,15 @@ class ShadowLedger:
                             renew_file.unlink()
                         except FileNotFoundError:
                             pass
+        active_lease_id: str | None = None
+        post_latest = ShadowLedger._latest_lease_slot(lease_path)
+        if post_latest is not None:
+            try:
+                post_parsed = parse_json_no_duplicates(post_latest[1].read_text(encoding="utf-8"))
+            except Exception:
+                post_parsed = None
+            if isinstance(post_parsed, dict) and isinstance(post_parsed.get("lease_id"), str):
+                active_lease_id = post_parsed["lease_id"]
         for rpath in lease_path.parent.glob(".chain.lease.reclaim.*.lock"):
             try:
                 rst, rbytes = ShadowLedger._read_lease_snapshot(rpath)
