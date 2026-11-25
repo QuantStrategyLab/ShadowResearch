@@ -1019,6 +1019,8 @@ def build_fuse_validated_inputs(
 
     mkt_ok = True
     idx_ok = True
+    bad_market_insts: set[str] = set()
+    bad_market_payload = False
     cal_ok = cal_status in ("open", "closed", "holiday") and exch_status == cal_status and not bool((calendar_session or {}).get("venue_disagreement"))
     vol_ok = True
 
@@ -1026,6 +1028,7 @@ def build_fuse_validated_inputs(
         if not isinstance(mkt_recs, list):
             mkt_ok = False
             idx_ok = False
+            bad_market_payload = True
         else:
             by_inst = {
                 str(r.get("instrument")): r
@@ -1043,6 +1046,7 @@ def build_fuse_validated_inputs(
                     or (cal_digest is not None and rec.get("calendar_spec_digest") != cal_digest)
                 )
                 if bad_rec:
+                    bad_market_insts.add(inst)
                     if inst in ("XNDX", "SEMI", "QQQ"):
                         idx_ok = False
                     mkt_ok = False
@@ -1117,8 +1121,8 @@ def build_fuse_validated_inputs(
             "exposure": _finite_number(fdata.get("exposure")) if fdata.get("exposure") is not None else pos_val,
             "fund_return": fund_ret_val,
             "index_return": idx_ret_val,
-            "modelled_fee": _finite_number(fdata.get("modelled_fee")) if fdata.get("modelled_fee") is not None else 0.0,
-            "modelled_financing": _finite_number(fdata.get("modelled_financing")) if fdata.get("modelled_financing") is not None else 0.0,
+            "modelled_fee": _finite_number(fdata.get("modelled_fee")),
+            "modelled_financing": _finite_number(fdata.get("modelled_financing")),
             "forecast_volatility": sigma_val,
             "long_run_volatility": long_run_vol,
             "shortfall_observed": _finite_number(fdata.get("shortfall_observed")),
@@ -1151,26 +1155,20 @@ def build_fuse_validated_inputs(
     if "index_one_session_returns" in session_inputs:
         raw_idx_rets = session_inputs.get("index_one_session_returns")
         idx_returns = copy.deepcopy(raw_idx_rets) if isinstance(raw_idx_rets, dict) else raw_idx_rets  # type: ignore[assignment]
-    elif idx_ok and prior_closes:
+    elif not bad_market_payload and prior_closes:
         derived_idx: dict[str, float] = {}
         for inst_key, ret_label in _INDEX_RETURN_LABELS:
-            if inst_key in prior_closes and inst_key in cur_closes:
+            if (
+                inst_key not in bad_market_insts
+                and inst_key in prior_closes
+                and inst_key in cur_closes
+            ):
                 r_val = _compute_return_ratio(cur_closes.get(inst_key), prior_closes.get(inst_key))
                 if r_val is not None:
                     derived_idx[ret_label] = r_val
-        has_all_fund_rets = all(
-            fuse_funds[sym].get("fund_return") is not None
-            and fuse_funds[sym].get("index_return") is not None
-            for sym in fuse_funds
-        )
         idx_returns = (
             derived_idx
-            if (
-                "NDX" in derived_idx
-                and "SEMI" in derived_idx
-                and len(derived_idx) >= 2
-                and has_all_fund_rets
-            )
+            if ("NDX" in derived_idx and "SEMI" in derived_idx and len(derived_idx) >= 2)
             else None
         )
     else:
@@ -1192,13 +1190,18 @@ def build_fuse_validated_inputs(
         if "broker_reconciliation_source_record" in session_inputs
         else caller_sources.get("broker_reconciliation")
     )
+    has_all_fund_rets = bool(fuse_funds) and all(
+        fuse_funds[sym].get("fund_return") is not None
+        and fuse_funds[sym].get("index_return") is not None
+        for sym in fuse_funds
+    )
     raw_source_records: dict[str, dict[str, Any] | None] = {
         "market_data": (
             copy.deepcopy(caller_sources.get("market_data"))
             if "market_data" in caller_sources
             else {"as_of": as_of, "age_sessions": 0}
         )
-        if (mkt_ok and idx_ok and vol_ok)
+        if (mkt_ok and idx_ok and vol_ok and has_all_fund_rets)
         else None,
         "index_returns": caller_sources.get("index_returns")
         if "index_returns" in caller_sources

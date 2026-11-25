@@ -57,6 +57,8 @@ def _valid_inputs() -> dict:
                 "q_pre": 100,
                 "sigma_forecast": "0.24",
                 "long_run_volatility": "0.24",
+                "modelled_fee": 0.0,
+                "modelled_financing": 0.0,
                 "fund_return": 0.0,
                 "index_return": 0.0,
             },
@@ -66,6 +68,8 @@ def _valid_inputs() -> dict:
                 "q_pre": 100,
                 "sigma_forecast": "0.22",
                 "long_run_volatility": "0.24",
+                "modelled_fee": 0.0,
+                "modelled_financing": 0.0,
                 "fund_return": 0.0,
                 "index_return": 0.0,
             },
@@ -831,6 +835,9 @@ class FuseAdapterTest(unittest.TestCase):
             "close_price": "25",
             "q_pre": 200,
             "sigma_forecast": "0.24",
+            "long_run_volatility": "0.24",
+            "modelled_fee": 0.0,
+            "modelled_financing": 0.0,
             "hwm_adjusted": True,
             "corporate_action": {
                 "type": "split",
@@ -1574,6 +1581,80 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertTrue(v7_row["would_have_tripped"])
         self.assertEqual(v7_row["reason"], "missing_input")
+
+    def test_v1_missing_fee_or_financing_fails_closed(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        for missing_key in ("modelled_fee", "modelled_financing"):
+            si = json.loads(json.dumps(_valid_inputs()))
+            si["funds"]["TQQQ"].pop(missing_key, None)
+            vin = build_fuse_validated_inputs(
+                si,
+                cal,
+                policy_hash="p",
+                session_date="2026-01-05",
+                as_of="2026-01-05T22:00:00.000Z",
+            )
+            self.assertIsNone(vin["funds"]["TQQQ"][missing_key])
+            rows, _, nxt = ev.evaluate(
+                ev.spec_version,
+                ev.engine_hash,
+                "p",
+                "2026-01-05",
+                "2026-01-05T22:00:00.000Z",
+                "shadow",
+                vin,
+                {},
+                None,
+            )
+            self.assertEqual(rows["V1"]["state"], "NO-NEW-RISK")
+            self.assertEqual(rows["V1"]["reason"], "missing_input")
+            self.assertEqual(nxt.get("V1", {}).get("TQQQ", {}).get("five_session_history", []), [])
+
+    def test_l6_benchmark_returns_derived_independently_of_missing_fund_return(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        si = json.loads(json.dumps(_valid_inputs()))
+        si.pop("index_one_session_returns", None)
+        si["prior_closes"] = {"XNDX": "100", "SEMI": "100", "SOXL": "40"}  # omit TQQQ prior close
+        si["current_index_closes"] = {"XNDX": "90", "SEMI": "100"}
+        si["funds"]["TQQQ"].pop("fund_return", None)
+        si["funds"]["TQQQ"].pop("index_return", None)
+        si["funds"]["SOXL"]["fund_return"] = 0.0
+        si["funds"]["SOXL"]["index_return"] = 0.0
+
+        vin = build_fuse_validated_inputs(
+            si,
+            cal,
+            policy_hash="p",
+            session_date="2026-01-05",
+            as_of="2026-01-05T22:00:00.000Z",
+        )
+        self.assertIsNone(vin["funds"]["TQQQ"]["fund_return"])
+        self.assertIsNotNone(vin["index_one_session_returns"])
+        self.assertAlmostEqual(vin["index_one_session_returns"]["NDX"], -0.1, places=6)
+        self.assertAlmostEqual(vin["index_one_session_returns"]["SEMI"], 0.0, places=6)
+
+        rows, _, nxt = ev.evaluate(
+            ev.spec_version,
+            ev.engine_hash,
+            "p",
+            "2026-01-05",
+            "2026-01-05T22:00:00.000Z",
+            "shadow",
+            vin,
+            {},
+            None,
+        )
+        self.assertEqual(rows["O1"]["state"], "NO-NEW-RISK")
+        self.assertEqual(rows["L6"]["state"], "HALT")
+        self.assertTrue(rows["L6"]["latched"])
+        self.assertEqual(rows["L6"]["reason"], "index_fall_10pct")
+        self.assertTrue(nxt["L6"]["latched"])
 
 
 if __name__ == "__main__":

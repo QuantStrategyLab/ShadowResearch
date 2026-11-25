@@ -81,6 +81,8 @@ def _sample_inputs(
                 "q_pre": 100,
                 "sigma_forecast": sigma_tqqq,
                 "long_run_volatility": "0.24",
+                "modelled_fee": 0.0,
+                "modelled_financing": 0.0,
             },
             "SOXL": {
                 "s": "1",
@@ -88,6 +90,8 @@ def _sample_inputs(
                 "q_pre": 100,
                 "sigma_forecast": "0.22",
                 "long_run_volatility": "0.24",
+                "modelled_fee": 0.0,
+                "modelled_financing": 0.0,
             },
         },
     }
@@ -484,8 +488,8 @@ def run_all_demos() -> dict[str, dict]:
             "'current_index_closes': {'XNDX': '29500', 'SEMI': '8200'}, "
             "'positions_source_record': {'as_of': '2026-01-05T22:30:00.000Z', 'age_sessions': 0}, "
             "'broker_reconciliation_source_record': {'as_of': '2026-01-05T22:30:00.000Z', 'age_sessions': 0}, "
-            "'funds': {'TQQQ': {'s': '1', 'close_price': '50', 'q_pre': 100, 'sigma_forecast': '0.50', 'long_run_volatility': '0.24'}, "
-            "'SOXL': {'s': '1', 'close_price': '40', 'q_pre': 100, 'sigma_forecast': '0.22', 'long_run_volatility': '0.24'}}}\n"
+            "'funds': {'TQQQ': {'s': '1', 'close_price': '50', 'q_pre': 100, 'sigma_forecast': '0.50', 'long_run_volatility': '0.24', 'modelled_fee': 0.0, 'modelled_financing': 0.0}, "
+            "'SOXL': {'s': '1', 'close_price': '40', 'q_pre': 100, 'sigma_forecast': '0.22', 'long_run_volatility': '0.24', 'modelled_fee': 0.0, 'modelled_financing': 0.0}}}\n"
             "vin = build_fuse_validated_inputs(sin, cal, policy_hash='p', session_date='2026-01-05', as_of='2026-01-05T22:30:00.000Z')\n"
             "_, _, nxt = ev.evaluate(ev.spec_version, ev.engine_hash, 'p', '2026-01-05', '2026-01-05T22:30:00.000Z', 'shadow', vin, {}, None)\n"
             f"save_row_state_snapshot({str(snap_dir)!r}, chain_id='d4', sequence=0, session_date='2026-01-05', record_sha256='0'*64, engine_hash=ev.engine_hash, spec_version=ev.spec_version, next_row_state=nxt)\n"
@@ -504,8 +508,8 @@ def run_all_demos() -> dict[str, dict]:
             "'current_index_closes': {'XNDX': '29600', 'SEMI': '8240'}, "
             "'positions_source_record': {'as_of': '2026-01-06T22:30:00.000Z', 'age_sessions': 0}, "
             "'broker_reconciliation_source_record': {'as_of': '2026-01-06T22:30:00.000Z', 'age_sessions': 0}, "
-            "'funds': {'TQQQ': {'s': '1', 'close_price': '50', 'q_pre': 100, 'sigma_forecast': '0.24', 'long_run_volatility': '0.24'}, "
-            "'SOXL': {'s': '1', 'close_price': '40', 'q_pre': 100, 'sigma_forecast': '0.22', 'long_run_volatility': '0.24'}}}\n"
+            "'funds': {'TQQQ': {'s': '1', 'close_price': '50', 'q_pre': 100, 'sigma_forecast': '0.24', 'long_run_volatility': '0.24', 'modelled_fee': 0.0, 'modelled_financing': 0.0}, "
+            "'SOXL': {'s': '1', 'close_price': '40', 'q_pre': 100, 'sigma_forecast': '0.22', 'long_run_volatility': '0.24', 'modelled_fee': 0.0, 'modelled_financing': 0.0}}}\n"
             "vin = build_fuse_validated_inputs(sin, cal, policy_hash='p', session_date='2026-01-06', as_of='2026-01-06T22:30:00.000Z')\n"
             "rows, _, nxt = ev.evaluate(ev.spec_version, ev.engine_hash, 'p', '2026-01-06', '2026-01-06T22:30:00.000Z', 'shadow', vin, prior, None)\n"
             "assert rows['V4']['state'] == 'NO-NEW-RISK' and rows['V4']['would_have_tripped'] is True and nxt['V4']['TQQQ']['clearing_counter'] == 1\n"
