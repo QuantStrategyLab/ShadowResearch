@@ -3464,6 +3464,117 @@ class Sh2PipelineTest(unittest.TestCase):
                 str(missed["evaluated_trading_days"][0]["detail"]).startswith("documented_fail_closed:")
             )
 
+    def test_float_q_pre_fails_closed_preserving_l6_and_halfday_prior_close_and_config_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Float q_pre fails closed in O1 without uncaught SizingInputError and preserves L6 latch
+            root = Path(tmpdir) / "float_qpre_drill"
+            f5 = Path(tmpdir) / "f5_float_qpre"
+            _build_session_fixture_files(f5, "2026-01-05")
+            y5 = json.loads((f5 / "yahoo_xndx_2026-01-05.json").read_text(encoding="utf-8"))
+            y5["chart"]["result"][0]["indicators"]["quote"][0]["close"] = [33000.0, 29500.0]
+            (f5 / "yahoo_xndx_2026-01-05.json").write_text(json.dumps(y5), encoding="utf-8")
+
+            res = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=_sh2_drill_cfg(),
+                fixtures_dir=f5,
+                q_pre_by_inst={"TQQQ": 0.0, "SOXL": 0},
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 0)
+            pending, _ = load_pending_rejected_state_snapshot(
+                root / "state_snapshots",
+                expected_chain_id="drill-v0",
+                expected_base_sequence=-1,
+                expected_base_record_sha256=GENESIS_PREV_HASH,
+                current_session_date="2026-01-05",
+                expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
+                expected_spec_version=PINNED_FUSE_SPEC_VERSION,
+            )
+            self.assertIsNotNone(pending)
+            self.assertTrue(pending["L6"]["latched"])
+
+            # 2. Half-day current session calendar_session does not discard prior full-day 16:00 ET closes
+            cal_spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+            cal_half = resolve_session("XNYS", "2026-11-27", spec=cal_spec)
+            t_bytes = json.dumps(
+                [
+                    {
+                        "date": "2026-11-25T16:00:00-05:00",
+                        "close": 50.0,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "session": "regular",
+                        "session_time": "regular",
+                    }
+                ]
+            ).encode("utf-8")
+            self.assertEqual(
+                extract_prior_close_from_tiingo_bytes(
+                    t_bytes,
+                    "2026-11-27",
+                    calendar_session=cal_half,
+                    target_prior_date="2026-11-25",
+                ),
+                "50",
+            )
+            prior_close_ts = int(datetime(2026, 11, 25, 16, 0, tzinfo=_NY_TZ).timestamp())
+            y_bytes = json.dumps(
+                {
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {"dataGranularity": "1d"},
+                                "timestamp": [prior_close_ts],
+                                "indicators": {"quote": [{"close": [20000.0]}]},
+                            }
+                        ]
+                    }
+                }
+            ).encode("utf-8")
+            self.assertEqual(
+                extract_prior_close_from_yahoo_bytes(
+                    y_bytes,
+                    "2026-11-27",
+                    calendar_session=cal_half,
+                    target_prior_date="2026-11-25",
+                ),
+                "20000",
+            )
+
+            # 3. run_production_cycle enforces production_mode_forbidden & pinned calendar_spec_digest on config=
+            base_prod = load_production_scheduler_config(
+                _REPO_ROOT / "config" / "production-scheduler.json"
+            )
+            bad_forbid = dataclasses.replace(
+                base_prod,
+                production_chain_locked=False,
+                clk01_active=True,
+                production_mode_forbidden=True,
+            )
+            with self.assertRaises(DrillOnlyViolationError):
+                run_production_cycle(
+                    session_date="2026-01-05",
+                    data_dir=Path(tmpdir) / "bad_forbid",
+                    config=bad_forbid,
+                )
+            bad_digest = dataclasses.replace(
+                base_prod,
+                production_chain_locked=False,
+                clk01_active=True,
+                production_mode_forbidden=False,
+                calendar_spec_digest=None,
+            )
+            with self.assertRaises(CalendarCoverageError):
+                run_production_cycle(
+                    session_date="2026-01-05",
+                    data_dir=Path(tmpdir) / "bad_digest",
+                    config=bad_digest,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

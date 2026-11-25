@@ -1421,12 +1421,21 @@ class ShadowLedger:
             return st, rf.read()
 
     @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short_write_no_progress")
+            view = view[written:]
+
+    @staticmethod
     def _publish_exclusive_file(target_path: Path, tmp_path: Path, payload: bytes) -> None:
         """Write complete payload to tmp_path and publish exclusively via os.link when supported."""
         try:
             tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             try:
-                os.write(tfd, payload)
+                ShadowLedger._write_all(tfd, payload)
                 os.fsync(tfd)
             finally:
                 os.close(tfd)
@@ -1435,11 +1444,17 @@ class ShadowLedger:
             except OSError as link_exc:
                 if isinstance(link_exc, FileExistsError):
                     raise
-                if link_exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EPERM):
+                if link_exc.errno not in (
+                    errno.ENOTSUP,
+                    errno.EOPNOTSUPP,
+                    errno.EXDEV,
+                    errno.EPERM,
+                    errno.ENOSYS,
+                ):
                     raise
                 lfd = os.open(str(target_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 try:
-                    os.write(lfd, payload)
+                    ShadowLedger._write_all(lfd, payload)
                     os.fsync(lfd)
                 finally:
                     os.close(lfd)

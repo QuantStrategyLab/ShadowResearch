@@ -2334,6 +2334,30 @@ class CloudRunJobTest(unittest.TestCase):
                     trusted_head_anchor_path=anchor_path,
                 )
 
+    def test_chain_lock_publishes_and_reclaims_leases_when_os_link_returns_enosys(self) -> None:
+        import errno
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ShadowLedger(Path(tmpdir) / "enosys_lease" / "ledger")
+
+            def _enosys_link(_src: object, _dst: object) -> None:
+                raise OSError(errno.ENOSYS, "Function not implemented")
+
+            with mock.patch("os.link", side_effect=_enosys_link):
+                with ledger.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
+                    slot0 = ShadowLedger._latest_lease_slot(ledger.root_dir / ".chain.lease.json")
+                    self.assertIsNotNone(slot0)
+                    self.assertEqual(slot0[0], 0)
+                    ledger.assert_active_chain_lease()
+
+                peer = ShadowLedger(ledger.root_dir)
+                with peer.chain_lock(lease_ttl_seconds=300.0, renew_interval_seconds=3600.0):
+                    slot1 = ShadowLedger._latest_lease_slot(ledger.root_dir / ".chain.lease.json")
+                    self.assertIsNotNone(slot1)
+                    self.assertEqual(slot1[0], 1)
+                    peer.assert_active_chain_lease()
+
 
 if __name__ == "__main__":
     unittest.main()

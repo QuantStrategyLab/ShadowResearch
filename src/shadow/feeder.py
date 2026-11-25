@@ -1451,7 +1451,12 @@ def extract_prior_close_from_tiingo_bytes(
         elif row_d >= session_date:
             continue
         try:
-            _validate_tiingo_official_close_row(row, row_d, calendar_session)
+            row_cal = (
+                calendar_session
+                if (isinstance(calendar_session, Mapping) and calendar_session.get("trade_date") == row_d)
+                else None
+            )
+            _validate_tiingo_official_close_row(row, row_d, row_cal)
             close_dec = _parse_finite_decimal(
                 row["close"],
                 "tiingo_prior_close",
@@ -1489,7 +1494,6 @@ def extract_prior_close_from_yahoo_bytes(
     timestamps = result0.get("timestamp") or []
     quote = ((result0.get("indicators") or {}).get("quote") or [{}])[0]
     closes = quote.get("close") or []
-    close_t = _official_close_time_for_calendar(calendar_session)
     best: tuple[str, int, Decimal] | None = None
     for ts, close in zip(timestamps, closes):
         if ts is None or close is None or isinstance(ts, bool):
@@ -1505,6 +1509,12 @@ def extract_prior_close_from_yahoo_bytes(
                 continue
         elif bar_date >= session_date:
             continue
+        bar_cal = (
+            calendar_session
+            if (isinstance(calendar_session, Mapping) and calendar_session.get("trade_date") == bar_date)
+            else None
+        )
+        close_t = _official_close_time_for_calendar(bar_cal)
         bar_t = bar_dt.time()
         if bar_t < dt_time(9, 30) or bar_t > close_t or bar_t >= dt_time(21, 0):
             continue

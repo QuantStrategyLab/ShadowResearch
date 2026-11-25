@@ -814,6 +814,33 @@ def _resolve_tier_quantity(raw_val: object, tier: str) -> float | None:
     return _finite_number(raw_val)
 
 
+def _resolve_sizing_q_pre(raw_val: object, tier: str) -> int | None:
+    """Resolve scalar or tier-keyed q_pre enforcing sizing._resolve_q_pre() integer contract."""
+    cand = raw_val
+    if isinstance(cand, Mapping):
+        if tier not in cand:
+            return None
+        cand = cand[tier]
+    if cand is None or isinstance(cand, (bool, float)):
+        return None
+    if isinstance(cand, int):
+        return cand if cand >= 0 else None
+    if isinstance(cand, str):
+        s = cand.strip()
+        if not s:
+            return None
+        try:
+            val = int(s)
+        except ValueError:
+            return None
+        return val if val >= 0 else None
+    try:
+        val = int(cand)  # type: ignore[call-overload]
+    except Exception:
+        return None
+    return val if val >= 0 else None
+
+
 def _derive_default_max_loss_cap(
     session_inputs: Mapping[str, Any],
     tier: str,
@@ -1082,7 +1109,7 @@ def build_fuse_validated_inputs(
         if not isinstance(fdata, Mapping):
             continue
         close_val = _finite_number(fdata.get("close_price"))
-        q_pre_val = _resolve_tier_quantity(fdata.get("q_pre", 0), tier)
+        q_pre_val = _resolve_sizing_q_pre(fdata.get("q_pre", 0), tier)
         sigma_val = _finite_number(fdata.get("sigma_forecast"))
         if sigma_val is None or sigma_val <= 0.0:
             vol_ok = False

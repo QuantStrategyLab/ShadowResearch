@@ -1963,6 +1963,17 @@ def run_production_cycle(
     cfg = config if config is not None else load_production_scheduler_config(config_path)
     if cfg.mode != "production":
         raise DrillOnlyViolationError("run_production_cycle requires mode='production'")
+    if cfg.production_mode_forbidden is not False:
+        raise DrillOnlyViolationError(
+            "run_production_cycle requires production_mode_forbidden=false"
+        )
+    if (
+        cfg.calendar_version != "csa22-v2"
+        or cfg.calendar_spec_digest != PINNED_CSA22_V2_DIGEST
+    ):
+        raise CalendarCoverageError(
+            "run_production_cycle requires calendar_version='csa22-v2' and pinned calendar_spec_digest"
+        )
     if cfg.production_chain_locked is not False or not cfg.clk01_active:
         raise ProductionChainLockedError(
             "Production chain is locked pending OA-SH2-2 sign-off; 0 production appends permitted"
