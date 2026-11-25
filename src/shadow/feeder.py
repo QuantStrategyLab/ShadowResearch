@@ -1017,7 +1017,15 @@ def emit_market_records_from_payloads(
                     "yahoo_non_daily_granularity_rejected",
                     "tiingo_invalid_timestamp",
                 )
-                and not err_msg.startswith(("invalid_numeric:", "nonfinite_numeric:"))
+                and not err_msg.startswith(
+                    (
+                        "invalid_numeric:",
+                        "nonfinite_numeric:",
+                        "oversized_numeric:",
+                        "out_of_bounds_numeric:",
+                        "out_of_range_numeric:",
+                    )
+                )
             ):
                 raise
             rec = _build_missing_record(

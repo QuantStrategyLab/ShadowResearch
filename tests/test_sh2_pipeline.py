@@ -36,6 +36,7 @@ from shadow.calendar_consumer import (  # noqa: E402
     resolve_session,
 )
 from shadow.feeder import (  # noqa: E402
+    emit_market_records_from_payloads,
     extract_prior_close_from_tiingo_bytes,
     extract_prior_close_from_yahoo_bytes,
     select_tiingo_row,
@@ -3317,6 +3318,67 @@ class Sh2PipelineTest(unittest.TestCase):
             ),
             "28000",
         )
+
+    def test_emit_market_records_converts_rejected_numeric_values_to_missing_records(self) -> None:
+        cal_spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cases = [
+                (0, "out_of_range_numeric:tiingo_close"),
+                (-5, "out_of_range_numeric:tiingo_close"),
+                ("1e200000000", "out_of_bounds_numeric:tiingo_close"),
+                ("1" * 70, "oversized_numeric:tiingo_close"),
+            ]
+            for idx, (bad_close, expected_err) in enumerate(cases):
+                t_bytes = json.dumps(
+                    [
+                        {
+                            "date": "2026-01-05T00:00:00.000Z",
+                            "close": bad_close,
+                            "divCash": 0.0,
+                            "splitFactor": 1.0,
+                            "session": "regular",
+                            "session_time": "regular",
+                        }
+                    ]
+                ).encode("utf-8")
+                recs = emit_market_records_from_payloads(
+                    series=[("TQQQ", "TQQQ", "etf_tiingo")],
+                    payloads={"TQQQ": t_bytes},
+                    session_date="2026-01-05",
+                    retrieval_time_utc="2026-01-05T22:00:00.000Z",
+                    archive_dir=Path(tmpdir) / f"arch_{idx}",
+                    calendar_spec=cal_spec,
+                    vintage="recorded_eod",
+                    observation_class="drill_recorded_replay",
+                    provider_for=lambda _inst: "tiingo_eod",
+                    missing_reason_for=lambda _inst: "missing",
+                )
+                self.assertEqual(len(recs), 1)
+                rec = recs[0]
+                self.assertIsNone(rec["normalized_value"])
+                self.assertFalse(rec["eligibility"]["eligible"])
+                self.assertEqual(rec["eligibility"]["reason"], expected_err)
+                self.assertIn(expected_err, rec["disclosures"])
+
+            # Full scheduler drill cycle with TQQQ close=0 fails closed cleanly (no uncaught ValueError)
+            root = Path(tmpdir) / "bad_close_drill"
+            f5 = Path(tmpdir) / "f5_bad_close"
+            _build_session_fixture_files(f5, "2026-01-05")
+            tqqq_path = f5 / "tiingo_tqqq_2026-01-05.json"
+            tqqq_rows = json.loads(tqqq_path.read_text(encoding="utf-8"))
+            tqqq_rows[0]["close"] = 0
+            tqqq_path.write_text(json.dumps(tqqq_rows), encoding="utf-8")
+
+            res = run_daily_drill_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config=_sh2_drill_cfg(),
+                fixtures_dir=f5,
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertFalse(res["appended"])
+            self.assertTrue(res["fail_closed"])
+            self.assertEqual(len(ShadowLedger(root / "ledger").load_records()), 0)
 
 
 if __name__ == "__main__":
