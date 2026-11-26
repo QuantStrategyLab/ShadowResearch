@@ -1,0 +1,99 @@
+# Secret-free Cloud Run Job specification example for SHADOW-N SH-2 (us-east1)
+# Replace <project-id>, <repo>, <tag>, <service-account>, and <bucket-name> before deploy.
+# Keep config/production-scheduler.json production_chain_locked=true until OA-SH2-2 sign-off.
+# Single-writer concurrency discipline: maxRetries: 0, parallelism: 1, and taskCount: 1 only
+# limit concurrency within one Cloud Run execution. Launching multiple overlapping executions (e.g.
+# duplicate Cloud Scheduler triggers or manual runs while a prior execution is still active) is NOT
+# serialized by Cloud Run or GCS FUSE O_EXCL (which lacks pre-close creation atomicity). Production
+# deployment MUST gate execution launches behind an execution-lifecycle lock (rejecting any new
+# run while an execution is active) OR mount POSIX-locking storage (e.g. Cloud Filestore) / use
+# storage-native GCS ifGenerationMatch=0 lease objects before enabling writes on the ledger.
+# Production history authentication:
+# - One-time genesis initialization (seq=0 on empty SHADOW_DATA_DIR): set
+#   SHADOW_TRUSTED_HEAD_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+#   (GENESIS_PREV_HASH) once, then replace or remove it after seq=0 commits.
+# - Recurring runs & retries (seq >= 1): ALWAYS set SHADOW_TRUSTED_HEAD_SHA256 (e.g., via Secret
+#   Manager) to the externally authorized committed head digest (for both advancing runs and
+#   same-session retries) WITHOUT keeping the zero genesis marker; ALWAYS set
+#   SHADOW_TRUSTED_PENDING_STATE_SHA256 on every production run (0*64 NO_PENDING_REJECTED_STATE_SHA256
+#   when no unconsumed rejection exists, or the emitted pending_rejected_state_sha256 after any
+#   O1/O2/deadline/OTS rejection until a committed session retires it); AND mount
+#   SHADOW_TRUSTED_HEAD_ANCHOR_PATH on a separate dedicated GCS anchor bucket outside SHADOW_DATA_DIR
+#   so each committed record or persisted pending state atomically advances a monotonic external
+#   head anchor and blocks state-bucket rollback even if secret rotation lags; optional
+#   SHADOW_BITCOIN_MERKLE_ROOTS_PATH adds corroborating OTS verification.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: shadow-sh2-eod-job
+  namespace: "<project-id>"
+  labels:
+    cloud.googleapis.com/location: us-east1
+    component: shadow-sh2
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      parallelism: 1
+      taskCount: 1
+      template:
+        spec:
+          maxRetries: 0
+          timeoutSeconds: 300
+          serviceAccountName: "<service-account>@<project-id>.iam.gserviceaccount.com"
+          containers:
+            - image: "us-east1-docker.pkg.dev/<project-id>/<repo>/shadow-sh2:<tag>"
+              env:
+                - name: SHADOW_DATA_DIR
+                  value: /var/lib/shadow/data
+                - name: SHADOW_CONFIG_PATH
+                  value: /app/config/production-scheduler.json
+                - name: SHADOW_CHAIN_MODE
+                  value: production
+                # Genesis requires GENESIS_PREV_HASH (0*64); recurring chains always require authorized head SHA-256:
+                # - name: SHADOW_TRUSTED_HEAD_SHA256
+                #   valueFrom:
+                #     secretKeyRef:
+                #       name: shadow-trusted-head-sha256
+                #       key: latest
+                # - name: SHADOW_TRUSTED_PENDING_STATE_SHA256
+                #   valueFrom:
+                #     secretKeyRef:
+                #       name: shadow-trusted-pending-state-sha256
+                #       key: latest
+                # - name: SHADOW_TRUSTED_HEAD_ANCHOR_PATH
+                #   value: /var/run/shadow/anchor/trusted_head.json
+                # - name: SHADOW_BITCOIN_MERKLE_ROOTS_PATH
+                #   value: /var/run/shadow/trusted/bitcoin-merkle-roots.json
+                - name: TIINGO_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: tiingo-api-key
+                      key: latest
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              volumeMounts:
+                - name: shadow-state
+                  mountPath: /var/lib/shadow/data
+                # Dedicated separate anchor bucket mount strictly outside /var/lib/shadow/data:
+                # - name: shadow-anchor
+                #   mountPath: /var/run/shadow/anchor
+          volumes:
+            - name: shadow-state
+              csi:
+                driver: gcsfuse.run.googleapis.com
+                readOnly: false
+                volumeAttributes:
+                  bucketName: "<bucket-name>"
+                  mountOptions: "uid=10001,gid=10001,implicit-dirs"
+            # - name: shadow-anchor
+            #   csi:
+            #     driver: gcsfuse.run.googleapis.com
+            #     readOnly: false
+            #     volumeAttributes:
+            #       bucketName: "<anchor-bucket-name>"
+            #       mountOptions: "uid=10001,gid=10001,implicit-dirs"
