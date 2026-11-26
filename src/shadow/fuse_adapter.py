@@ -697,6 +697,15 @@ def _map_calendar_statuses(
     disagreement = bool(calendar_session.get("venue_disagreement"))
     observed_venue = calendar_session.get("observed_venue_status")
 
+    # SH-2 makes END-OF-DAY decisions (17:30 ET regular, 14:30 ET half day; orders, if any,
+    # belong to the next session), so a trading day maps to `open` for the whole day, before
+    # and after its core window, half days included. FuseControl C-FUSE-GATE
+    # (`fuse_gate._calendar_status`) emits `half_day_cutoff` when a half day's as_of is at or
+    # past `order_cutoff_utc`, but that is a PRE-TRADE rule where as_of is an order instant.
+    # Applying it here would HALT O2 on every half-day EOD decision. Plain `half_day` is
+    # never emitted (vendored O2 treats it as closed). Late EOD decisions are rejected by the
+    # scheduler's decision-cutoff check (`late_after_decision_cutoff`), not by O2; time-of-day
+    # order blocking belongs to V7 `session_time`.
     if state in ("regular", "half_day") and calendar_session.get("is_trading_day") and not calendar_session.get("blocks_eligibility"):
         cal_status = "open"
         exch_status = str(observed_venue) if disagreement and observed_venue is not None else "open"

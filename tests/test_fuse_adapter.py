@@ -1254,6 +1254,37 @@ class FuseAdapterTest(unittest.TestCase):
                 sys.pycache_prefix = prev_prefix
             self.assertEqual(ev_cache.engine_hash, PINNED_FUSE_ENGINE_HASH)
 
+    def test_half_day_eod_decision_maps_open_and_late_runs_are_rejected_by_scheduler_cutoff(self) -> None:
+        from shadow.scheduler import DrillSchedulerConfig, compute_session_deadlines
+
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal_hd = resolve_session("XNYS", "2026-11-27", spec=spec)
+        self.assertEqual(cal_hd["session_state"], "half_day")
+        self.assertEqual(cal_hd["order_cutoff_utc"], "2026-11-27T18:00:00.000Z")
+        deadlines = compute_session_deadlines("2026-11-27", DrillSchedulerConfig(), calendar_session=cal_hd)
+        decision_utc = deadlines["scheduled_decision_instant_utc"]
+        # SH-1 half_day_run_time 14:30 ET is an EOD decision after the 13:00 ET order cutoff.
+        self.assertEqual(decision_utc, "2026-11-27T19:30:00.000Z")
+        self.assertGreater(decision_utc, cal_hd["order_cutoff_utc"])
+        self.assertEqual(deadlines["decision_cutoff_utc"], "2026-11-27T20:00:00.000Z")
+
+        ev = VendoredFuseEvaluator()
+        for as_of in (decision_utc, "2026-11-27T20:05:00.000Z"):
+            vin = build_fuse_validated_inputs(
+                _valid_inputs(), cal_hd, policy_hash="p", session_date="2026-11-27", as_of=as_of
+            )
+            self.assertEqual(vin["session_calendar_status"], "open", as_of)
+            self.assertEqual(vin["exchange_status"], "open", as_of)
+            rows, _, _ = ev.evaluate(
+                ev.spec_version, ev.engine_hash, "p", "2026-11-27", as_of, "shadow", vin, {}, None
+            )
+            self.assertFalse(rows["O2"]["would_have_tripped"], as_of)
+        # A late run (15:05 ET) is past the scheduler's half-day decision cutoff (15:00 ET):
+        # run_daily_drill_cycle rejects it as late_after_decision_cutoff before evaluation
+        # (covered end-to-end by test_scheduler.test_market_cutoff_separate_from_commitment_deadline),
+        # independent of O2.
+        self.assertGreater("2026-11-27T20:05:00.000Z", deadlines["decision_cutoff_utc"])
+
     def test_o5_order_evidence_and_v1_five_session_history_forwarded(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
         cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
