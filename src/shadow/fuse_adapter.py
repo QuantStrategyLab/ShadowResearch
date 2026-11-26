@@ -1595,7 +1595,9 @@ def build_fuse_validated_inputs(
             "spread_width": _finite_number(fdata.get("spread_width")),
             "trading_pause": fdata.get("trading_pause"),
             "session_time": str(fdata["session_time"]) if fdata.get("session_time") is not None else None,
-            "share_count": _preserve_numeric_quantity(q_pre_val) if q_pre_val is not None else 0,
+            # Unknown ledger quantity stays None (O3/V2 must not match or clear on it); an
+            # explicitly flat position is the known quantity 0.
+            "share_count": _preserve_numeric_quantity(q_pre_val),
             "ledger_value": ((_finite_number(fdata["ledger_value"]) if fdata["ledger_value"] is not None else None) if "ledger_value" in fdata else pos_val),
             "broker_position": _preserve_numeric_quantity(broker_pos_val),
             "broker_value": (
@@ -1798,6 +1800,28 @@ def build_fuse_validated_inputs(
     return out
 
 
+def _drop_future_source_records(validated_inputs: Any, as_of: str) -> Any:
+    """Evaluator-boundary look-ahead guard for every payload path (native, direct, nested).
+
+    Any source record whose as_of is not an aware instant at or before the decision as_of is
+    removed from the effective payload, so O1 sees it as stale/missing. The caller's mapping is
+    never mutated.
+    """
+    if not isinstance(validated_inputs, Mapping):
+        return validated_inputs
+    src = validated_inputs.get("source_records")
+    if not isinstance(src, Mapping):
+        return validated_inputs
+    kept = {
+        k: v for k, v in src.items() if isinstance(v, Mapping) and _not_after(v.get("as_of"), as_of)
+    }
+    if len(kept) == len(src):
+        return validated_inputs
+    out = dict(validated_inputs)
+    out["source_records"] = kept
+    return out
+
+
 class VendoredFuseEvaluator:
     """Real FUSE-1 vendored evaluator with runtime hash, spec, __pycache__, and V2 checks."""
 
@@ -1872,6 +1896,7 @@ class VendoredFuseEvaluator:
                 "kill_switch_tripped is not supported by fuse-eval-spec/v1 O8; supply an owner "
                 "authorized_events entry {'type': 'kill_switch', 'scope': 'account', ...} instead"
             )
+        validated_inputs = _drop_future_source_records(validated_inputs, as_of)
         validate_v2_reconciliation_payload(validated_inputs)
 
         auth_events_arg: dict | list | None
