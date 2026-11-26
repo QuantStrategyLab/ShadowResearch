@@ -368,42 +368,49 @@ class FuseAdapterTest(unittest.TestCase):
                     "normalized_value": "33.5",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "SOXL",
                     "normalized_value": "40",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "QQQ",
                     "normalized_value": "445",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "XNDX",
                     "normalized_value": "89",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "SEMI",
                     "normalized_value": "100",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "SOFR",
                     "normalized_value": "0.045",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "TBILL_3M",
                     "normalized_value": "0.044",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
             ],
             "funds": {
@@ -446,6 +453,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "normalized_value": "50",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                     "corporate_action": {
                         "split_ratio": split_ratio,
                         "cash_per_share_usd": cash,
@@ -457,6 +465,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "normalized_value": "40",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                     "corporate_action": {"split_ratio": "1", "cash_per_share_usd": "0", "ex_date": "2026-01-05"},
                 },
                 {
@@ -464,30 +473,35 @@ class FuseAdapterTest(unittest.TestCase):
                     "normalized_value": "500",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "XNDX",
                     "normalized_value": "20000",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "SEMI",
                     "normalized_value": "5000",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "SOFR",
                     "normalized_value": "0.045",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
                 {
                     "instrument": "TBILL_3M",
                     "normalized_value": "0.044",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
+                    "effective_session": "2026-01-05",
                 },
             ]
             return inp
@@ -842,6 +856,7 @@ class FuseAdapterTest(unittest.TestCase):
             "corporate_action": {
                 "type": "split",
                 "ratio": 2,
+                "ex_date": "2026-01-05",
                 "adjustment_complete": True,
                 "exact_reconciliation": True,
                 "hwm_adjusted": True,
@@ -1184,6 +1199,7 @@ class FuseAdapterTest(unittest.TestCase):
             return rows
 
         o5_order = {
+            "settled_cash": "50000",
             "o5_collar": "0.05",
             "o5_symbol": "TQQQ",
             "o5_order_size": 10,
@@ -1198,6 +1214,7 @@ class FuseAdapterTest(unittest.TestCase):
 
         si_no_cash = _valid_inputs()
         si_no_cash.update(o5_order)
+        si_no_cash.pop("settled_cash")
         si_no_cash["o5_settled_cash"] = "0"
         rows_no_cash = _rows(si_no_cash)
         self.assertTrue(rows_no_cash["O5"]["would_have_tripped"])
@@ -1206,6 +1223,7 @@ class FuseAdapterTest(unittest.TestCase):
         for null_key in ("settled_cash", "o5_settled_cash"):
             si_null_cash = _valid_inputs()
             si_null_cash.update(o5_order)
+            si_null_cash.pop("settled_cash")
             si_null_cash[null_key] = None
             rows_null_cash = _rows(si_null_cash)
             self.assertTrue(rows_null_cash["O5"]["would_have_tripped"], null_key)
@@ -1260,6 +1278,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "o5_limit_price": "50",
                 "o5_reference_price": "50",
                 "o5_account": "stage_n_shadow",
+                "settled_cash": "50000",
                 "o5_orders_today": 1,
                 "o5_max_orders_per_session": 10,
                 "o5_turnover_today": 500,
@@ -1283,6 +1302,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "o5_limit_price": "50",
                     "o5_reference_price": "50",
                     "o5_account": "stage_n_shadow",
+                    "settled_cash": "50000",
                     limit_key: limit_val,
                     null_counter: None,
                 }
@@ -1324,6 +1344,169 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertEqual(vin_retier["tier"], "balanced")
         self.assertAlmostEqual(vin_retier["max_loss_cap"], 6382.293860109469, places=6)
+
+    def test_astra_p1_market_records_ca_interval_and_uncoerced_controls(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+        sd = "2026-01-06"
+        as_of = "2026-01-06T22:00:00.000Z"
+
+        def _vin(si: dict) -> dict:
+            return build_fuse_validated_inputs(si, cal6, policy_hash="p", session_date=sd, as_of=as_of)
+
+        def _rows(si: dict) -> dict:
+            rows, _, _ = ev.evaluate(ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", _vin(si), {}, None)
+            return rows
+
+        closes = {"TQQQ": "50", "SOXL": "40", "QQQ": "500", "XNDX": "20000", "SEMI": "5000", "SOFR": "0.045", "TBILL_3M": "0.044"}
+
+        def _records(eff: str, **overrides: dict) -> list[dict]:
+            recs = []
+            for inst, val in closes.items():
+                rec = {
+                    "instrument": inst,
+                    "normalized_value": val,
+                    "eligibility": {"eligible": True},
+                    "calendar_spec_digest": cal6["spec_digest"],
+                    "effective_session": eff,
+                }
+                rec.update(overrides.get(inst, {}))
+                recs.append(rec)
+            return recs
+
+        def _mkt_inputs(recs: list[dict]) -> dict:
+            si = _valid_inputs()
+            si.pop("index_one_session_returns", None)
+            for f in si["funds"].values():
+                f.pop("fund_return", None)
+                f.pop("index_return", None)
+            si["market_records"] = recs
+            si["prior_closes"] = {"TQQQ": "50", "SOXL": "40", "XNDX": "20000", "SEMI": "5000", "SPX": "100"}
+            return si
+
+        # P1-3: a previous session's eligible record with the same calendar digest is not current evidence.
+        vin_cur = _vin(_mkt_inputs(_records(sd)))
+        self.assertEqual(vin_cur["funds"]["TQQQ"]["fund_return"], 0.0)
+        vin_stale = _vin(_mkt_inputs(_records("2026-01-05")))
+        self.assertIsNone(vin_stale["funds"]["TQQQ"]["fund_return"])
+        self.assertIsNone(vin_stale["funds"]["TQQQ"]["index_return"])
+        self.assertTrue(_rows(_mkt_inputs(_records("2026-01-05")))["O1"]["would_have_tripped"])
+        # Rate series may lag (earlier effective date) but never lead the decision session.
+        lagged_rates = _records(sd, SOFR={"effective_session": "2026-01-05"}, TBILL_3M={"effective_session": "2026-01-05"})
+        self.assertEqual(_vin(_mkt_inputs(lagged_rates))["funds"]["TQQQ"]["fund_return"], 0.0)
+        future_rate = _records(sd, SOFR={"effective_session": "2026-01-07"})
+        self.assertTrue(_rows(_mkt_inputs(future_rate))["O1"]["would_have_tripped"])
+
+        # P1-4: an ineligible optional SPX bar must not derive an L6 index-crash return.
+        spx_bad = _records(sd) + [
+            {
+                "instrument": "SPX",
+                "normalized_value": "80",
+                "eligibility": {"eligible": False, "reason": "stale_index_bar"},
+                "calendar_spec_digest": cal6["spec_digest"],
+                "effective_session": sd,
+            }
+        ]
+        vin_spx_bad = _vin(_mkt_inputs(spx_bad))
+        self.assertNotIn("SPX", vin_spx_bad["index_one_session_returns"] or {})
+        self.assertNotEqual(_rows(_mkt_inputs(spx_bad))["L6"]["state"], "HALT")
+        spx_ok = _records(sd) + [
+            {
+                "instrument": "SPX",
+                "normalized_value": "80",
+                "eligibility": {"eligible": True},
+                "calendar_spec_digest": cal6["spec_digest"],
+                "effective_session": sd,
+            }
+        ]
+        self.assertAlmostEqual(_vin(_mkt_inputs(spx_ok))["index_one_session_returns"]["SPX"], -0.2)
+
+        # P1-5: a corporate action dated before the return interval does not re-adjust V1's return.
+        def _split_inputs(ca: dict) -> dict:
+            si = _valid_inputs()
+            si["prior_closes"] = {"TQQQ": "25", "SOXL": "40", "XNDX": "20000", "SEMI": "5000"}
+            si["funds"]["TQQQ"].pop("fund_return", None)
+            si["funds"]["TQQQ"]["close_price"] = "25"
+            si["funds"]["TQQQ"]["corporate_action"] = dict(
+                {"type": "split", "ratio": 2, "adjustment_complete": True, "exact_reconciliation": True}, **ca
+            )
+            return si
+
+        # Friday 2026-01-02 split reconciled on Tuesday 2026-01-06: both closes are post-split.
+        self.assertEqual(_vin(_split_inputs({"ex_date": "2026-01-02"}))["funds"]["TQQQ"]["fund_return"], 0.0)
+        self.assertAlmostEqual(_vin(_split_inputs({"ex_date": sd}))["funds"]["TQQQ"]["fund_return"], 1.0)
+        self.assertIsNone(_vin(_split_inputs({}))["funds"]["TQQQ"]["fund_return"])
+
+        # P1-6: null policy hashes stay null so O6 fails closed (not the string "None").
+        for key in ("loaded_policy_hash", "registered_policy_hash"):
+            si = _valid_inputs()
+            si[key] = None
+            self.assertIsNone(_vin(si)[key])
+            self.assertTrue(_rows(si)["O6"]["would_have_tripped"], key)
+
+        # P1-1 (explicit evidence): a supplied null heartbeat or interval is not replaced by as_of / 60s.
+        for key in ("last_heartbeat", "scheduled_interval"):
+            si = _valid_inputs()
+            si[key] = None
+            self.assertIsNone(_vin(si)[key])
+            self.assertTrue(_rows(si)["O7"]["would_have_tripped"], key)
+
+        # P1-7: with no settled-cash evidence O5 does not treat total equity as settled cash.
+        si_buy = _valid_inputs()
+        si_buy.update(
+            {
+                "o5_collar": "0.05",
+                "o5_symbol": "TQQQ",
+                "o5_order_size": 10,
+                "o5_side": "buy",
+                "o5_limit_price": "50",
+                "o5_reference_price": "50",
+                "o5_account": "stage_n_shadow",
+            }
+        )
+        self.assertIsNone(_vin(si_buy)["settled_cash"])
+        rows_buy = _rows(si_buy)
+        self.assertTrue(rows_buy["O5"]["would_have_tripped"])
+        self.assertEqual(rows_buy["O5"]["reason"], "pre_trade_limit_violation")
+
+    def test_astra_p1_metadata_pinned_and_loader_executes_verified_source_only(self) -> None:
+        import marshal
+
+        from shadow.fuse_adapter import PINNED_FUSE_METADATA_SHA256
+
+        self.assertIn("provenance.json", PINNED_FUSE_METADATA_SHA256)
+        self.assertIn("SH1-ACCEPTANCE.json", PINNED_FUSE_METADATA_SHA256)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # P1-8: provenance.json and SH1-ACCEPTANCE.json cannot be rewritten consistently.
+            for fname in ("SH1-ACCEPTANCE.json", "provenance.json", "spec.json"):
+                copy_dir = Path(tmpdir) / f"vendor_{fname}"
+                shutil.copytree(DEFAULT_VENDOR_ENGINE_ROOT, copy_dir)
+                target = copy_dir / "metadata" / fname
+                os.chmod(target, 0o644)
+                target.write_bytes(target.read_bytes().replace(b"{", b"{ ", 1))
+                with self.assertRaises(EngineIdentityError, msg=fname):
+                    verify_vendored_engine_bundle(copy_dir)
+
+            # P1-9: a poisoned cache under PYTHONPYCACHEPREFIX is never executed.
+            copy_dir = Path(tmpdir) / "vendor_cache"
+            shutil.copytree(DEFAULT_VENDOR_ENGINE_ROOT, copy_dir)
+            prefix = Path(tmpdir) / "pycache_prefix"
+            prev_prefix = sys.pycache_prefix
+            sys.pycache_prefix = str(prefix)
+            try:
+                for py in sorted((copy_dir / "fuse_engine").glob("*.py")):
+                    cfile = Path(importlib.util.cache_from_source(str(py.resolve())))
+                    cfile.parent.mkdir(parents=True, exist_ok=True)
+                    poisoned = compile("raise RuntimeError('poisoned cache executed')\n", str(py), "exec")
+                    header = importlib.util.MAGIC_NUMBER + (0).to_bytes(4, "little")
+                    st = py.stat()
+                    header += int(st.st_mtime).to_bytes(4, "little") + (st.st_size & 0xFFFFFFFF).to_bytes(4, "little")
+                    cfile.write_bytes(header + marshal.dumps(poisoned))
+                ev_cache = VendoredFuseEvaluator(vendor_root=copy_dir)
+            finally:
+                sys.pycache_prefix = prev_prefix
+            self.assertEqual(ev_cache.engine_hash, PINNED_FUSE_ENGINE_HASH)
 
     def test_o5_order_evidence_and_v1_five_session_history_forwarded(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
@@ -1372,6 +1555,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "o5_limit_price": "50",
                 "o5_reference_price": "50",
                 "o5_account": "stage_n_shadow",
+                "settled_cash": "50000",
             }
         )
         rows_o5_ok, _, _ = ev.evaluate(
@@ -1464,6 +1648,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "instrument": inst,
                 "normalized_value": 50.0,
                 "calendar_spec_digest": cal_digest,
+                "effective_session": "2026-01-06",
                 "eligibility": {"eligible": True},
             }
             for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR")
@@ -1905,6 +2090,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "49",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
                 "corporate_action": {
                     "split_ratio": "2",
                     "cash_per_share_usd": "1",
@@ -1916,6 +2102,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "40",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
                 "corporate_action": {"split_ratio": "1", "cash_per_share_usd": "0", "ex_date": "2026-01-05"},
             },
             {
@@ -1923,24 +2110,28 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "500",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "XNDX",
                 "normalized_value": "20000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SEMI",
                 "normalized_value": "5000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
         ]
 
@@ -2029,18 +2220,21 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "50",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOXL",
                 "normalized_value": "40",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "QQQ",
                 "normalized_value": "50",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
                 "corporate_action": {"split_ratio": "2", "ex_date": "2026-01-05"},
             },
             {
@@ -2048,24 +2242,28 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "20000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SEMI",
                 "normalized_value": "5000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "TBILL_3M",
                 "normalized_value": "0.042",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
         ]
         vin = build_fuse_validated_inputs(
@@ -2139,42 +2337,49 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "50",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOXL",
                 "normalized_value": "40",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "QQQ",
                 "normalized_value": "500",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "XNDX",
                 "normalized_value": "90",
                 "eligibility": {"eligible": False, "reason": "stale_benchmark_bar"},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SEMI",
                 "normalized_value": "5000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "TBILL_3M",
                 "normalized_value": "0.042",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
         ]
 
@@ -2220,36 +2425,42 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": "45",
                 "eligibility": {"eligible": False, "reason": "stale_fund_bar"},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOXL",
                 "normalized_value": "40",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "XNDX",
                 "normalized_value": "20000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SEMI",
                 "normalized_value": "5000",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
             {
                 "instrument": "TBILL_3M",
                 "normalized_value": "0.042",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
+                "effective_session": "2026-01-05",
             },
         ]
 
