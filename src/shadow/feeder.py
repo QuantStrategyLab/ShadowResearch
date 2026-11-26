@@ -140,6 +140,20 @@ def read_verified_archived_bytes(
     return data
 
 
+def _parse_aware_utc(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    txt = raw.strip()
+    iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
+    try:
+        parsed = datetime.fromisoformat(iso_norm)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def _build_mkt_record(
     *,
     instrument: str,
@@ -167,8 +181,21 @@ def _build_mkt_record(
     cutoff = decision_cutoff_utc if decision_cutoff_utc is not None else calendar_session.get("order_cutoff_utc")
     eff_close = session_close_utc if session_close_utc is not None else calendar_session.get("close_utc")
     post_close_ok = bool(eff_close is not None and retrieval_time_utc >= eff_close)
+    pub_reason: str | None = None
+    if source_publication_time_utc is not None:
+        pub_dt = _parse_aware_utc(source_publication_time_utc)
+        if pub_dt is None:
+            pub_reason = "invalid_source_publication_time"
+        else:
+            cutoff_dt = _parse_aware_utc(cutoff) if cutoff is not None else None
+            ret_dt = _parse_aware_utc(retrieval_time_utc)
+            if cutoff_dt is not None and pub_dt > cutoff_dt:
+                pub_reason = "publication_after_decision_cutoff"
+            elif ret_dt is not None and pub_dt > ret_dt:
+                pub_reason = "publication_after_retrieval"
     eligible = (
         missing_reason is None
+        and pub_reason is None
         and normalized_value is not None
         and bool(calendar_session.get("is_trading_day"))
         and not bool(calendar_session.get("blocks_eligibility"))
@@ -180,7 +207,9 @@ def _build_mkt_record(
     if eligible:
         elig_reason = None
     elif elig_reason is None:
-        if normalized_value is None:
+        if pub_reason is not None:
+            elig_reason = pub_reason
+        elif normalized_value is None:
             elig_reason = "missing_normalized_value"
         elif cutoff is None or not calendar_session.get("is_trading_day"):
             elig_reason = "non_trading_session"
@@ -296,6 +325,7 @@ _EXTENDED_SESSION_MARKERS = frozenset(
         "pre_market",
         "pre_market_extended",
         "blue_ocean_overnight",
+        "closed",
     }
 )
 
@@ -318,8 +348,10 @@ def _validate_core_rth_bar_timestamp(
     *,
     allow_midnight_date_marker: bool = False,
 ) -> None:
-    if not isinstance(raw_ts, str) or not raw_ts.strip():
+    if raw_ts is None:
         return
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        raise ValueError("tiingo_invalid_timestamp")
     txt = raw_ts.strip()
     if allow_midnight_date_marker:
         if len(txt) == 10:
@@ -370,14 +402,25 @@ def _validate_tiingo_official_close_row(
     """Validate that a Tiingo row represents core RTH Official Close, not extended/overnight/T+1."""
     for marker_key in ("session", "market_session", "session_window", "session_time"):
         marker_val = row.get(marker_key)
-        if isinstance(marker_val, str) and marker_val.strip().lower() in _EXTENDED_SESSION_MARKERS:
-            raise ValueError("extended_hours_overnight_rejected")
+        if isinstance(marker_val, str):
+            norm_marker = marker_val.strip().lower()
+            if norm_marker == "next_trade_date_window":
+                raise ValueError("next_trade_date_contamination")
+            if norm_marker in _EXTENDED_SESSION_MARKERS:
+                raise ValueError("extended_hours_overnight_rejected")
     session_time_val = row.get("session_time")
     if isinstance(session_time_val, str) and ":" in session_time_val:
         st_txt = session_time_val.strip()
-        if "T" in st_txt or " " in st_txt or "+" in st_txt or st_txt.endswith("Z"):
+        if "T" in st_txt or " " in st_txt:
             _validate_core_rth_bar_timestamp(
                 st_txt,
+                session_date,
+                calendar_session,
+                allow_midnight_date_marker=False,
+            )
+        elif st_txt.endswith("Z") or "+" in st_txt or "-" in st_txt:
+            _validate_core_rth_bar_timestamp(
+                f"{session_date}T{st_txt}",
                 session_date,
                 calendar_session,
                 allow_midnight_date_marker=False,
@@ -1422,14 +1465,21 @@ def validate_official_close_market_record(
     """Enforce US 23/5 16:00 ET Official Close isolation & non-contamination for equity/index prints."""
     inst = str(rec.get("instrument", ""))
     disclosures = rec.get("disclosures") if isinstance(rec.get("disclosures"), Mapping) else {}
-    session_marker = str(disclosures.get("session_window") or disclosures.get("market_session") or "").lower()
+    session_marker = str(disclosures.get("session_window") or disclosures.get("market_session") or "").strip().lower()
+    if session_marker == "next_trade_date_window":
+        return False, "next_trade_date_contamination"
     if session_marker in _EXTENDED_SESSION_MARKERS:
         return False, "extended_hours_overnight_rejected"
     if inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI"):
         trade_date = str(calendar_session.get("trade_date") or "")
         eff = str(rec.get("effective_session") or "")
-        if trade_date and eff > trade_date:
-            return False, "next_trade_date_contamination"
+        if trade_date:
+            if not eff:
+                return False, "missing_effective_session"
+            if eff > trade_date:
+                return False, "next_trade_date_contamination"
+            if eff < trade_date:
+                return False, "stale_effective_session"
         bar_ts = disclosures.get("bar_timestamp_utc")
         if isinstance(bar_ts, str) and bar_ts.strip():
             ok_ts, err = is_official_close_bar_timestamp(bar_ts, calendar_session)
