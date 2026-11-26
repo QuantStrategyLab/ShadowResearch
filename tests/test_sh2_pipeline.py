@@ -37,6 +37,7 @@ from shadow.calendar_consumer import (  # noqa: E402
 )
 from shadow.feeder import (  # noqa: E402
     emit_market_records_from_payloads,
+    expected_prior_sofr_business_day,
     extract_prior_close_from_tiingo_bytes,
     extract_prior_close_from_yahoo_bytes,
     select_tiingo_row,
@@ -2697,9 +2698,12 @@ class Sh2PipelineTest(unittest.TestCase):
                 "market_records": [
                     {
                         "instrument": inst,
-                        "normalized_value": 50.0,
+                        "normalized_value": {"SOXL": 40.0}.get(inst, 50.0),
                         "calendar_spec_digest": str(cal5["spec_digest"]),
-                        "effective_session": ts[:10],
+                        "effective_session": (
+                            expected_prior_sofr_business_day(ts[:10]) if inst == "SOFR" else ts[:10]
+                        ),
+                        "retrieval_time_utc": ts,
                         "eligibility": {"eligible": True},
                     }
                     for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
@@ -2866,9 +2870,12 @@ class Sh2PipelineTest(unittest.TestCase):
                 "market_records": [
                     {
                         "instrument": inst,
-                        "normalized_value": 50.0,
+                        "normalized_value": {"SOXL": 40.0}.get(inst, 50.0),
                         "calendar_spec_digest": str(cal5["spec_digest"]),
-                        "effective_session": ts[:10],
+                        "effective_session": (
+                            expected_prior_sofr_business_day(ts[:10]) if inst == "SOFR" else ts[:10]
+                        ),
+                        "retrieval_time_utc": ts,
                         "eligibility": {"eligible": True},
                     }
                     for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
