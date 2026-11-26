@@ -24,7 +24,6 @@ RUNTIME_MODULE_FILES: tuple[str, ...] = (
     "src/shadow/ots.py",
     "src/shadow/replay.py",
     "src/shadow/scheduler.py",
-    "src/shadow/sh2_acceptance.py",
     "src/shadow/sizing.py",
 )
 

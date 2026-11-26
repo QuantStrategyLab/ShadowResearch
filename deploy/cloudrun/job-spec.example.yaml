@@ -2,8 +2,10 @@
 # Replace <project-id>, <repo>, <tag>, <service-account>, and <bucket-name> before deploy.
 # Keep config/production-scheduler.json production_chain_locked=true until OA-SH2-2 sign-off.
 # Single-writer concurrency discipline: maxRetries: 0 with parallelism: 1 and taskCount: 1
-# prevents concurrent overlapping Cloud Run tasks; cross-instance writes are additionally fenced by
-# ledger/.chain.lease.json (GCS exclusive create ifGenerationMatch=0 semantics).
+# prevents concurrent overlapping Cloud Run tasks within one execution, AND Cloud Scheduler must
+# serialize job triggers (no overlapping manual/scheduled launches). Note: GCS FUSE O_EXCL does not
+# guarantee cross-instance distributed creation atomicity until close/generation check; use a
+# POSIX Filestore mount or storage-native GCS ifGenerationMatch=0 lease if executions can overlap.
 # Production history authentication:
 # - One-time genesis initialization (seq=0 on empty SHADOW_DATA_DIR): set
 #   SHADOW_TRUSTED_HEAD_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
@@ -85,9 +87,11 @@ spec:
                 readOnly: false
                 volumeAttributes:
                   bucketName: "<bucket-name>"
+                  mountOptions: "uid=10001,gid=10001,implicit-dirs"
             # - name: shadow-anchor
             #   csi:
             #     driver: gcsfuse.run.googleapis.com
             #     readOnly: false
             #     volumeAttributes:
             #       bucketName: "<anchor-bucket-name>"
+            #       mountOptions: "uid=10001,gid=10001,implicit-dirs"

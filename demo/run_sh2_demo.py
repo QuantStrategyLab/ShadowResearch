@@ -50,7 +50,7 @@ from shadow.ledger import (  # noqa: E402
     save_row_state_snapshot,
 )
 from shadow.manifest import compute_code_manifest_hash  # noqa: E402
-from shadow.ots import build_synthetic_ots_fixture  # noqa: E402
+from shadow.ots import OpenTimestampsClient, build_synthetic_ots_fixture  # noqa: E402
 from shadow.replay import replay_window  # noqa: E402
 from shadow.scheduler import (  # noqa: E402
     load_production_scheduler_config,
@@ -587,11 +587,17 @@ def run_all_demos() -> dict[str, dict]:
             fuse_spec_version=PINNED_FUSE_SPEC_VERSION,
             fuse_engine_hash=PINNED_FUSE_ENGINE_HASH,
         )
+        class _DemoOfflineOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
         res_d7 = run_daily_drill_cycle(
             session_date="2026-01-05",
             data_dir=ddir,
             config=base_cfg,
             fixtures_dir=fdir,
+            ots_client=_DemoOfflineOts(),
             wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
             evaluator=ev,
         )
@@ -626,11 +632,19 @@ def run_all_demos() -> dict[str, dict]:
         fdir = Path(tmpdir) / "fixtures"
         _build_session_fixture_files(fdir, "2026-01-05")
         wc = lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc)
+
+        class _CloudRunOfflineOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
+        d9_ots = _CloudRunOfflineOts()
         first = run_cloudrun_job(
             data_dir=cdir,
             config_path=REPO_ROOT / "config" / "drill-scheduler.json",
             session_date="2026-01-05",
             fixtures_dir=fdir,
+            ots_client=d9_ots,
             wall_clock=wc,
         )
         assert first["status"] == "committed" and first["appended"] is True
@@ -641,6 +655,7 @@ def run_all_demos() -> dict[str, dict]:
                 config_path=REPO_ROOT / "config" / "drill-scheduler.json",
                 session_date="2026-01-05",
                 fixtures_dir=fdir,
+                ots_client=d9_ots,
                 wall_clock=wc,
             )
             f2 = pool.submit(
@@ -649,6 +664,7 @@ def run_all_demos() -> dict[str, dict]:
                 config_path=REPO_ROOT / "config" / "drill-scheduler.json",
                 session_date="2026-01-05",
                 fixtures_dir=fdir,
+                ots_client=d9_ots,
                 wall_clock=wc,
             )
             r_c1, r_c2 = f1.result(), f2.result()
