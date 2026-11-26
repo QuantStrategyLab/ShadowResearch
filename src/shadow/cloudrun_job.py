@@ -44,7 +44,8 @@ def _default_session_date(
 ) -> str:
     spec_path = Path(spec_dir) if spec_dir is not None else (REPO_ROOT / "specs" / cfg.calendar_version)
     spec = load_spec(spec_path)
-    ts = (now_utc or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    eff_now = now_utc.astimezone(timezone.utc) if now_utc is not None else datetime.now(timezone.utc)
+    ts = eff_now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     resolved = resolve_prior_close_session(ts, spec=spec, venue=cfg.venue)
     return str(resolved["trade_date"])
 

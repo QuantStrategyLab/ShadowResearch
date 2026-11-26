@@ -1369,6 +1369,18 @@ def _apply_explicit_payload_tier(
                 payload.pop(stale_key, None)
     else:
         payload.setdefault("tier", "balanced")
+    explicit_inner = session_inputs.get("fuse_inputs")
+    for hb_key in ("last_heartbeat", "heartbeat_source", "scheduled_interval"):
+        if hb_key in session_inputs:
+            if (
+                isinstance(explicit_inner, Mapping)
+                and hb_key in explicit_inner
+                and explicit_inner[hb_key] != session_inputs[hb_key]
+            ):
+                raise ValueError(
+                    f"conflicting_{hb_key}_between_session_inputs_and_fuse_inputs"
+                )
+            payload[hb_key] = copy.deepcopy(session_inputs[hb_key])
     payload.setdefault("loaded_policy_hash", policy_hash)
     payload.setdefault("registered_policy_hash", policy_hash)
     return payload

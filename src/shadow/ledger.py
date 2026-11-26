@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import errno
 import fcntl
@@ -14,7 +15,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -768,9 +769,17 @@ def derive_o7_heartbeat_inputs(
 ) -> dict[str, object]:
     """Derive deterministic O7 heartbeat inputs from committed history and pinned calendar."""
     inputs = session_inputs if isinstance(session_inputs, Mapping) else {}
+    inner_fuse = inputs.get("fuse_inputs") if isinstance(inputs.get("fuse_inputs"), Mapping) else {}
 
     if "scheduled_interval" in inputs:
+        if (
+            "scheduled_interval" in inner_fuse
+            and inner_fuse["scheduled_interval"] != inputs["scheduled_interval"]
+        ):
+            raise ValueError("conflicting_scheduled_interval_between_session_inputs_and_fuse_inputs")
         sched_interval = inputs["scheduled_interval"]
+    elif "scheduled_interval" in inner_fuse:
+        sched_interval = inner_fuse["scheduled_interval"]
     else:
         venue = str(calendar_session.get("exchange") or "XNYS")
         is_half_day = calendar_session.get("session_state") == "half_day"
@@ -807,8 +816,13 @@ def derive_o7_heartbeat_inputs(
             sched_interval = max(93600.0, float((cutoff_dt - cur_close_dt).total_seconds()))
 
     if "last_heartbeat" in inputs:
+        if "last_heartbeat" in inner_fuse and inner_fuse["last_heartbeat"] != inputs["last_heartbeat"]:
+            raise ValueError("conflicting_last_heartbeat_between_session_inputs_and_fuse_inputs")
         last_hb = copy.deepcopy(inputs["last_heartbeat"])
-        hb_source = str(inputs.get("heartbeat_source") or "caller")
+        hb_source = str(inputs.get("heartbeat_source") or inner_fuse.get("heartbeat_source") or "caller")
+    elif "last_heartbeat" in inner_fuse:
+        last_hb = copy.deepcopy(inner_fuse["last_heartbeat"])
+        hb_source = str(inputs.get("heartbeat_source") or inner_fuse.get("heartbeat_source") or "caller")
     elif sequence == 0:
         # Documented genesis bootstrap rule: anchor to genesis session official close (never as_of).
         last_hb = calendar_session.get("close_utc")
@@ -1114,11 +1128,14 @@ def build_record_body(
         )
         if hb_info is not None:
             raw_sched = hb_info["scheduled_interval"]
-            sched_str = (
-                canonical_decimal_str(Decimal(str(raw_sched)))
-                if raw_sched is not None and not isinstance(raw_sched, bool)
-                else None
-            )
+            sched_str: str | None = None
+            if raw_sched is not None and not isinstance(raw_sched, bool):
+                try:
+                    sched_dec = Decimal(str(raw_sched))
+                    if sched_dec.is_finite():
+                        sched_str = canonical_decimal_str(sched_dec)
+                except (InvalidOperation, ValueError, CanonicalizationError):
+                    sched_str = None
             evaluator_block["heartbeat_source"] = hb_info["heartbeat_source"]
             evaluator_block["o7_heartbeat"] = {
                 "heartbeat_source": hb_info["heartbeat_source"],
@@ -1277,23 +1294,24 @@ def check_forward_clock_credit(
             or first_body.get("ledger_mode") == "stage_n_production"
         )
         if is_sh2_prod_chain:
-            if eff_locked is None:
-                base_root = Path(repo_root) if repo_root is not None else _SPECS_ROOT.parent
-                default_prod_cfg = base_root / "config" / "production-scheduler.json"
-                if not default_prod_cfg.is_file():
-                    eff_locked = True
+            base_root = Path(repo_root) if repo_root is not None else _SPECS_ROOT.parent
+            default_prod_cfg = base_root / "config" / "production-scheduler.json"
+            if not default_prod_cfg.is_file():
+                cfg_locked = True
+            else:
+                try:
+                    raw_prod = parse_json_no_duplicates(default_prod_cfg.read_text(encoding="utf-8"))
+                except Exception:
+                    raw_prod = None
+                if not isinstance(raw_prod, dict):
+                    cfg_locked = True
                 else:
-                    try:
-                        raw_prod = parse_json_no_duplicates(default_prod_cfg.read_text(encoding="utf-8"))
-                    except Exception:
-                        raw_prod = None
-                    if not isinstance(raw_prod, dict):
-                        eff_locked = True
-                    else:
-                        eff_locked = not (
-                            raw_prod.get("production_chain_locked") is False
-                            and raw_prod.get("clk01_active") is True
-                        )
+                    cfg_locked = not (
+                        raw_prod.get("production_chain_locked") is False
+                        and raw_prod.get("clk01_active") is True
+                    )
+            # Default production config cannot be unlocked by caller production_chain_locked=False.
+            eff_locked = bool(cfg_locked or (production_chain_locked is True))
             if eff_expected_engine_hash is None:
                 eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
             if eff_expected_spec_version is None:
@@ -2512,6 +2530,23 @@ class ShadowLedger:
 
             self.assert_active_chain_lease()
             self.root_dir.mkdir(parents=True, exist_ok=True)
+            pending_ev_path: Path | None = None
+            if not allow_unanchored and post_marker_writes:
+                pending_ev_path = self.root_dir / (
+                    f".pending_evidence_{seq:06d}_{envelope['record_sha256']}.json"
+                )
+                pending_ev_payload = {
+                    "schema_version": "c-sh-pending-evidence-v1",
+                    "sequence": seq,
+                    "record_sha256": envelope["record_sha256"],
+                    "ots_b64": (
+                        base64.b64encode(ots_bytes).decode("ascii")
+                        if ots_bytes is not None
+                        else None
+                    ),
+                    "receipt": receipt_obj,
+                }
+                _atomic_write_bytes(pending_ev_path, canonical_json_bytes(pending_ev_payload))
             created_artifacts: list[tuple[Path, bytes]] = []
             try:
                 if before_record_commit is not None:
@@ -2550,6 +2585,8 @@ class ShadowLedger:
                                 f"target_detached_evidence_exists_concurrently: {target_path.name}"
                             ) from exc
                         created_artifacts.append((target_path, data))
+                    if pending_ev_path is not None and pending_ev_path.is_file():
+                        pending_ev_path.unlink()
             except Exception:
                 try:
                     self.assert_active_chain_lease()
@@ -2560,8 +2597,56 @@ class ShadowLedger:
                     for created_path, expected_bytes in reversed(created_artifacts):
                         if created_path.is_file() and created_path.read_bytes() == expected_bytes:
                             created_path.unlink()
+                    if pending_ev_path is not None and not rec_path.exists() and pending_ev_path.is_file():
+                        pending_ev_path.unlink()
                 raise
             return envelope
+
+    def recover_pending_evidence(self, records: Sequence[dict]) -> int:
+        """Restore detached .ots/.receipt.json from pre-commit staging if Cloud Run died mid-publish."""
+        recovered = 0
+        for env in records:
+            if not isinstance(env, Mapping):
+                continue
+            body = env.get("record_body")
+            rec_sha = env.get("record_sha256")
+            if not isinstance(body, Mapping) or not isinstance(rec_sha, str):
+                continue
+            seq = body.get("sequence")
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                continue
+            pending_ev_path = self.root_dir / f".pending_evidence_{seq:06d}_{rec_sha}.json"
+            if not pending_ev_path.is_file():
+                continue
+            rcp_path = self._receipt_path(seq)
+            ots_path = self._ots_path(seq)
+            try:
+                staged = parse_json_no_duplicates(pending_ev_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(staged, dict) or staged.get("record_sha256") != rec_sha or staged.get("sequence") != seq:
+                continue
+            receipt_obj = staged.get("receipt")
+            ots_b64 = staged.get("ots_b64")
+            ots_bytes = base64.b64decode(ots_b64) if isinstance(ots_b64, str) else None
+            if not isinstance(receipt_obj, dict):
+                continue
+            ok_rec, _ = verify_receipt(
+                dict(env),
+                receipt_obj,
+                ots_bytes=ots_bytes,
+                require_bitcoin_verification=False,
+            )
+            if not ok_rec:
+                continue
+            self.assert_active_chain_lease()
+            if ots_bytes is not None and not ots_path.is_file():
+                _atomic_write_bytes(ots_path, ots_bytes)
+            if not rcp_path.is_file():
+                _atomic_write_bytes(rcp_path, canonical_json_bytes(receipt_obj))
+            pending_ev_path.unlink(missing_ok=True)
+            recovered += 1
+        return recovered
 
     def rollback_sequence(self, seq: int) -> None:
         """Roll back all artifacts for seq when an outer transaction fails before commit completion."""

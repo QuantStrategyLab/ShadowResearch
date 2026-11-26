@@ -991,6 +991,7 @@ def _is_committed_session_report_valid(
     cal: Mapping[str, object],
     ledger: ShadowLedger,
     expected_consecutive_count: int,
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
 ) -> bool:
     """Return True iff both completeness JSON and Markdown exist, match ledger+bundle+receipt, and render cleanly."""
     json_path = reports_dir / f"completeness_{session_date}.json"
@@ -1045,8 +1046,11 @@ def _is_committed_session_report_valid(
         return False
     if rep_obj.get("notifications_sent") != 0:
         return False
-    expected_scope = "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
-    if rep_obj.get("consecutive_session_scope") != expected_scope:
+    if cfg.mode == "production":
+        valid_prod_scopes = ("clk01_forward_clock_verified", "production_appended_pending_credit")
+        if rep_obj.get("consecutive_session_scope") not in valid_prod_scopes:
+            return False
+    elif rep_obj.get("consecutive_session_scope") != "drill_only_not_clk01":
         return False
     consec = rep_obj.get("consecutive_session_count")
     if isinstance(consec, bool) or consec != expected_consecutive_count:
@@ -1085,6 +1089,7 @@ def _is_committed_session_report_valid(
     ):
         return False
 
+    chain_locked_flag = bool(cfg.mode == "production" and (cfg.production_chain_locked is not False or not cfg.clk01_active))
     try:
         expected_rcp = _summarize_committed_receipt(
             ledger=ledger,
@@ -1092,6 +1097,9 @@ def _is_committed_session_report_valid(
             env=committed_env,
             deadline_utc=str(deadlines["commitment_deadline_utc"]),
             decision_utc=str(body["decision_timestamp_utc"]),
+            mode=cfg.mode,
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
+            chain_locked=chain_locked_flag,
         )
     except Exception:
         return False
@@ -1105,21 +1113,56 @@ def _is_committed_session_report_valid(
         "ots_sha256",
         "obtained_at_utc",
         "commitment_deadline_utc",
-        "creditable",
     ):
         if rep_rcp.get(rcp_key) != expected_rcp.get(rcp_key):
             return False
     rep_reasons = rep_rcp.get("non_creditable_reasons")
-    if expected_rcp.get("status") == "missing":
-        if (
-            not isinstance(rep_reasons, list)
-            or len(rep_reasons) < 2
-            or not str(rep_reasons[0]).startswith("missing_ots_receipt")
-            or "drill_mode" not in rep_reasons
-        ):
+    preserved_prod_bitcoin_state = bool(
+        cfg.mode == "production"
+        and not chain_locked_flag
+        and bitcoin_merkle_roots is None
+        and expected_rcp.get("status") == "timely"
+        and (
+            (rep_rcp.get("creditable") is True and rep_reasons == [])
+            or (
+                rep_rcp.get("creditable") is False
+                and isinstance(rep_reasons, list)
+                and len(rep_reasons) > 0
+                and all(isinstance(x, str) and x for x in rep_reasons)
+                and "drill_mode" not in rep_reasons
+            )
+        )
+    )
+    if not preserved_prod_bitcoin_state:
+        if rep_rcp.get("creditable") != expected_rcp.get("creditable"):
             return False
-    elif rep_reasons != expected_rcp.get("non_creditable_reasons"):
-        return False
+        if expected_rcp.get("status") == "missing":
+            expected_mode_tag = "production_chain_locked" if cfg.mode == "production" else "drill_mode"
+            if cfg.mode == "production":
+                if (
+                    not isinstance(rep_reasons, list)
+                    or not rep_reasons
+                    or not str(rep_reasons[0]).startswith("missing_ots_receipt")
+                    or "drill_mode" in rep_reasons
+                ):
+                    return False
+            elif (
+                not isinstance(rep_reasons, list)
+                or len(rep_reasons) < 2
+                or not str(rep_reasons[0]).startswith("missing_ots_receipt")
+                or expected_mode_tag not in rep_reasons
+            ):
+                return False
+        elif rep_reasons != expected_rcp.get("non_creditable_reasons"):
+            return False
+    if cfg.mode == "production":
+        expected_scope = (
+            "clk01_forward_clock_verified"
+            if rep_rcp.get("creditable") is True
+            else "production_appended_pending_credit"
+        )
+        if rep_obj.get("consecutive_session_scope") != expected_scope:
+            return False
 
     try:
         md_text = md_path.read_text(encoding="utf-8")
@@ -1207,7 +1250,7 @@ def _is_fail_closed_session_report_valid(
     notif = rep_obj.get("notifications_sent")
     if type(notif) is not int or notif != 0:
         return False
-    expected_scope = "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+    expected_scope = "production_fail_closed_not_clk01" if cfg.mode == "production" else "drill_only_not_clk01"
     if rep_obj.get("consecutive_session_scope") != expected_scope:
         return False
     consec = rep_obj.get("consecutive_session_count")
@@ -1699,6 +1742,9 @@ def _summarize_committed_receipt(
     deadline_utc: str,
     decision_utc: str,
     ots_error: str | None = None,
+    mode: str = "drill",
+    bitcoin_merkle_roots: Mapping[int, object] | None = None,
+    chain_locked: bool = False,
 ) -> dict:
     rpath = ledger._receipt_path(seq)
     opath = ledger._ots_path(seq)
@@ -1712,15 +1758,39 @@ def _summarize_committed_receipt(
             decision_timestamp_utc=decision_utc,
             require_expected_deadline=True,
         )
+        creditable = False
         if not ok_rcp:
             status = "invalid"
-            reasons = [str(err_rcp), "drill_mode"]
-        elif timely:
+            reasons = [str(err_rcp)] if mode == "production" else [str(err_rcp), "drill_mode"]
+        elif not timely:
+            status = "late"
+            reasons = [str(timely_err)] if mode == "production" else [str(timely_err), "drill_mode"]
+        elif mode == "production":
+            status = "timely"
+            if bitcoin_merkle_roots is not None:
+                ok_btc, btc_err = verify_receipt(
+                    env,
+                    rcp_obj,
+                    ots_bytes=ots_raw,
+                    bitcoin_merkle_roots=bitcoin_merkle_roots,
+                    require_bitcoin_verification=True,
+                    require_bitcoin_timestamp=True,
+                    expected_commitment_deadline_utc=deadline_utc,
+                )
+                if ok_btc and not chain_locked:
+                    creditable = True
+                    reasons = []
+                elif ok_btc:
+                    reasons = ["production_chain_locked"]
+                else:
+                    reasons = [str(btc_err)]
+            elif chain_locked:
+                reasons = ["production_chain_locked", "ots_pending_bitcoin_confirmation"]
+            else:
+                reasons = ["ots_pending_bitcoin_confirmation"]
+        else:
             status = "timely"
             reasons = ["drill_mode"]
-        else:
-            status = "late"
-            reasons = [str(timely_err), "drill_mode"]
         return {
             "anchor": "opentimestamps",
             "status": status,
@@ -1728,10 +1798,11 @@ def _summarize_committed_receipt(
             "ots_sha256": rcp_obj.get("ots_sha256"),
             "obtained_at_utc": rcp_obj.get("obtained_at_utc"),
             "commitment_deadline_utc": deadline_utc,
-            "creditable": False,
+            "creditable": creditable,
             "non_creditable_reasons": reasons,
         }
     missing_reason = f"missing_ots_receipt:{ots_error}" if ots_error else "missing_ots_receipt"
+    missing_reasons = [missing_reason] if mode == "production" else [missing_reason, "drill_mode"]
     return {
         "anchor": "opentimestamps",
         "status": "missing",
@@ -1740,7 +1811,7 @@ def _summarize_committed_receipt(
         "obtained_at_utc": None,
         "commitment_deadline_utc": deadline_utc,
         "creditable": False,
-        "non_creditable_reasons": [missing_reason, "drill_mode"],
+        "non_creditable_reasons": missing_reasons,
     }
 
 
@@ -1791,8 +1862,21 @@ def _build_committed_completeness_report(
         "receipt": receipt_summary,
         "consecutive_session_count": consecutive_now,
         "consecutive_session_scope": (
-            "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+            (
+                "clk01_forward_clock_verified"
+                if receipt_summary.get("creditable") is True
+                else "production_appended_pending_credit"
+            )
+            if cfg.mode == "production"
+            else "drill_only_not_clk01"
         ),
+        "clk01_credit": {
+            "creditable": bool(receipt_summary.get("creditable") is True),
+            "verified_session_count": (
+                consecutive_now if (cfg.mode == "production" and receipt_summary.get("creditable") is True) else 0
+            ),
+            "reasons": list(receipt_summary.get("non_creditable_reasons") or []),
+        },
         "standing_assertions": {
             "kelly_applied": False,
             "orders_placed": 0,
@@ -1863,11 +1947,12 @@ def _build_fail_closed_result(
             "obtained_at_utc": receipt_obtained_at_utc,
             "commitment_deadline_utc": deadlines["commitment_deadline_utc"],
             "creditable": False,
-            "non_creditable_reasons": receipt_reasons or [fail_reason, "drill_mode"],
+            "non_creditable_reasons": receipt_reasons
+            or [fail_reason, "production_fail_closed" if cfg.mode == "production" else "drill_mode"],
         },
         "consecutive_session_count": consecutive_count,
         "consecutive_session_scope": (
-            "clk01_forward_clock" if cfg.mode == "production" else "drill_only_not_clk01"
+            "production_fail_closed_not_clk01" if cfg.mode == "production" else "drill_only_not_clk01"
         ),
         "standing_assertions": {
             "kelly_applied": False,
@@ -3003,6 +3088,7 @@ def _authenticate_production_history(
         raise EngineIdentityError(
             "production_history_unauthenticated: require expected_prior_head_sha256"
         )
+    ledger.recover_pending_evidence(prior_records)
 
     existing_env = next(
         (
@@ -3245,7 +3331,10 @@ def _run_daily_drill_cycle_locked(
                 + (f":seq={bad_seq}" if bad_seq is not None else "")
             ),
             required_series=[],
-            receipt_reasons=["existing_chain_verification_failed", "drill_mode"],
+            receipt_reasons=[
+                "existing_chain_verification_failed",
+                "production_fail_closed" if cfg.mode == "production" else "drill_mode",
+            ],
         )
 
     head_env = ledger.head()
@@ -3291,7 +3380,10 @@ def _run_daily_drill_cycle_locked(
             fail_reason=f"O2:{cal.get('reason') or 'non_trading_session'}",
             required_series=[],
             receipt_status="not_applicable_closed_session",
-            receipt_reasons=["non_trading_session", "drill_mode"],
+            receipt_reasons=[
+                "non_trading_session",
+                "production_fail_closed" if cfg.mode == "production" else "drill_mode",
+            ],
         )
 
     # 3a. Enforce ledger <-> replay_bundle consistency and committed-receipt integrity before any retry or append
@@ -3475,6 +3567,7 @@ def _run_daily_drill_cycle_locked(
             cal=cal,
             ledger=ledger,
             expected_consecutive_count=consecutive_now,
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
         ):
             existing_rep = parse_json_no_duplicates(json_path.read_text(encoding="utf-8"))
             return {
@@ -3576,6 +3669,11 @@ def _run_daily_drill_cycle_locked(
             env=existing_env,
             deadline_utc=deadline_utc,
             decision_utc=ex_body["decision_timestamp_utc"],
+            mode=cfg.mode,
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
+            chain_locked=bool(
+                cfg.mode == "production" and (cfg.production_chain_locked is not False or not cfg.clk01_active)
+            ),
         )
         report, footprint = _build_committed_completeness_report(
             t_start=t_start,
@@ -3698,7 +3796,7 @@ def _run_daily_drill_cycle_locked(
             fail_reason=fail_reason,
             required_series=[],
             receipt_status="late_backfill_rejected",
-            receipt_reasons=[fail_reason, "drill_mode"],
+            receipt_reasons=[fail_reason, "production_fail_closed" if cfg.mode == "production" else "drill_mode"],
         )
 
     eff_treasury = treasury_endpoint if treasury_endpoint is not None else cfg.treasury_endpoint
@@ -4208,7 +4306,7 @@ def _run_daily_drill_cycle_locked(
             receipt_anchor="opentimestamps",
             receipt_status="late_backfill_rejected",
             receipt_obtained_at_utc=rcp_obtained_utc,
-            receipt_reasons=[fail_reason, "drill_mode"],
+            receipt_reasons=[fail_reason, "production_fail_closed" if cfg.mode == "production" else "drill_mode"],
             pending_rejected_state_sha256=pending_sha,
         )
         return fail_res
@@ -4287,6 +4385,11 @@ def _run_daily_drill_cycle_locked(
         deadline_utc=deadline_utc,
         decision_utc=decision_utc,
         ots_error=ots_error,
+        mode=cfg.mode,
+        bitcoin_merkle_roots=bitcoin_merkle_roots,
+        chain_locked=bool(
+            cfg.mode == "production" and (cfg.production_chain_locked is not False or not cfg.clk01_active)
+        ),
     )
     consecutive_now = _count_consecutive_trading_sessions(
         prior_records,

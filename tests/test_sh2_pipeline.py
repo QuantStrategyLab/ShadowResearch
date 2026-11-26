@@ -158,9 +158,11 @@ class Sh2PipelineTest(unittest.TestCase):
 
             class _FakeOts(OpenTimestampsClient):
                 def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
-                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                    ht = 880100 + len(hdrs)
+                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=ht)
                     assert root_hex is not None
-                    hdrs[880100] = {"merkle_root": root_hex, "timestamp": "2026-01-06T03:00:00.000Z"}
+                    ts = "2026-01-06T03:00:00.000Z" if len(hdrs) == 0 else "2026-01-07T03:00:00.000Z"
+                    hdrs[ht] = {"merkle_root": root_hex, "timestamp": ts}
                     return ots_b, "https://a.pool.opentimestamps.org"
 
             r1 = run_production_cycle(
@@ -860,9 +862,11 @@ class Sh2PipelineTest(unittest.TestCase):
 
             class _FakeOts(OpenTimestampsClient):
                 def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
-                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                    ht = 880100 + len(hdrs)
+                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=ht)
                     assert root_hex is not None
-                    hdrs[880100] = {"merkle_root": root_hex, "timestamp": "2026-01-06T03:00:00.000Z"}
+                    ts = "2026-01-06T03:00:00.000Z" if len(hdrs) == 0 else "2026-01-07T03:00:00.000Z"
+                    hdrs[ht] = {"merkle_root": root_hex, "timestamp": ts}
                     return ots_b, "https://a.pool.opentimestamps.org"
 
             run_production_cycle(
@@ -1689,7 +1693,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 sleeper=lambda _s: None,
                 expected_prior_head_sha256=seq0_sha,
                 expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
-                bitcoin_merkle_roots=dict(hdrs),
+                bitcoin_merkle_roots=hdrs,
                 trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
             )
             self.assertTrue(r1["appended"])
@@ -3466,12 +3470,12 @@ class Sh2PipelineTest(unittest.TestCase):
             )
             self.assertFalse(res["appended"])
             self.assertTrue(res["fail_closed"])
-            self.assertEqual(res["report"]["consecutive_session_scope"], "clk01_forward_clock")
+            self.assertEqual(res["report"]["consecutive_session_scope"], "production_fail_closed_not_clk01")
 
             rep_disk = json.loads(
                 (root / "reports" / "completeness_2026-01-05.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(rep_disk["consecutive_session_scope"], "clk01_forward_clock")
+            self.assertEqual(rep_disk["consecutive_session_scope"], "production_fail_closed_not_clk01")
 
             prod_cfg = load_production_scheduler_config(unlocked_cfg_path)
             missed = detect_missed_runs(
@@ -3788,9 +3792,11 @@ class Sh2PipelineTest(unittest.TestCase):
 
             class _FakeOts(OpenTimestampsClient):
                 def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
-                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                    ht = 880100 + len(hdrs)
+                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=ht)
                     assert root_hex is not None
-                    hdrs[880100] = {"merkle_root": root_hex, "timestamp": "2026-01-06T03:00:00.000Z"}
+                    ts = "2026-01-06T03:00:00.000Z" if len(hdrs) == 0 else "2026-01-07T03:00:00.000Z"
+                    hdrs[ht] = {"merkle_root": root_hex, "timestamp": ts}
                     return ots_b, "https://a.pool.opentimestamps.org"
 
             # P1 #4: Cloud Run / production mode rejects missing data_dir / SHADOW_DATA_DIR
@@ -3910,6 +3916,205 @@ class Sh2PipelineTest(unittest.TestCase):
                     trusted_head_anchor_path=anchor_path,
                 )
             self.assertIn("production_history_uncreditable", str(rcp_ctx.exception))
+
+    def test_astra_round2_regressions(self) -> None:
+        from shadow.cloudrun_job import _default_session_date
+
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec_v2)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "round2_reg"
+            cfg_path = Path(tmpdir) / "unlocked-prod.json"
+            cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            anchor_path = Path(tmpdir) / "trusted_anchor.json"
+            hdrs: dict[int, dict[str, str]] = {}
+
+            class _FakeOts(OpenTimestampsClient):
+                def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                    ht = 880100 + len(hdrs)
+                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=ht)
+                    assert root_hex is not None
+                    ts = "2026-01-06T03:00:00.000Z" if len(hdrs) == 0 else "2026-01-07T03:00:00.000Z"
+                    hdrs[ht] = {"merkle_root": root_hex, "timestamp": ts}
+                    return ots_b, "https://a.pool.opentimestamps.org"
+
+            # P1 #4: Pending vs verified CLK-01 credit in completeness reports (never 'drill_mode')
+            res_pending = run_production_cycle(
+                session_date="2026-01-05",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-05"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertTrue(res_pending["appended"])
+            rep_pend = res_pending["report"]
+            self.assertEqual(rep_pend["consecutive_session_scope"], "production_appended_pending_credit")
+            self.assertEqual(rep_pend["clk01_credit"]["verified_session_count"], 0)
+            self.assertFalse(rep_pend["receipt"]["creditable"])
+            self.assertEqual(rep_pend["receipt"]["non_creditable_reasons"], ["ots_pending_bitcoin_confirmation"])
+            self.assertNotIn("drill_mode", rep_pend["receipt"]["non_creditable_reasons"])
+
+            # P1 #1: Default repo lock cannot be bypassed with config_path=None + production_chain_locked=False
+            prod_ledger = ShadowLedger(root / "ledger")
+            recs = prod_ledger.load_records()
+            rcps = prod_ledger.load_receipts()
+            ok_def, reasons_def = check_forward_clock_credit(
+                recs,
+                rcps,
+                ledger_dir=prod_ledger.root_dir,
+                bitcoin_merkle_roots=dict(hdrs),
+                calendar_spec=spec_v2,
+                production_chain_locked=False,
+            )
+            self.assertFalse(ok_def)
+            self.assertIn("production_chain_locked", reasons_def)
+
+            # With verified BTC headers on seq=1 + unlocked config, scope becomes clk01_forward_clock_verified
+            res_verified = run_production_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                expected_prior_head_sha256=str(res_pending["record_sha256"]),
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                bitcoin_merkle_roots=hdrs,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertTrue(res_verified["appended"])
+            rep_ver = res_verified["report"]
+            self.assertEqual(rep_ver["consecutive_session_scope"], "clk01_forward_clock_verified")
+            self.assertTrue(rep_ver["clk01_credit"]["creditable"])
+            self.assertEqual(rep_ver["clk01_credit"]["verified_session_count"], 2)
+
+            # P1 #3: Simulate lost detached files after .record.json commit when .pending_evidence exists -> retry recovers
+            seq1_rec = prod_ledger._record_path(1)
+            seq1_env = json.loads(seq1_rec.read_text(encoding="utf-8"))
+            import base64 as _b64
+
+            rcp_obj = json.loads(prod_ledger._receipt_path(1).read_text(encoding="utf-8"))
+            ots_bytes = prod_ledger._ots_path(1).read_bytes()
+            pend_ev = prod_ledger.root_dir / f".pending_evidence_000001_{seq1_env['record_sha256']}.json"
+            pend_ev.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c-sh-pending-evidence-v1",
+                        "sequence": 1,
+                        "record_sha256": seq1_env["record_sha256"],
+                        "ots_b64": _b64.b64encode(ots_bytes).decode("ascii"),
+                        "receipt": rcp_obj,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prod_ledger._receipt_path(1).unlink()
+            prod_ledger._ots_path(1).unlink()
+            res_recover = run_production_cycle(
+                session_date="2026-01-06",
+                data_dir=root,
+                config_path=cfg_path,
+                transport=build_live_mock_transport("2026-01-06"),
+                environ={"TIINGO_API_KEY": "test-dummy-token"},
+                wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                expected_prior_head_sha256=str(res_verified["record_sha256"]),
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                bitcoin_merkle_roots=dict(hdrs),
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(res_recover["reason"], "already_committed_session_preserved")
+            self.assertTrue(prod_ledger._receipt_path(1).is_file())
+            self.assertTrue(prod_ledger._ots_path(1).is_file())
+            self.assertFalse(pend_ev.exists())
+
+        # P1 #2 & P2 #3: Nested fuse_inputs sees ledger-derived O7 heartbeat and unknown interval stays None
+        from shadow.fuse_adapter import build_fuse_validated_inputs
+
+        base_inputs = {
+            "E": "50000",
+            "E_star": "50000",
+            "H": "0",
+            "L": "0",
+            "tier": "balanced",
+            "prior_closes": {"TQQQ": "100", "SOXL": "100", "XNDX": "29400", "SEMI": "8150"},
+            "current_index_closes": {"XNDX": "29500", "SEMI": "8200"},
+            "positions_source_record": {"as_of": "2026-01-06T22:30:00.000Z", "age_sessions": 0},
+            "broker_reconciliation_source_record": {"as_of": "2026-01-06T22:30:00.000Z", "age_sessions": 0},
+            "funds": {
+                "TQQQ": {"s": "1", "close_price": "100", "q_pre": 0, "sigma_forecast": "0.24", "long_run_volatility": "0.24", "modelled_fee": 0.0, "modelled_financing": 0.0},
+                "SOXL": {"s": "1", "close_price": "100", "q_pre": 0, "sigma_forecast": "0.24", "long_run_volatility": "0.24", "modelled_fee": 0.0, "modelled_financing": 0.0},
+            },
+        }
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec_v2)
+        nested_payload = build_fuse_validated_inputs(
+            base_inputs,
+            cal6,
+            policy_hash="dummy",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:30:00.000Z",
+        )
+        for _k in ("last_heartbeat", "heartbeat_source", "scheduled_interval"):
+            nested_payload.pop(_k, None)
+        nested_inputs = {
+            **base_inputs,
+            "fuse_inputs": nested_payload,
+        }
+        built_nested = build_record_body(
+            chain_id="drill-nested-o7",
+            sequence=1,
+            prev_record_sha256="a" * 64,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:30:00.000Z",
+            session_inputs=nested_inputs,
+            calendar_session=cal6,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec_v2,
+            prev_decision_timestamp_utc="2026-01-02T22:30:00.000Z",
+        )
+        o7_nested = {b["id"]: b for b in built_nested["record_body"]["evaluator"]["breakers"]}["O7"]
+        self.assertEqual(o7_nested["state"], "NO-NEW-RISK")
+        self.assertEqual(built_nested["record_body"]["evaluator"]["o7_heartbeat"]["heartbeat_source"], "previous_committed_record")
+
+        built_unk_sched = build_record_body(
+            chain_id="drill-unk-sched",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-06",
+            decision_timestamp_utc="2026-01-06T22:30:00.000Z",
+            session_inputs={**base_inputs, "scheduled_interval": "unknown"},
+            calendar_session=cal6,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec_v2,
+        )
+        self.assertIsNone(built_unk_sched["record_body"]["evaluator"]["o7_heartbeat"]["scheduled_interval_seconds"])
+
+        # P2 #4: Non-UTC tz-aware wall_clock converts to UTC before resolving session_date
+        cfg_drill = load_scheduler_config(_REPO_ROOT / "config" / "drill-scheduler.json")
+        ny_dt = datetime(2026, 1, 5, 17, 30, tzinfo=_NY_TZ)
+        self.assertEqual(_default_session_date(cfg=cfg_drill, now_utc=ny_dt), "2026-01-05")
 
 
 if __name__ == "__main__":
