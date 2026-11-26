@@ -1885,9 +1885,10 @@ class FuseAdapterTest(unittest.TestCase):
         si_tier["market_records"] = [
             {
                 "instrument": inst,
-                "normalized_value": 50.0,
+                "normalized_value": {"SOXL": 40.0}.get(inst, 50.0),
                 "calendar_spec_digest": str(cal6["spec_digest"]),
-                "effective_session": "2026-01-06",
+                "effective_session": "2026-01-05" if inst == "SOFR" else "2026-01-06",
+                "retrieval_time_utc": "2026-01-06T21:30:00.000Z",
                 "eligibility": {"eligible": True},
             }
             for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
@@ -1947,9 +1948,10 @@ class FuseAdapterTest(unittest.TestCase):
         si_base["market_records"] = [
             {
                 "instrument": inst,
-                "normalized_value": 50.0,
+                "normalized_value": {"SOXL": 40.0}.get(inst, 50.0),
                 "calendar_spec_digest": str(cal6["spec_digest"]),
-                "effective_session": "2026-01-06",
+                "effective_session": "2026-01-05" if inst == "SOFR" else "2026-01-06",
+                "retrieval_time_utc": "2026-01-06T21:30:00.000Z",
                 "eligibility": {"eligible": True},
             }
             for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
