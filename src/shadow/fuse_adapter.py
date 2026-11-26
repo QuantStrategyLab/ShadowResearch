@@ -222,7 +222,10 @@ def _verify_pyc_matches_source(
         raise EngineIdentityError(f"Unexpected .pyc co_filename in vendored engine: {rel!r}")
 
     expected_code = compile(src_bytes, pyc_code.co_filename, "exec", dont_inherit=True, optimize=optimize)
-    if marshal.dumps(pyc_code) != marshal.dumps(expected_code):
+    # Compare code objects structurally (bytecode, constants incl. nested code, names, flags,
+    # line/exception tables); marshal byte encoding of shared references differs across
+    # py_compile and in-process compile() on some CPython versions.
+    if pyc_code != expected_code:
         raise EngineIdentityError(f"Tampered .pyc bytecode mismatch in vendored engine: {rel!r}")
 
 
@@ -1393,8 +1396,12 @@ def build_fuse_validated_inputs(
         "settled_cash": (
             _finite_number(session_inputs["settled_cash"])
             if session_inputs.get("settled_cash") is not None
+            else None
+            if "settled_cash" in session_inputs
             else _finite_number(session_inputs["o5_settled_cash"])
             if session_inputs.get("o5_settled_cash") is not None
+            else None
+            if "o5_settled_cash" in session_inputs
             else bankroll_val
         ),
         "loaded_policy_hash": str(session_inputs.get("loaded_policy_hash", policy_hash)),

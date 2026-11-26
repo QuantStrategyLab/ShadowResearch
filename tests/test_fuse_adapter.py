@@ -877,14 +877,25 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertTrue(rows_stale_cal["O1"]["would_have_tripped"])
 
     def test_valid_compiled_pycache_is_accepted_without_inherited_future_flags(self) -> None:
+        import marshal
         import py_compile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             copy_dir = Path(tmpdir) / "vendor"
             shutil.copytree(DEFAULT_VENDOR_ENGINE_ROOT, copy_dir)
             src = copy_dir / "fuse_engine" / "__init__.py"
-            py_compile.compile(str(src), cfile=importlib.util.cache_from_source(str(src)), doraise=True)
+            pyc_path = Path(importlib.util.cache_from_source(str(src)))
+            py_compile.compile(str(src), cfile=str(pyc_path), doraise=True)
             verify_vendored_engine_bundle(copy_dir)
+
+            # Same-size bytecode for altered source (changed docstring constant) is still rejected.
+            src_bytes = src.read_bytes()
+            altered = src_bytes.replace(b"FUSE-1 reference engine", b"FUSE-X reference engine", 1)
+            self.assertNotEqual(altered, src_bytes)
+            header = pyc_path.read_bytes()[:16]
+            pyc_path.write_bytes(header + marshal.dumps(compile(altered, str(src), "exec", dont_inherit=True)))
+            with self.assertRaises(EngineIdentityError):
+                verify_vendored_engine_bundle(copy_dir)
 
     def test_o5_settled_cash_alias_and_missing_v7_session_time_are_not_defaulted(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
@@ -930,6 +941,14 @@ class FuseAdapterTest(unittest.TestCase):
         rows_no_cash = _rows(si_no_cash)
         self.assertTrue(rows_no_cash["O5"]["would_have_tripped"])
         self.assertEqual(rows_no_cash["O5"]["reason"], "pre_trade_limit_violation")
+
+        for null_key in ("settled_cash", "o5_settled_cash"):
+            si_null_cash = _valid_inputs()
+            si_null_cash.update(o5_order)
+            si_null_cash[null_key] = None
+            rows_null_cash = _rows(si_null_cash)
+            self.assertTrue(rows_null_cash["O5"]["would_have_tripped"], null_key)
+            self.assertEqual(rows_null_cash["O5"]["reason"], "pre_trade_limit_violation", null_key)
 
         v7_obs = {"quote_staleness": 0.0, "spread_width": 0.001, "trading_pause": False}
         si_v7_regular = _valid_inputs()
