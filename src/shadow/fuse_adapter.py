@@ -1247,6 +1247,11 @@ def build_fuse_validated_inputs(
         else:
             idx_ret_val = None
 
+        # Stage N (SH-2) has no broker connection and no independent broker evidence in any
+        # mode. When broker_* observations are absent they are substituted with the modelled
+        # q_pre / position value / bankroll, so O3 here is a documented model
+        # self-reconciliation, NOT independent reconciliation evidence. Once SUPPLY-B supplies
+        # broker evidence, missing broker_* observations must fail closed (tracked follow-up).
         broker_pos_val = (
             _resolve_tier_quantity(fdata.get("broker_position"), tier)
             if "broker_position" in fdata and fdata.get("broker_position") is not None
@@ -1369,6 +1374,8 @@ def build_fuse_validated_inputs(
         "source_records": source_records,
         "session_calendar_status": cal_status,
         "exchange_status": exch_status,
+        # Stage N model self-reconciliation (see broker_position above): absent cash
+        # observations default to the bankroll; O3 is not independently evaluated in SH-2.
         "positions_cash": _finite_number(session_inputs.get("positions_cash")) if session_inputs.get("positions_cash") is not None else bankroll_val,
         "broker_cash": _finite_number(session_inputs.get("broker_cash")) if session_inputs.get("broker_cash") is not None else bankroll_val,
         "reconciliation_tolerance": _finite_number(session_inputs.get("reconciliation_tolerance")) if session_inputs.get("reconciliation_tolerance") is not None else 1.0,
