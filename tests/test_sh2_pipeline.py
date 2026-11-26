@@ -2769,6 +2769,7 @@ class Sh2PipelineTest(unittest.TestCase):
             evaluator=ev,
             prior_row_state=committed_state,
             calendar_spec=spec_v2,
+            prev_decision_timestamp_utc=b0["record_body"]["decision_timestamp_utc"],
         )
         self.assertFalse(b1_rej["appended"])
         self.assertEqual(b1_rej["o4_resolved_symbols"], ["TQQQ"])
@@ -2944,6 +2945,7 @@ class Sh2PipelineTest(unittest.TestCase):
             evaluator=ev,
             prior_row_state=committed_state,
             calendar_spec=spec_v2,
+            prev_decision_timestamp_utc=b0["record_body"]["decision_timestamp_utc"],
         )
         self.assertFalse(b1_rej["appended"])
         self.assertEqual(b1_rej["next_row_state"].get("L4", {}), {})
@@ -3012,6 +3014,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 evaluator=ev,
                 prior_row_state=loaded_state,
                 calendar_spec=spec_v2,
+                prev_decision_timestamp_utc=b0["record_body"]["decision_timestamp_utc"],
             )
             self.assertTrue(b1_ok["appended"])
             self.assertFalse(bool(b1_ok["next_row_state"].get("L4", {}).get("latched")))
@@ -3608,6 +3611,134 @@ class Sh2PipelineTest(unittest.TestCase):
             pending_path = ddir / "state_snapshots" / "pending_rejected_state.json"
             self.assertTrue(pending_path.is_file())
             self.assertEqual(ShadowLedger(ddir / "ledger").load_records(), [])
+
+    def test_o7_heartbeat_genesis_normal_weekend_and_stale_replay(self) -> None:
+        """Issue #13: ledger supplies genesis bootstrap, previous_committed_record, and calendar interval."""
+        drill_cfg = _sh2_drill_cfg()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "o7_hb"
+            f_fri = Path(tmpdir) / "f_fri"
+            f_mon = Path(tmpdir) / "f_mon"
+            f_thu = Path(tmpdir) / "f_thu"
+            _build_session_fixture_files(f_fri, "2026-01-09")
+            _build_session_fixture_files(f_mon, "2026-01-12")
+            _build_session_fixture_files(f_thu, "2026-01-15")
+
+            # seq=0 (genesis): genesis_bootstrap anchored to close_utc (not as_of), O7 NORMAL
+            r0 = run_daily_drill_cycle(
+                session_date="2026-01-09",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f_fri,
+                wall_clock=lambda: datetime(2026, 1, 9, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r0["appended"])
+            recs0 = ShadowLedger(root / "ledger").load_records()
+            ev0 = recs0[-1]["record_body"]["evaluator"]
+            self.assertEqual(ev0["heartbeat_source"], "genesis_bootstrap")
+            self.assertEqual(ev0["o7_heartbeat"]["last_heartbeat"], "2026-01-09T21:00:00.000Z")
+            self.assertNotEqual(ev0["o7_heartbeat"]["last_heartbeat"], recs0[-1]["record_body"]["decision_timestamp_utc"])
+            o7_0 = {b["id"]: b for b in ev0["breakers"]}["O7"]
+            self.assertEqual(o7_0["state"], "NORMAL")
+            self.assertFalse(o7_0["would_have_tripped"])
+
+            # seq=1 (next trading day across weekend, Mon 2026-01-12): previous_committed_record, O7 NORMAL
+            r1 = run_daily_drill_cycle(
+                session_date="2026-01-12",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f_mon,
+                wall_clock=lambda: datetime(2026, 1, 12, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r1["appended"])
+            recs1 = ShadowLedger(root / "ledger").load_records()
+            ev1 = recs1[-1]["record_body"]["evaluator"]
+            self.assertEqual(ev1["heartbeat_source"], "previous_committed_record")
+            self.assertEqual(ev1["o7_heartbeat"]["last_heartbeat"], recs0[-1]["record_body"]["decision_timestamp_utc"])
+            self.assertEqual(ev1["o7_heartbeat"]["scheduled_interval_seconds"], "266400")
+            o7_1 = {b["id"]: b for b in ev1["breakers"]}["O7"]
+            self.assertEqual(o7_1["state"], "NORMAL")
+            self.assertFalse(o7_1["would_have_tripped"])
+
+            # seq=2 (Thu 2026-01-15, skipped Tue & Wed -> > 2 scheduled intervals old): trips O7 NO-NEW-RISK
+            r2 = run_daily_drill_cycle(
+                session_date="2026-01-15",
+                data_dir=root,
+                config=drill_cfg,
+                fixtures_dir=f_thu,
+                wall_clock=lambda: datetime(2026, 1, 15, 22, 30, tzinfo=timezone.utc),
+            )
+            self.assertTrue(r2["appended"])
+            recs2 = ShadowLedger(root / "ledger").load_records()
+            ev2 = recs2[-1]["record_body"]["evaluator"]
+            self.assertEqual(ev2["heartbeat_source"], "previous_committed_record")
+            self.assertEqual(ev2["o7_heartbeat"]["scheduled_interval_seconds"], "93600")
+            o7_2 = {b["id"]: b for b in ev2["breakers"]}["O7"]
+            self.assertEqual(o7_2["state"], "NO-NEW-RISK")
+            self.assertTrue(o7_2["would_have_tripped"])
+            self.assertEqual(o7_2["reason"], "dead_mans_switch")
+
+            rep = replay_window(root / "replay", root / "ledger")
+            self.assertTrue(rep["bit_for_bit_match"], rep["mismatches"])
+
+    def test_l0_two_pass_evaluates_actual_sized_proposal(self) -> None:
+        """L0 two-pass re-evaluates L0 against post-sizing exposure (q_pre + delta_q_exec)."""
+        spec_v2 = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal = resolve_session("XNYS", "2026-01-05", spec=spec_v2)
+        code_sha = compute_code_manifest_hash(_REPO_ROOT, calendar_version="csa22-v2")
+        ev = VendoredFuseEvaluator()
+
+        # Case 1: q_pre starts above balanced x_ML(0) * E (30% of 50000 = 15000),
+        # while sizing reduces q_ideal + delta_q_exec below 15000.
+        # Pass 1 saw proposed_exposure = joint_exposure = 20000 (>15000); Pass 2 sees sized proposal <= 15000.
+        inp_reduce = {
+            "E": "50000",
+            "E_star": "50000",
+            "H": "0",
+            "L": "0",
+            "tier": "balanced",
+            "prior_closes": {"TQQQ": "100", "SOXL": "100", "XNDX": "29400", "SEMI": "8150"},
+            "current_index_closes": {"XNDX": "29500", "SEMI": "8200"},
+            "positions_source_record": {"as_of": "2026-01-05T22:30:00.000Z", "age_sessions": 0},
+            "broker_reconciliation_source_record": {"as_of": "2026-01-05T22:30:00.000Z", "age_sessions": 0},
+            "funds": {
+                "TQQQ": {
+                    "s": "1",
+                    "close_price": "100",
+                    "q_pre": 200,
+                    "sigma_forecast": "0.24",
+                    "long_run_volatility": "0.24",
+                    "modelled_fee": 0.0,
+                    "modelled_financing": 0.0,
+                },
+                "SOXL": {
+                    "s": "1",
+                    "close_price": "100",
+                    "q_pre": 0,
+                    "sigma_forecast": "0.24",
+                    "long_run_volatility": "0.24",
+                    "modelled_fee": 0.0,
+                    "modelled_financing": 0.0,
+                },
+            },
+        }
+        built = build_record_body(
+            chain_id="drill-l0-twopass",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:30:00.000Z",
+            session_inputs=inp_reduce,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built["appended"])
+        l0 = {b["id"]: b for b in built["record_body"]["evaluator"]["breakers"]}["L0"]
+        self.assertTrue(l0["outputs"]["cap_breached"])
+        self.assertFalse(l0["outputs"]["increases_blocked"])
 
 
 if __name__ == "__main__":

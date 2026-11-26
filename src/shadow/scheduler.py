@@ -70,6 +70,7 @@ from shadow.ledger import (
     compute_inputs_digest,
     compute_pending_rejected_state_sha256,
     compute_session_commitment_deadline_utc,
+    derive_o7_heartbeat_inputs,
     evaluate_non_stub_tiers,
     has_committed_detached_evidence,
     is_receipt_timely,
@@ -2450,6 +2451,11 @@ def _reconcile_committed_state_snapshot_if_missing(
 
     ev = VendoredFuseEvaluator()
     ex_cal = cal if str(cal.get("date", "")) == ex_sess_date else resolve_session(cfg.venue, ex_sess_date, spec=spec)
+    ex_prev_decision_utc = (
+        str(prior_records[ex_seq - 1]["record_body"]["decision_timestamp_utc"])
+        if ex_seq > 0
+        else None
+    )
     rebuilt = build_record_body(
         chain_id=cfg.chain_id,
         sequence=ex_seq,
@@ -2466,6 +2472,7 @@ def _reconcile_committed_state_snapshot_if_missing(
         market_records_digest=sess_entry.get("market_records_digest"),
         runtime_config=bundle_obj.get("runtime_config"),
         calendar_spec=spec,
+        prev_decision_timestamp_utc=ex_prev_decision_utc,
     )
     if not rebuilt.get("appended") or sha256_canonical(rebuilt["record_body"]) != existing_env["record_sha256"]:
         raise ValueError(f"snapshot_recovery_record_hash_mismatch:seq={ex_seq}")
@@ -3958,6 +3965,23 @@ def _run_daily_drill_cycle_locked(
             )
             o4_resolved: list[str] = []
         else:
+            prev_decision_utc = (
+                str(head_env["record_body"]["decision_timestamp_utc"])
+                if head_env is not None
+                else None
+            )
+            hb_eval = derive_o7_heartbeat_inputs(
+                sequence=seq,
+                session_date=session_date,
+                calendar_session=cal,
+                prev_decision_timestamp_utc=prev_decision_utc,
+                session_inputs=eval_inputs,
+                runtime_config=eff_cfg,
+                calendar_spec=spec,
+            )
+            eval_inputs["last_heartbeat"] = hb_eval["last_heartbeat"]
+            eval_inputs["heartbeat_source"] = hb_eval["heartbeat_source"]
+            eval_inputs["scheduled_interval"] = hb_eval["scheduled_interval"]
             tiered_eval = evaluate_non_stub_tiers(
                 evaluator=ev,
                 session_inputs=eval_inputs,
@@ -4016,6 +4040,11 @@ def _run_daily_drill_cycle_locked(
                     "forward_clock_credit_eligible": False,
                 }
             )
+            prev_decision_utc = (
+                str(head_env["record_body"]["decision_timestamp_utc"])
+                if head_env is not None
+                else None
+            )
             built = build_record_body(
                 chain_id=cfg.chain_id,
                 sequence=seq,
@@ -4032,6 +4061,7 @@ def _run_daily_drill_cycle_locked(
                 market_records_digest=mkt_digest,
                 runtime_config=eff_cfg,
                 calendar_spec=spec,
+                prev_decision_timestamp_utc=prev_decision_utc,
             )
 
     def _persist_pending_rejected_state() -> str | None:

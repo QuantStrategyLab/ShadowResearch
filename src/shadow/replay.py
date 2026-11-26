@@ -313,6 +313,7 @@ def replay_window(
 
     prior_state: dict = {}
     prev_session_date: str | None = None
+    prev_decision_utc: str | None = None
     prev_hash = GENESIS_PREV_HASH
     mismatches: list[str] = []
     archive_errors: list[str] = []
@@ -545,6 +546,7 @@ def replay_window(
             market_records_digest=computed_mkt_digest,
             runtime_config=bundle.get("runtime_config"),
             calendar_spec=spec,
+            prev_decision_timestamp_utc=prev_decision_utc,
         )
         if not res["appended"]:
             mismatches.append(f"seq_{seq}:unexpected_fail_closed")
@@ -570,6 +572,7 @@ def replay_window(
 
         prior_state = res["next_row_state"]
         prev_session_date = sess["session_date"]
+        prev_decision_utc = str(replayed_body["decision_timestamp_utc"])
         prev_hash = replayed_hash
 
     archived_inputs_ok = (len(archive_errors) == 0) if any_requires_market_records else False

@@ -14,11 +14,17 @@ import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
+from shadow.calendar_consumer import (
+    DEFAULT_SPEC_DIR,
+    load_spec,
+    resolve_previous_trading_date,
+    resolve_session,
+)
 from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator, StubProductionForbiddenError
 from shadow.fuse_adapter import (
     EngineIdentityError,
@@ -718,6 +724,105 @@ def _extract_o4_resolved_symbols(
     return sorted(resolved)
 
 
+def _parse_utc_instant(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    txt = raw.strip()
+    iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
+    try:
+        dt = datetime.fromisoformat(iso_norm)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
+
+
+def _resolve_spec_for_heartbeat(
+    calendar_session: Mapping[str, object],
+    calendar_spec: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    if isinstance(calendar_spec, Mapping) and isinstance(calendar_spec.get("rules"), Mapping):
+        return calendar_spec
+    cal_ver = calendar_session.get("calendar_version")
+    if isinstance(cal_ver, str) and cal_ver.strip():
+        spec_dir = _SPECS_ROOT / cal_ver.strip()
+        if spec_dir.is_dir():
+            try:
+                return load_spec(spec_dir)
+            except Exception:
+                return None
+    return None
+
+
+def derive_o7_heartbeat_inputs(
+    *,
+    sequence: int,
+    session_date: str,
+    calendar_session: Mapping[str, object],
+    prev_decision_timestamp_utc: str | None = None,
+    session_inputs: Mapping[str, object] | None = None,
+    runtime_config: Mapping[str, object] | None = None,
+    calendar_spec: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Derive deterministic O7 heartbeat inputs from committed history and pinned calendar."""
+    inputs = session_inputs if isinstance(session_inputs, Mapping) else {}
+
+    if "scheduled_interval" in inputs:
+        sched_interval = inputs["scheduled_interval"]
+    else:
+        venue = str(calendar_session.get("exchange") or "XNYS")
+        is_half_day = calendar_session.get("session_state") == "half_day"
+        cutoff_dt: datetime | None = None
+        if isinstance(runtime_config, Mapping):
+            cutoff_key = "decision_cutoff_half_day_et" if is_half_day else "decision_cutoff_et"
+            cutoff_raw = runtime_config.get(cutoff_key)
+            if isinstance(cutoff_raw, str) and _STRICT_HHMM_RE.fullmatch(cutoff_raw):
+                hh, mm = map(int, cutoff_raw.split(":"))
+                try:
+                    cutoff_dt = datetime.combine(
+                        date.fromisoformat(session_date), dt_time(hh, mm), tzinfo=_NY_TZ
+                    ).astimezone(timezone.utc)
+                except ValueError:
+                    cutoff_dt = None
+        if cutoff_dt is None:
+            cutoff_dt = _parse_utc_instant(calendar_session.get("order_cutoff_utc"))
+        cur_close_dt = _parse_utc_instant(calendar_session.get("close_utc"))
+        if cutoff_dt is None and cur_close_dt is not None:
+            cutoff_dt = cur_close_dt + timedelta(hours=2)
+
+        sched_interval = 93600.0
+        spec_obj = _resolve_spec_for_heartbeat(calendar_session, calendar_spec)
+        if spec_obj is not None and cutoff_dt is not None:
+            prev_td = resolve_previous_trading_date(dict(spec_obj), venue, session_date)
+            if prev_td is not None:
+                prev_cal = resolve_session(venue, prev_td, spec=dict(spec_obj))
+                prev_close_dt = _parse_utc_instant(prev_cal.get("close_utc"))
+                if prev_close_dt is not None:
+                    gap = (cutoff_dt - prev_close_dt).total_seconds()
+                    if gap > 0.0:
+                        sched_interval = max(3600.0, float(gap))
+        elif cutoff_dt is not None and cur_close_dt is not None:
+            sched_interval = max(93600.0, float((cutoff_dt - cur_close_dt).total_seconds()))
+
+    if "last_heartbeat" in inputs:
+        last_hb = copy.deepcopy(inputs["last_heartbeat"])
+        hb_source = str(inputs.get("heartbeat_source") or "caller")
+    elif sequence == 0:
+        # Documented genesis bootstrap rule: anchor to genesis session official close (never as_of).
+        last_hb = calendar_session.get("close_utc")
+        hb_source = "genesis_bootstrap"
+    else:
+        last_hb = prev_decision_timestamp_utc
+        hb_source = "previous_committed_record"
+
+    return {
+        "last_heartbeat": last_hb,
+        "heartbeat_source": hb_source,
+        "scheduled_interval": sched_interval,
+    }
+
+
 def evaluate_non_stub_tiers(
     *,
     evaluator: object,
@@ -728,6 +833,7 @@ def evaluate_non_stub_tiers(
     decision_timestamp_utc: str,
     prior_row_state: Mapping[str, Any] | None,
     authorized_events: object | None = None,
+    proposed_exposure_by_tier: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate all 3 sizing tiers with vendored FUSE-1 while preserving the primary tier's outputs."""
     primary_tier = str(session_inputs.get("tier") or "balanced")
@@ -750,6 +856,8 @@ def evaluate_non_stub_tiers(
     for tier_id in tiers_to_eval:
         tier_inputs = dict(session_inputs)
         tier_inputs["tier"] = tier_id
+        if proposed_exposure_by_tier is not None and tier_id in proposed_exposure_by_tier:
+            tier_inputs["proposed_exposure"] = proposed_exposure_by_tier[tier_id]
         if (
             tier_id != primary_tier
             and primary_tier_change is not None
@@ -825,6 +933,7 @@ def build_record_body(
     market_records_digest: str | None = None,
     runtime_config: dict[str, object] | None = None,
     calendar_spec: dict[str, object] | None = None,
+    prev_decision_timestamp_utc: str | None = None,
 ) -> dict:
     """Run evaluator + sizing and assemble a canonical record_body (or O1/O2 fail-closed dict)."""
     ev = evaluator if evaluator is not None else StubEvaluator()
@@ -842,6 +951,8 @@ def build_record_body(
     rows_by_tier: dict[str, dict] | None = None
     eff_scope_by_tier: dict[str, dict[str, str]] | None = None
     o4_resolved_symbols: list[str] = []
+    hb_info: dict[str, object] | None = None
+    eval_session_inputs = dict(session_inputs)
 
     if is_stub_evaluator(ev):
         eval_inputs = dict(session_inputs)
@@ -860,15 +971,27 @@ def build_record_body(
             authorized_events=auth_events,
         )
     else:
+        hb_info = derive_o7_heartbeat_inputs(
+            sequence=sequence,
+            session_date=session_date,
+            calendar_session=calendar_session,
+            prev_decision_timestamp_utc=prev_decision_timestamp_utc,
+            session_inputs=eval_session_inputs,
+            runtime_config=runtime_config,
+            calendar_spec=calendar_spec,
+        )
+        eval_session_inputs["last_heartbeat"] = hb_info["last_heartbeat"]
+        eval_session_inputs["heartbeat_source"] = hb_info["heartbeat_source"]
+        eval_session_inputs["scheduled_interval"] = hb_info["scheduled_interval"]
         tiered_eval = evaluate_non_stub_tiers(
             evaluator=ev,
-            session_inputs=session_inputs,
+            session_inputs=eval_session_inputs,
             calendar_session=calendar_session,
             policy_hash=p_hash,
             session_date=session_date,
             decision_timestamp_utc=decision_timestamp_utc,
             prior_row_state=prior,
-            authorized_events=session_inputs.get("authorized_events"),
+            authorized_events=eval_session_inputs.get("authorized_events"),
         )
         rows_by_id = tiered_eval["rows_by_id"]
         eff_scope = tiered_eval["effective_state_by_scope"]
@@ -910,6 +1033,36 @@ def build_record_body(
         fund_control_states=fund_states,
         tier_control_states=tier_control_states,
     )
+
+    if not is_stub_evaluator(ev) and "proposed_exposure" not in eval_session_inputs:
+        funds_in = eval_session_inputs.get("funds", {})
+        proposed_by_tier: dict[str, float] = {}
+        for t_dec in sizing_res["tiers"]:
+            tier_id = str(t_dec["tier_id"])
+            total_prop = Decimal("0")
+            for f_dec in t_dec["funds"]:
+                inst = str(f_dec["instrument"])
+                q_after = int(f_dec["q_pre"]) + int(f_dec["delta_q_exec"])
+                px_dec = Decimal(str(funds_in[inst]["close_price"]))
+                total_prop += Decimal(q_after) * px_dec
+            proposed_by_tier[tier_id] = float(total_prop)
+        tiered_eval_p2 = evaluate_non_stub_tiers(
+            evaluator=ev,
+            session_inputs=eval_session_inputs,
+            calendar_session=calendar_session,
+            policy_hash=p_hash,
+            session_date=session_date,
+            decision_timestamp_utc=decision_timestamp_utc,
+            prior_row_state=prior,
+            authorized_events=eval_session_inputs.get("authorized_events"),
+            proposed_exposure_by_tier=proposed_by_tier,
+        )
+        rows_by_id = tiered_eval_p2["rows_by_id"]
+        eff_scope = tiered_eval_p2["effective_state_by_scope"]
+        next_state = tiered_eval_p2["next_row_state"]
+        rows_by_tier = tiered_eval_p2["rows_by_tier"]
+        eff_scope_by_tier = tiered_eval_p2["eff_scope_by_tier"]
+        o4_resolved_symbols = tiered_eval_p2["o4_resolved_symbols"]
 
     inputs_digest = compute_inputs_digest(
         session_inputs,
@@ -957,6 +1110,19 @@ def build_record_body(
         evaluator_block["next_row_state_sha256"] = _sha256_canonical_state_dict(
             next_state if isinstance(next_state, dict) else {}
         )
+        if hb_info is not None:
+            raw_sched = hb_info["scheduled_interval"]
+            sched_str = (
+                canonical_decimal_str(Decimal(str(raw_sched)))
+                if raw_sched is not None and not isinstance(raw_sched, bool)
+                else None
+            )
+            evaluator_block["heartbeat_source"] = hb_info["heartbeat_source"]
+            evaluator_block["o7_heartbeat"] = {
+                "heartbeat_source": hb_info["heartbeat_source"],
+                "last_heartbeat": hb_info["last_heartbeat"],
+                "scheduled_interval_seconds": sched_str,
+            }
 
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
