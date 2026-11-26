@@ -798,6 +798,17 @@ def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
 _CA_UNDATED = object()
 
 
+def _finite_decimal(raw: object) -> Decimal | None:
+    """Value-compare helper: finite Decimal of a numeric/str observation, else None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        dec = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+    except Exception:
+        return None
+    return dec if dec.is_finite() else None
+
+
 def _ca_identity(ca: object) -> tuple[object, ...] | None:
     """Identity of a corporate action for comparing two reported events."""
     if not isinstance(ca, Mapping):
@@ -1465,10 +1476,10 @@ def build_fuse_validated_inputs(
         if symbol in by_inst and symbol not in bad_market_insts and not bad_market_payload:
             mkt_close = by_inst[symbol].get("normalized_value")
             close_for_return = mkt_close
+            caller_close_dec = _finite_decimal(fdata.get("close_price"))
+            mkt_close_dec = _finite_decimal(mkt_close)
             if fdata.get("close_price") is not None and (
-                _sizing_decimal(fdata.get("close_price")) is None
-                or _sizing_decimal(mkt_close) is None
-                or _sizing_decimal(fdata.get("close_price")) != _sizing_decimal(mkt_close)
+                caller_close_dec is None or mkt_close_dec is None or caller_close_dec != mkt_close_dec
             ):
                 close_mismatch = True
                 mkt_ok = False
