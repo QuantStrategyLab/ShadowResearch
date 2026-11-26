@@ -146,6 +146,44 @@ class CalendarConsumerTest(unittest.TestCase):
         self.assertEqual(classify_us_equity_session_window("2025-11-25T06:00:00.000Z", mon_sess), "next_trade_date_window")
         self.assertEqual(classify_us_equity_session_window("2025-11-25T02:15:00.000Z", mon_sess), "extended_overnight_open")
 
+    def test_full_2027_csa22_v3_vectors_and_boundaries(self) -> None:
+        spec_v3_dir = REPO_ROOT / "specs" / "csa22-v3"
+        spec_v3 = load_spec(spec_v3_dir)
+        expected_doc = json.loads((spec_v3_dir / "expected-2027.json").read_text(encoding="utf-8"))
+        sessions = expected_doc["sessions"]
+        self.assertEqual(len(sessions), 365)
+        self.assertEqual(spec_v3["rules"]["calendar_version"], "csa22-v3")
+
+        for trade_date, expected in sessions.items():
+            actual = resolve_session("XNYS", trade_date, spec=spec_v3)
+            self.assertEqual(actual, expected, msg=f"mismatch on {trade_date}")
+
+        # Observed weekend holidays & full Christmas observed holiday on 2027-12-24
+        for hol_date in ("2027-06-18", "2027-07-05", "2027-12-24"):
+            hol = resolve_session("XNYS", hol_date, spec=spec_v3)
+            self.assertEqual(hol["session_state"], "closed", hol_date)
+            self.assertFalse(hol["is_trading_day"], hol_date)
+
+        # Single 2027 early close: Day After Thanksgiving (2027-11-26) 13:00 EST -> 18:00Z
+        half = resolve_session("XNYS", "2027-11-26", spec=spec_v3)
+        self.assertEqual(half["session_state"], "half_day")
+        self.assertEqual(half["close_local"], "13:00")
+        self.assertEqual(half["close_utc"], "2027-11-26T18:00:00.000Z")
+
+        # 2027 DST transitions: Sun 2027-03-14 spring, Sun 2027-11-07 fall
+        self.assertFalse(resolve_session("XNYS", "2027-03-12", spec=spec_v3)["is_dst"])
+        mon_edt = resolve_session("XNYS", "2027-03-15", spec=spec_v3)
+        self.assertTrue(mon_edt["is_dst"])
+        self.assertEqual(mon_edt["close_utc"], "2027-03-15T20:00:00.000Z")
+        self.assertTrue(resolve_session("XNYS", "2027-11-05", spec=spec_v3)["is_dst"])
+        mon_est = resolve_session("XNYS", "2027-11-08", spec=spec_v3)
+        self.assertFalse(mon_est["is_dst"])
+        self.assertEqual(mon_est["close_utc"], "2027-11-08T21:00:00.000Z")
+
+        # Out-of-range checks
+        self.assertEqual(resolve_session("XNYS", "2026-12-31", spec=spec_v3)["reason"], "out_of_range")
+        self.assertEqual(resolve_session("XNYS", "2028-01-01", spec=spec_v3)["reason"], "out_of_range")
+
 
 if __name__ == "__main__":
     unittest.main()
