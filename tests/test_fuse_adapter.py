@@ -1191,8 +1191,11 @@ class FuseAdapterTest(unittest.TestCase):
             "hwm_adjusted": True,
         }
         ca_in["funds"]["TQQQ"]["hwm_adjusted"] = True
-        self.assertIsNone(_vin(ca_in)["funds"]["TQQQ"]["fund_return"])
-        self.assertTrue(_rows(ca_in)["O1"]["would_have_tripped"])
+        # P1(r3)-1: rejected before any successor state (V2 never sees only one of the two).
+        from shadow.fuse_adapter import CorporateActionConflictError
+
+        with self.assertRaises(CorporateActionConflictError):
+            _vin(ca_in)
         same_ca = _mkt_inputs(
             _records(sd, TQQQ={"corporate_action": {"split_ratio": "2", "cash_per_share_usd": "0", "ex_date": sd}})
         )
@@ -1294,6 +1297,55 @@ class FuseAdapterTest(unittest.TestCase):
             None, policy_hash="p", session_date=sd, as_of=as_of,
         )
         self.assertNotIn("max_loss_cap", retier_no_hwm)
+
+        # P1(r3)-2: current_index_closes never overwrites a validated record; disagreement fails closed.
+        idx_in = _mkt_inputs(_records(sd, XNDX={"normalized_value": "17800"}))
+        self.assertAlmostEqual(_vin(idx_in)["index_one_session_returns"]["NDX"], -0.11)
+        idx_in["current_index_closes"] = {"XNDX": "20000"}
+        vin_idx = _vin(idx_in)
+        self.assertNotIn("NDX", vin_idx["index_one_session_returns"] or {})
+        self.assertTrue(_rows(idx_in)["O1"]["would_have_tripped"])
+        # With no record for an (optional) index, the override supplies its close.
+        idx_no_rec = _mkt_inputs(_records(sd))
+        idx_no_rec["current_index_closes"] = {"SPX": "90"}
+        self.assertAlmostEqual(_vin(idx_no_rec)["index_one_session_returns"]["SPX"], -0.1)
+        # A missing REQUIRED record is not replaced by an override (fails closed).
+        idx_req_missing = _mkt_inputs([r for r in _records(sd) if r["instrument"] != "SEMI"])
+        idx_req_missing["current_index_closes"] = {"SEMI": "4500"}
+        self.assertNotIn("SEMI", _vin(idx_req_missing)["index_one_session_returns"] or {})
+
+        # P1(r3)-3: a held fund with an unknown close has unknown ledger/broker values (no invented 0).
+        si_noclose = _valid_inputs()
+        si_noclose["funds"]["TQQQ"].pop("close_price")
+        vin_noclose = _vin(si_noclose)
+        for key in ("ledger_value", "broker_value", "exposure"):
+            self.assertIsNone(vin_noclose["funds"]["TQQQ"][key], key)
+        self.assertIsNone(vin_noclose["joint_exposure"])
+        self.assertTrue(_rows(si_noclose)["O3"]["would_have_tripped"])
+        si_flat = _valid_inputs()
+        si_flat["funds"]["TQQQ"].pop("close_price")
+        si_flat["funds"]["TQQQ"]["q_pre"] = 0
+        self.assertEqual(_vin(si_flat)["funds"]["TQQQ"]["ledger_value"], 0.0)
+
+        # P1(r3)-4: kill_switch_tripped is rejected at the evaluator boundary on the effective payload.
+        nested = _valid_inputs()
+        nested["fuse_inputs"] = dict(_vin(_valid_inputs()), kill_switch_tripped=True)
+        with self.assertRaisesRegex(ValueError, "authorized_events"):
+            ev.evaluate(ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", _vin(nested), {}, None)
+
+        # P1(r3)-5: caller source records dated after as_of are dropped, so O1 fails closed.
+        for rec_key in ("positions_source_record", "broker_reconciliation_source_record"):
+            si_future = _valid_inputs()
+            si_future[rec_key] = {"as_of": "2026-01-07T22:00:00.000Z", "age_sessions": 0}
+            self.assertTrue(_rows(si_future)["O1"]["would_have_tripped"], rec_key)
+
+        # P1(r3)-6: retrieval timestamps compare as aware instants, not strings.
+        offset_ok = _records(sd, TQQQ={"retrieval_time_utc": "2026-01-06T16:30:00-05:00"})
+        self.assertEqual(_vin(_mkt_inputs(offset_ok))["funds"]["TQQQ"]["fund_return"], 0.0)
+        offset_late = _records(sd, TQQQ={"retrieval_time_utc": "2026-01-06T17:30:00-05:00"})
+        self.assertIsNone(_vin(_mkt_inputs(offset_late))["funds"]["TQQQ"]["fund_return"])
+        naive = _records(sd, TQQQ={"retrieval_time_utc": "2026-01-06T21:30:00"})
+        self.assertIsNone(_vin(_mkt_inputs(naive))["funds"]["TQQQ"]["fund_return"])
 
         # P1-6: null policy hashes stay null so O6 fails closed (not the string "None").
         for key in ("loaded_policy_hash", "registered_policy_hash"):
