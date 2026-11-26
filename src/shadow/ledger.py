@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import errno
 import fcntl
@@ -14,17 +15,24 @@ import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
+from shadow.calendar_consumer import (
+    DEFAULT_SPEC_DIR,
+    load_spec,
+    resolve_previous_trading_date,
+    resolve_session,
+)
 from shadow.evaluator import ALL_BREAKER_IDS, StubEvaluator, StubProductionForbiddenError
 from shadow.fuse_adapter import (
     EngineIdentityError,
     PINNED_FUSE_ENGINE_HASH,
     PINNED_FUSE_SPEC_VERSION,
     build_fuse_validated_inputs,
+    compute_joint_exposure_for_quantities,
     is_stub_evaluator,
     resolve_account_and_fund_control_states,
     resolve_aggregate_control_state,
@@ -718,6 +726,118 @@ def _extract_o4_resolved_symbols(
     return sorted(resolved)
 
 
+def _parse_utc_instant(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    txt = raw.strip()
+    iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
+    try:
+        dt = datetime.fromisoformat(iso_norm)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
+
+
+def _resolve_spec_for_heartbeat(
+    calendar_session: Mapping[str, object],
+    calendar_spec: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    if isinstance(calendar_spec, Mapping) and isinstance(calendar_spec.get("rules"), Mapping):
+        return calendar_spec
+    cal_ver = calendar_session.get("calendar_version")
+    if isinstance(cal_ver, str) and cal_ver.strip():
+        spec_dir = _SPECS_ROOT / cal_ver.strip()
+        if spec_dir.is_dir():
+            try:
+                return load_spec(spec_dir)
+            except Exception:
+                return None
+    return None
+
+
+def derive_o7_heartbeat_inputs(
+    *,
+    sequence: int,
+    session_date: str,
+    calendar_session: Mapping[str, object],
+    prev_decision_timestamp_utc: str | None = None,
+    session_inputs: Mapping[str, object] | None = None,
+    runtime_config: Mapping[str, object] | None = None,
+    calendar_spec: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Derive deterministic O7 heartbeat inputs from committed history and pinned calendar."""
+    inputs = session_inputs if isinstance(session_inputs, Mapping) else {}
+    inner_fuse = inputs.get("fuse_inputs") if isinstance(inputs.get("fuse_inputs"), Mapping) else {}
+
+    if "scheduled_interval" in inputs:
+        if (
+            "scheduled_interval" in inner_fuse
+            and inner_fuse["scheduled_interval"] != inputs["scheduled_interval"]
+        ):
+            raise ValueError("conflicting_scheduled_interval_between_session_inputs_and_fuse_inputs")
+        sched_interval = inputs["scheduled_interval"]
+    elif "scheduled_interval" in inner_fuse:
+        sched_interval = inner_fuse["scheduled_interval"]
+    else:
+        venue = str(calendar_session.get("exchange") or "XNYS")
+        is_half_day = calendar_session.get("session_state") == "half_day"
+        cutoff_dt: datetime | None = None
+        if isinstance(runtime_config, Mapping):
+            cutoff_key = "decision_cutoff_half_day_et" if is_half_day else "decision_cutoff_et"
+            cutoff_raw = runtime_config.get(cutoff_key)
+            if isinstance(cutoff_raw, str) and _STRICT_HHMM_RE.fullmatch(cutoff_raw):
+                hh, mm = map(int, cutoff_raw.split(":"))
+                try:
+                    cutoff_dt = datetime.combine(
+                        date.fromisoformat(session_date), dt_time(hh, mm), tzinfo=_NY_TZ
+                    ).astimezone(timezone.utc)
+                except ValueError:
+                    cutoff_dt = None
+        if cutoff_dt is None:
+            cutoff_dt = _parse_utc_instant(calendar_session.get("order_cutoff_utc"))
+        cur_close_dt = _parse_utc_instant(calendar_session.get("close_utc"))
+        if cutoff_dt is None and cur_close_dt is not None:
+            cutoff_dt = cur_close_dt + timedelta(hours=2)
+
+        sched_interval = 93600.0
+        spec_obj = _resolve_spec_for_heartbeat(calendar_session, calendar_spec)
+        if spec_obj is not None and cutoff_dt is not None:
+            prev_td = resolve_previous_trading_date(dict(spec_obj), venue, session_date)
+            if prev_td is not None:
+                prev_cal = resolve_session(venue, prev_td, spec=dict(spec_obj))
+                prev_close_dt = _parse_utc_instant(prev_cal.get("close_utc"))
+                if prev_close_dt is not None:
+                    gap = (cutoff_dt - prev_close_dt).total_seconds()
+                    if gap > 0.0:
+                        sched_interval = max(3600.0, float(gap))
+        elif cutoff_dt is not None and cur_close_dt is not None:
+            sched_interval = max(93600.0, float((cutoff_dt - cur_close_dt).total_seconds()))
+
+    if "last_heartbeat" in inputs:
+        if "last_heartbeat" in inner_fuse and inner_fuse["last_heartbeat"] != inputs["last_heartbeat"]:
+            raise ValueError("conflicting_last_heartbeat_between_session_inputs_and_fuse_inputs")
+        last_hb = copy.deepcopy(inputs["last_heartbeat"])
+        hb_source = str(inputs.get("heartbeat_source") or inner_fuse.get("heartbeat_source") or "caller")
+    elif "last_heartbeat" in inner_fuse:
+        last_hb = copy.deepcopy(inner_fuse["last_heartbeat"])
+        hb_source = str(inputs.get("heartbeat_source") or inner_fuse.get("heartbeat_source") or "caller")
+    elif sequence == 0:
+        # Documented genesis bootstrap rule: anchor to genesis session official close (never as_of).
+        last_hb = calendar_session.get("close_utc")
+        hb_source = "genesis_bootstrap"
+    else:
+        last_hb = prev_decision_timestamp_utc
+        hb_source = "previous_committed_record"
+
+    return {
+        "last_heartbeat": last_hb,
+        "heartbeat_source": hb_source,
+        "scheduled_interval": sched_interval,
+    }
+
+
 def evaluate_non_stub_tiers(
     *,
     evaluator: object,
@@ -728,6 +848,7 @@ def evaluate_non_stub_tiers(
     decision_timestamp_utc: str,
     prior_row_state: Mapping[str, Any] | None,
     authorized_events: object | None = None,
+    proposed_exposure_by_tier: Mapping[str, float | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate all 3 sizing tiers with vendored FUSE-1 while preserving the primary tier's outputs."""
     primary_tier = str(session_inputs.get("tier") or "balanced")
@@ -750,6 +871,12 @@ def evaluate_non_stub_tiers(
     for tier_id in tiers_to_eval:
         tier_inputs = dict(session_inputs)
         tier_inputs["tier"] = tier_id
+        if proposed_exposure_by_tier is not None and tier_id in proposed_exposure_by_tier:
+            tier_inputs["proposed_exposure"] = proposed_exposure_by_tier[tier_id]
+            if isinstance(tier_inputs.get("fuse_inputs"), Mapping):
+                nested_copy = dict(tier_inputs["fuse_inputs"])
+                nested_copy["proposed_exposure"] = proposed_exposure_by_tier[tier_id]
+                tier_inputs["fuse_inputs"] = nested_copy
         if (
             tier_id != primary_tier
             and primary_tier_change is not None
@@ -825,6 +952,7 @@ def build_record_body(
     market_records_digest: str | None = None,
     runtime_config: dict[str, object] | None = None,
     calendar_spec: dict[str, object] | None = None,
+    prev_decision_timestamp_utc: str | None = None,
 ) -> dict:
     """Run evaluator + sizing and assemble a canonical record_body (or O1/O2 fail-closed dict)."""
     ev = evaluator if evaluator is not None else StubEvaluator()
@@ -842,6 +970,8 @@ def build_record_body(
     rows_by_tier: dict[str, dict] | None = None
     eff_scope_by_tier: dict[str, dict[str, str]] | None = None
     o4_resolved_symbols: list[str] = []
+    hb_info: dict[str, object] | None = None
+    eval_session_inputs = dict(session_inputs)
 
     if is_stub_evaluator(ev):
         eval_inputs = dict(session_inputs)
@@ -860,15 +990,27 @@ def build_record_body(
             authorized_events=auth_events,
         )
     else:
+        hb_info = derive_o7_heartbeat_inputs(
+            sequence=sequence,
+            session_date=session_date,
+            calendar_session=calendar_session,
+            prev_decision_timestamp_utc=prev_decision_timestamp_utc,
+            session_inputs=eval_session_inputs,
+            runtime_config=runtime_config,
+            calendar_spec=calendar_spec,
+        )
+        eval_session_inputs["last_heartbeat"] = hb_info["last_heartbeat"]
+        eval_session_inputs["heartbeat_source"] = hb_info["heartbeat_source"]
+        eval_session_inputs["scheduled_interval"] = hb_info["scheduled_interval"]
         tiered_eval = evaluate_non_stub_tiers(
             evaluator=ev,
-            session_inputs=session_inputs,
+            session_inputs=eval_session_inputs,
             calendar_session=calendar_session,
             policy_hash=p_hash,
             session_date=session_date,
             decision_timestamp_utc=decision_timestamp_utc,
             prior_row_state=prior,
-            authorized_events=session_inputs.get("authorized_events"),
+            authorized_events=eval_session_inputs.get("authorized_events"),
         )
         rows_by_id = tiered_eval["rows_by_id"]
         eff_scope = tiered_eval["effective_state_by_scope"]
@@ -910,6 +1052,37 @@ def build_record_body(
         fund_control_states=fund_states,
         tier_control_states=tier_control_states,
     )
+
+    if not is_stub_evaluator(ev) and "proposed_exposure" not in eval_session_inputs:
+        proposed_by_tier: dict[str, float | None] = {}
+        for t_dec in sizing_res["tiers"]:
+            tier_id = str(t_dec["tier_id"])
+            q_after_by_inst = {
+                str(f_dec["instrument"]): int(f_dec["q_pre"]) + int(f_dec["delta_q_exec"])
+                for f_dec in t_dec["funds"]
+            }
+            proposed_by_tier[tier_id] = compute_joint_exposure_for_quantities(
+                eval_session_inputs,
+                q_after_by_inst,
+                tier=tier_id,
+            )
+        tiered_eval_p2 = evaluate_non_stub_tiers(
+            evaluator=ev,
+            session_inputs=eval_session_inputs,
+            calendar_session=calendar_session,
+            policy_hash=p_hash,
+            session_date=session_date,
+            decision_timestamp_utc=decision_timestamp_utc,
+            prior_row_state=prior,
+            authorized_events=eval_session_inputs.get("authorized_events"),
+            proposed_exposure_by_tier=proposed_by_tier,
+        )
+        rows_by_id = tiered_eval_p2["rows_by_id"]
+        eff_scope = tiered_eval_p2["effective_state_by_scope"]
+        next_state = tiered_eval_p2["next_row_state"]
+        rows_by_tier = tiered_eval_p2["rows_by_tier"]
+        eff_scope_by_tier = tiered_eval_p2["eff_scope_by_tier"]
+        o4_resolved_symbols = tiered_eval_p2["o4_resolved_symbols"]
 
     inputs_digest = compute_inputs_digest(
         session_inputs,
@@ -957,6 +1130,22 @@ def build_record_body(
         evaluator_block["next_row_state_sha256"] = _sha256_canonical_state_dict(
             next_state if isinstance(next_state, dict) else {}
         )
+        if hb_info is not None:
+            raw_sched = hb_info["scheduled_interval"]
+            sched_str: str | None = None
+            if raw_sched is not None and not isinstance(raw_sched, bool):
+                try:
+                    sched_dec = Decimal(str(raw_sched))
+                    if sched_dec.is_finite():
+                        sched_str = canonical_decimal_str(sched_dec)
+                except (InvalidOperation, ValueError, CanonicalizationError):
+                    sched_str = None
+            evaluator_block["heartbeat_source"] = hb_info["heartbeat_source"]
+            evaluator_block["o7_heartbeat"] = {
+                "heartbeat_source": hb_info["heartbeat_source"],
+                "last_heartbeat": hb_info["last_heartbeat"],
+                "scheduled_interval_seconds": sched_str,
+            }
 
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1000,6 +1189,7 @@ def build_record_body(
         "fail_closed": False,
         "record_body": body,
         "next_row_state": next_state,
+        "o4_resolved_symbols": o4_resolved_symbols,
     }
 
 
@@ -1084,11 +1274,12 @@ def check_forward_clock_credit(
                 if eff_expected_spec_version is None:
                     eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
             else:
-                if eff_locked is None:
-                    eff_locked = not (
-                        raw_cfg.get("production_chain_locked") is False
-                        and raw_cfg.get("clk01_active") is True
-                    )
+                cfg_locked = not (
+                    raw_cfg.get("production_chain_locked") is False
+                    and raw_cfg.get("clk01_active") is True
+                )
+                # Explicit or default locked production configuration cannot be overridden by caller args.
+                eff_locked = bool(cfg_locked or (production_chain_locked is True))
                 if eff_expected_engine_hash is None:
                     eh = raw_cfg.get("fuse_engine_hash")
                     eff_expected_engine_hash = eh if isinstance(eh, str) and eh else "__MISSING__"
@@ -1107,23 +1298,24 @@ def check_forward_clock_credit(
             or first_body.get("ledger_mode") == "stage_n_production"
         )
         if is_sh2_prod_chain:
-            if eff_locked is None:
-                base_root = Path(repo_root) if repo_root is not None else _SPECS_ROOT.parent
-                default_prod_cfg = base_root / "config" / "production-scheduler.json"
-                if not default_prod_cfg.is_file():
-                    eff_locked = True
+            base_root = Path(repo_root) if repo_root is not None else _SPECS_ROOT.parent
+            default_prod_cfg = base_root / "config" / "production-scheduler.json"
+            if not default_prod_cfg.is_file():
+                cfg_locked = True
+            else:
+                try:
+                    raw_prod = parse_json_no_duplicates(default_prod_cfg.read_text(encoding="utf-8"))
+                except Exception:
+                    raw_prod = None
+                if not isinstance(raw_prod, dict):
+                    cfg_locked = True
                 else:
-                    try:
-                        raw_prod = parse_json_no_duplicates(default_prod_cfg.read_text(encoding="utf-8"))
-                    except Exception:
-                        raw_prod = None
-                    if not isinstance(raw_prod, dict):
-                        eff_locked = True
-                    else:
-                        eff_locked = not (
-                            raw_prod.get("production_chain_locked") is False
-                            and raw_prod.get("clk01_active") is True
-                        )
+                    cfg_locked = not (
+                        raw_prod.get("production_chain_locked") is False
+                        and raw_prod.get("clk01_active") is True
+                    )
+            # Default production config cannot be unlocked by caller production_chain_locked=False.
+            eff_locked = bool(cfg_locked or (production_chain_locked is True))
             if eff_expected_engine_hash is None:
                 eff_expected_engine_hash = PINNED_FUSE_ENGINE_HASH
             if eff_expected_spec_version is None:
@@ -2342,6 +2534,23 @@ class ShadowLedger:
 
             self.assert_active_chain_lease()
             self.root_dir.mkdir(parents=True, exist_ok=True)
+            pending_ev_path: Path | None = None
+            if not allow_unanchored and post_marker_writes:
+                pending_ev_path = self.root_dir / (
+                    f".pending_evidence_{seq:06d}_{envelope['record_sha256']}.json"
+                )
+                pending_ev_payload = {
+                    "schema_version": "c-sh-pending-evidence-v1",
+                    "sequence": seq,
+                    "record_sha256": envelope["record_sha256"],
+                    "ots_b64": (
+                        base64.b64encode(ots_bytes).decode("ascii")
+                        if ots_bytes is not None
+                        else None
+                    ),
+                    "receipt": receipt_obj,
+                }
+                _atomic_write_bytes(pending_ev_path, canonical_json_bytes(pending_ev_payload))
             created_artifacts: list[tuple[Path, bytes]] = []
             try:
                 if before_record_commit is not None:
@@ -2380,6 +2589,8 @@ class ShadowLedger:
                                 f"target_detached_evidence_exists_concurrently: {target_path.name}"
                             ) from exc
                         created_artifacts.append((target_path, data))
+                    if pending_ev_path is not None and pending_ev_path.is_file():
+                        pending_ev_path.unlink()
             except Exception:
                 try:
                     self.assert_active_chain_lease()
@@ -2390,8 +2601,56 @@ class ShadowLedger:
                     for created_path, expected_bytes in reversed(created_artifacts):
                         if created_path.is_file() and created_path.read_bytes() == expected_bytes:
                             created_path.unlink()
+                    if pending_ev_path is not None and not rec_path.exists() and pending_ev_path.is_file():
+                        pending_ev_path.unlink()
                 raise
             return envelope
+
+    def recover_pending_evidence(self, records: Sequence[dict]) -> int:
+        """Restore detached .ots/.receipt.json from pre-commit staging if Cloud Run died mid-publish."""
+        recovered = 0
+        for env in records:
+            if not isinstance(env, Mapping):
+                continue
+            body = env.get("record_body")
+            rec_sha = env.get("record_sha256")
+            if not isinstance(body, Mapping) or not isinstance(rec_sha, str):
+                continue
+            seq = body.get("sequence")
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                continue
+            pending_ev_path = self.root_dir / f".pending_evidence_{seq:06d}_{rec_sha}.json"
+            if not pending_ev_path.is_file():
+                continue
+            rcp_path = self._receipt_path(seq)
+            ots_path = self._ots_path(seq)
+            try:
+                staged = parse_json_no_duplicates(pending_ev_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(staged, dict) or staged.get("record_sha256") != rec_sha or staged.get("sequence") != seq:
+                continue
+            receipt_obj = staged.get("receipt")
+            ots_b64 = staged.get("ots_b64")
+            ots_bytes = base64.b64decode(ots_b64) if isinstance(ots_b64, str) else None
+            if not isinstance(receipt_obj, dict):
+                continue
+            ok_rec, _ = verify_receipt(
+                dict(env),
+                receipt_obj,
+                ots_bytes=ots_bytes,
+                require_bitcoin_verification=False,
+            )
+            if not ok_rec:
+                continue
+            self.assert_active_chain_lease()
+            if ots_bytes is not None and not ots_path.is_file():
+                _atomic_write_bytes(ots_path, ots_bytes)
+            if not rcp_path.is_file():
+                _atomic_write_bytes(rcp_path, canonical_json_bytes(receipt_obj))
+            pending_ev_path.unlink(missing_ok=True)
+            recovered += 1
+        return recovered
 
     def rollback_sequence(self, seq: int) -> None:
         """Roll back all artifacts for seq when an outer transaction fails before commit completion."""
@@ -2510,6 +2769,7 @@ class ShadowLedger:
         repo_root: str | Path | None = None,
         config_path: str | Path | None = None,
         runtime_config: object | None = None,
+        require_bitcoin_verification: bool = True,
     ) -> tuple[bool, list[object]]:
         """Require valid chain + non-empty ledger with timely OTS receipts verified against trusted Bitcoin headers & block timestamps."""
         eff_commitment_deadline_et = commitment_deadline_et
@@ -2577,17 +2837,18 @@ class ShadowLedger:
             if not timely:
                 issues.append({"sequence": seq, "reason": str(t_err)})
                 continue
-            ok_btc, btc_err = verify_receipt(
-                envelope,
-                receipt,
-                ots_bytes=ots_bytes,
-                bitcoin_merkle_roots=bitcoin_merkle_roots,
-                require_bitcoin_verification=True,
-                require_bitcoin_timestamp=True,
-                expected_commitment_deadline_utc=expected_deadline,
-            )
-            if not ok_btc:
-                issues.append({"sequence": seq, "reason": str(btc_err)})
+            if require_bitcoin_verification:
+                ok_btc, btc_err = verify_receipt(
+                    envelope,
+                    receipt,
+                    ots_bytes=ots_bytes,
+                    bitcoin_merkle_roots=bitcoin_merkle_roots,
+                    require_bitcoin_verification=True,
+                    require_bitcoin_timestamp=True,
+                    expected_commitment_deadline_utc=expected_deadline,
+                )
+                if not ok_btc:
+                    issues.append({"sequence": seq, "reason": str(btc_err)})
         return len(issues) == 0, issues
 
 
@@ -2601,6 +2862,7 @@ def save_row_state_snapshot(
     engine_hash: str,
     spec_version: str,
     next_row_state: dict,
+    update_latest: bool = True,
 ) -> Path:
     """Persist next_row_state atomically for restart continuity with identity pins."""
     if not isinstance(next_row_state, dict):
@@ -2629,9 +2891,10 @@ def save_row_state_snapshot(
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
     ).encode("utf-8")
     seq_path = s_dir / f"seq_{sequence:06d}.state.json"
-    latest_path = s_dir / "latest.state.json"
     _atomic_write_bytes(seq_path, raw_bytes)
-    _atomic_write_bytes(latest_path, raw_bytes)
+    if update_latest:
+        latest_path = s_dir / "latest.state.json"
+        _atomic_write_bytes(latest_path, raw_bytes)
     return seq_path
 
 
@@ -3337,9 +3600,9 @@ def _assert_pending_state_preserves_committed_breakers(
 
     c_by_tier = committed_state.get("_by_tier")
     p_by_tier = pending_state.get("_by_tier")
-    if isinstance(c_by_tier, Mapping) and p_by_tier is not None:
+    if isinstance(c_by_tier, Mapping):
         if not isinstance(p_by_tier, Mapping):
-            raise EngineIdentityError("Pending state invalid _by_tier section")
+            raise EngineIdentityError("Pending state invalid or missing _by_tier section")
         for t_name, c_tier_state in c_by_tier.items():
             if not isinstance(c_tier_state, Mapping):
                 continue

@@ -777,6 +777,67 @@ class LiveFeederAdaptersTest(unittest.TestCase):
             self.assertFalse(by_inst["TBILL_3M"]["eligibility"]["eligible"])
             self.assertEqual(by_inst["TBILL_3M"]["eligibility"]["reason"], "late_after_decision_cutoff")
 
+    def test_redirect_closes_intermediate_body_without_unbounded_read(self) -> None:
+        import io
+
+        class RejectUnboundedReadStream:
+            def __init__(self) -> None:
+                self.closed = False
+                self._buf = io.BytesIO(b"error body")
+
+            def read(self, size: int | None = -1) -> bytes:
+                if size is None or size < 0:
+                    raise AssertionError("unbounded fp.read() called on redirect")
+                return self._buf.read(size)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class DummyParent:
+            def open(self, req, timeout=None):
+                return (req.full_url, timeout)
+
+        handler = _NoCrossHostAuthRedirectHandler()
+        handler.parent = DummyParent()
+        stream = RejectUnboundedReadStream()
+        req = urllib.request.Request("http://127.0.0.1:8000/start")
+        req.timeout = 5.0
+        result = handler.http_error_302(req, stream, 302, "Found", {"location": "/next"})
+        self.assertTrue(stream.closed)
+        self.assertEqual(result[0], "http://127.0.0.1:8000/next")
+
+        class LargeRedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/start":
+                    body = b"X" * 4096
+                    self.send_response(302)
+                    self.send_header("Location", "/final")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"[]")
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), LargeRedirectHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            status, payload = urllib_fetch_bytes(
+                f"http://127.0.0.1:{port}/start",
+                max_bytes=128,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(payload, b"[]")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

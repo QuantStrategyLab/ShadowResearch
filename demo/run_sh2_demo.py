@@ -693,7 +693,7 @@ def run_all_demos() -> dict[str, dict]:
             production_chain_locked=True,
         )
         assert not ok_locked and "production_chain_locked" in reasons_locked
-        ok_unlocked, reasons_unlocked = check_forward_clock_credit(
+        ok_locked_override, reasons_locked_override = check_forward_clock_credit(
             recs,
             rcps,
             ledger_dir=ldir,
@@ -703,6 +703,23 @@ def run_all_demos() -> dict[str, dict]:
             expected_engine_hash=PINNED_FUSE_ENGINE_HASH,
             expected_spec_version=PINNED_FUSE_SPEC_VERSION,
             production_chain_locked=False,
+        )
+        assert not ok_locked_override and "production_chain_locked" in reasons_locked_override
+        unlocked_cfg_obj = json.loads(
+            (REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        unlocked_cfg_obj["production_chain_locked"] = False
+        unlocked_cfg_obj["clk01_active"] = True
+        unlocked_cfg_path = Path(tmpdir) / "unlocked-production.json"
+        unlocked_cfg_path.write_text(json.dumps(unlocked_cfg_obj), encoding="utf-8")
+        ok_unlocked, reasons_unlocked = check_forward_clock_credit(
+            recs,
+            rcps,
+            ledger_dir=ldir,
+            bitcoin_merkle_roots=hdrs,
+            commitment_deadline_et="23:30",
+            config_path=unlocked_cfg_path,
+            calendar_spec=spec_v2,
         )
         assert ok_unlocked and reasons_unlocked == []
     results["D10"] = {"status": "PASS", "locked_rejected": True, "default_locked_rejected": True, "unlocked_creditable": True}

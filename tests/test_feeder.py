@@ -14,9 +14,11 @@ _SRC = str(Path(__file__).resolve().parents[1] / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from shadow.calendar_consumer import resolve_session
 from shadow.feeder import (
     FeederIntegrityError,
     SOXL_PROXY_LABEL,
+    SeriesSpec,
     VINTAGE_Y2,
     _parse_y2_csv_bytes,
     emit_market_records_from_fixtures,
@@ -29,6 +31,8 @@ from shadow.feeder import (
     select_tiingo_row,
     select_treasury_tbill_row,
     select_yahoo_close,
+    validate_official_close_market_record,
+    verify_market_record_raw_integrity,
 )
 from shadow.ledger import check_forward_clock_credit
 
@@ -368,6 +372,184 @@ class FeederTest(unittest.TestCase):
         ).encode("utf-8")
         with self.assertRaisesRegex(ValueError, "tiingo_invalid_timestamp"):
             select_tiingo_row(naive_pub, "2025-11-21")
+
+    def test_verify_market_record_raw_integrity_uses_half_day_calendar(self) -> None:
+        cal = resolve_session("XNYS", "2025-11-28")
+        self.assertEqual(cal["session_state"], "half_day")
+        yahoo_payload = json.dumps(
+            {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {"dataGranularity": "1d"},
+                            "timestamp": [
+                                int(datetime(2025, 11, 28, 18, 0, tzinfo=timezone.utc).timestamp()),  # 13:00 EST
+                                int(datetime(2025, 11, 28, 19, 0, tzinfo=timezone.utc).timestamp()),  # 14:00 EST
+                            ],
+                            "indicators": {"quote": [{"close": [110.0, 120.0]}]},
+                        }
+                    ]
+                }
+            }
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            arch = Path(tmpdir) / "arch"
+            rec = emit_market_records_from_payloads(
+                (SeriesSpec("XNDX", "^XNDX", "idx_yahoo"),),
+                {"XNDX": yahoo_payload},
+                session_date="2025-11-28",
+                retrieval_time_utc="2025-11-28T19:30:00.000Z",
+                archive_dir=arch,
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"XNDX": "yahoo"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertEqual(rec["normalized_value"], "110")
+            ok_with_cal, err_with_cal = verify_market_record_raw_integrity(
+                arch, rec, session_date="2025-11-28", calendar_session=cal
+            )
+            self.assertTrue(ok_with_cal, err_with_cal)
+
+    def test_tiingo_and_record_reject_next_trade_date_window_and_closed_markers(self) -> None:
+        cal = resolve_session("XNYS", "2025-11-21")
+        for marker, expected_err in (
+            ("next_trade_date_window", "next_trade_date_contamination"),
+            ("closed", "extended_hours_overnight_rejected"),
+        ):
+            payload = json.dumps(
+                [
+                    {
+                        "date": "2025-11-21T00:00:00.000Z",
+                        "close": 47.48,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "session_window": marker,
+                    }
+                ]
+            ).encode("utf-8")
+            with self.assertRaisesRegex(ValueError, expected_err):
+                select_tiingo_row(payload, "2025-11-21", calendar_session=cal)
+
+            ok_rec, err_rec = validate_official_close_market_record(
+                {
+                    "instrument": "TQQQ",
+                    "effective_session": "2025-11-21",
+                    "disclosures": {"session_window": marker},
+                },
+                cal,
+            )
+            self.assertFalse(ok_rec)
+            self.assertEqual(err_rec, expected_err)
+
+    def test_tiingo_rejects_blank_or_numeric_timestamp_and_parses_offset_session_time(self) -> None:
+        for bad_ts in ("", "   ", 1763762400):
+            payload = json.dumps(
+                [
+                    {
+                        "date": "2025-11-21T00:00:00.000Z",
+                        "close": 47.48,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "timestamp": bad_ts,
+                    }
+                ]
+            ).encode("utf-8")
+            with self.assertRaisesRegex(ValueError, "tiingo_invalid_timestamp"):
+                select_tiingo_row(payload, "2025-11-21")
+
+        half_cal = resolve_session("XNYS", "2025-11-28")
+        ok_offset = json.dumps(
+            [
+                {
+                    "date": "2025-11-28T00:00:00.000Z",
+                    "close": 50.0,
+                    "divCash": 0.0,
+                    "splitFactor": 1.0,
+                    "session_time": "13:00:00-05:00",
+                }
+            ]
+        ).encode("utf-8")
+        self.assertEqual(
+            select_tiingo_row(ok_offset, "2025-11-28", calendar_session=half_cal)["close"],
+            50.0,
+        )
+
+        late_offset = json.dumps(
+            [
+                {
+                    "date": "2025-11-28T00:00:00.000Z",
+                    "close": 50.0,
+                    "divCash": 0.0,
+                    "splitFactor": 1.0,
+                    "session_time": "14:00:00-05:00",
+                }
+            ]
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "extended_hours_overnight_rejected"):
+            select_tiingo_row(late_offset, "2025-11-28", calendar_session=half_cal)
+
+    def test_post_cutoff_and_post_retrieval_publication_timestamp_marked_ineligible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            post_cutoff_row = json.dumps(
+                [
+                    {
+                        "date": "2025-11-21T00:00:00.000Z",
+                        "close": 47.48,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "publicationTimestamp": "2025-11-22T02:00:00Z",
+                    }
+                ]
+            ).encode("utf-8")
+            rec_cutoff = emit_market_records_from_payloads(
+                (SeriesSpec("TQQQ", "TQQQ", "etf_tiingo"),),
+                {"TQQQ": post_cutoff_row},
+                session_date="2025-11-21",
+                retrieval_time_utc="2025-11-21T21:30:00.000Z",
+                decision_cutoff_utc="2025-11-21T23:00:00.000Z",
+                archive_dir=Path(tmpdir) / "arch_cutoff",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"TQQQ": "tiingo"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertFalse(rec_cutoff["eligibility"]["eligible"])
+            self.assertEqual(rec_cutoff["eligibility"]["reason"], "publication_after_decision_cutoff")
+
+            post_ret_row = json.dumps(
+                [
+                    {
+                        "date": "2025-11-21T00:00:00.000Z",
+                        "close": 47.48,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "publicationTimestamp": "2025-11-21T22:00:00Z",
+                    }
+                ]
+            ).encode("utf-8")
+            rec_ret = emit_market_records_from_payloads(
+                (SeriesSpec("TQQQ", "TQQQ", "etf_tiingo"),),
+                {"TQQQ": post_ret_row},
+                session_date="2025-11-21",
+                retrieval_time_utc="2025-11-21T21:30:00.000Z",
+                decision_cutoff_utc="2025-11-21T23:00:00.000Z",
+                archive_dir=Path(tmpdir) / "arch_ret",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"TQQQ": "tiingo"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertFalse(rec_ret["eligibility"]["eligible"])
+            self.assertEqual(rec_ret["eligibility"]["reason"], "publication_after_retrieval")
+
+            cal = resolve_session("XNYS", "2025-11-21")
+            ok_stale, err_stale = validate_official_close_market_record(
+                {"instrument": "TQQQ", "effective_session": "2025-11-20", "disclosures": {}},
+                cal,
+            )
+            self.assertFalse(ok_stale)
+            self.assertEqual(err_stale, "stale_effective_session")
 
 
 if __name__ == "__main__":
