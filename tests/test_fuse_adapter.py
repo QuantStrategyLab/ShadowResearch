@@ -1137,6 +1137,74 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertTrue(rows_stale_cal["O2"]["would_have_tripped"])
         self.assertTrue(rows_stale_cal["O1"]["would_have_tripped"])
 
+    def test_valid_compiled_pycache_is_accepted_without_inherited_future_flags(self) -> None:
+        import py_compile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            copy_dir = Path(tmpdir) / "vendor"
+            shutil.copytree(DEFAULT_VENDOR_ENGINE_ROOT, copy_dir)
+            src = copy_dir / "fuse_engine" / "__init__.py"
+            py_compile.compile(str(src), cfile=importlib.util.cache_from_source(str(src)), doraise=True)
+            verify_vendored_engine_bundle(copy_dir)
+
+    def test_o5_settled_cash_alias_and_missing_v7_session_time_are_not_defaulted(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        def _rows(si: dict) -> dict:
+            rows, _, _ = ev.evaluate(
+                ev.spec_version,
+                ev.engine_hash,
+                "p",
+                "2026-01-06",
+                "2026-01-06T22:00:00.000Z",
+                "shadow",
+                build_fuse_validated_inputs(
+                    si,
+                    cal6,
+                    policy_hash="p",
+                    session_date="2026-01-06",
+                    as_of="2026-01-06T22:00:00.000Z",
+                ),
+                {},
+                None,
+            )
+            return rows
+
+        o5_order = {
+            "o5_collar": "0.05",
+            "o5_symbol": "TQQQ",
+            "o5_order_size": 10,
+            "o5_side": "buy",
+            "o5_limit_price": "50",
+            "o5_reference_price": "50",
+            "o5_account": "stage_n_shadow",
+        }
+        si_cash_ok = _valid_inputs()
+        si_cash_ok.update(o5_order)
+        self.assertFalse(_rows(si_cash_ok)["O5"]["would_have_tripped"])
+
+        si_no_cash = _valid_inputs()
+        si_no_cash.update(o5_order)
+        si_no_cash["o5_settled_cash"] = "0"
+        rows_no_cash = _rows(si_no_cash)
+        self.assertTrue(rows_no_cash["O5"]["would_have_tripped"])
+        self.assertEqual(rows_no_cash["O5"]["reason"], "pre_trade_limit_violation")
+
+        v7_obs = {"quote_staleness": 0.0, "spread_width": 0.001, "trading_pause": False}
+        si_v7_regular = _valid_inputs()
+        si_v7_regular["v7_spread_width"] = "0.01"
+        for fund in si_v7_regular["funds"].values():
+            fund.update(v7_obs, session_time="regular")
+        self.assertFalse(_rows(si_v7_regular)["V7"]["would_have_tripped"])
+
+        si_v7_missing = _valid_inputs()
+        si_v7_missing["v7_spread_width"] = "0.01"
+        for fund in si_v7_missing["funds"].values():
+            fund.update(v7_obs)
+        self.assertTrue(_rows(si_v7_missing)["V7"]["would_have_tripped"])
+
     def test_o5_order_evidence_and_v1_five_session_history_forwarded(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
         cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
