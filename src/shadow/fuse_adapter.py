@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.abc
 import importlib.util
 import json
 import marshal
@@ -40,6 +41,16 @@ PINNED_CSA22_V2_DIGEST = (
     "2ba8cd7684c361209df68bfa2e10004c1f9922a645c7ec55d421fda520561798"
 )
 PINNED_SH1_COMMIT = "20be23f1ce4f4f23bd2f863aef43213894947bf3"
+# Complete required metadata set, pinned in code: provenance.json itself is not trusted
+# to attest its own siblings (P1: unpinned self-referential metadata manifest).
+PINNED_FUSE_METADATA_SHA256: dict[str, str] = {
+    "FREEZE.json": "2262eabd746d2c6ff9e0e5f49853244d638b550330db049d2af9c41c659dd89d",
+    "SH1-ACCEPTANCE.json": "830ec9519edfa8b996039f53b98cc33659c7c5f53c2934fe009a0e6f925e39fc",
+    "disposition-register.json": "4f2c497f727f9fa4be43d4aa287ff740f2affe1f602ab8518f10916cbfbe105c",
+    "provenance.json": "a6ab4981e77b64a750f243f2ac79c073ef2e522eb2548b9c078bd59036d34e14",
+    "result-bundle.json": "ca3af33909c2fd5c26364458406de710197dd87dc8c9f1234adef0c1f60cbd42",
+    "spec.json": "94b99e5da90ce559c916aba10aca91cf9c370847266da59cd9e441a4c3bb2e1f",
+}
 
 EXPECTED_ENGINE_FILES: tuple[str, ...] = (
     "__init__.py",
@@ -239,6 +250,7 @@ def verify_vendored_engine_bundle(
     expected_engine_hash: str = PINNED_FUSE_ENGINE_HASH,
     expected_spec_version: str = PINNED_FUSE_SPEC_VERSION,
     require_read_only: bool = False,
+    expected_metadata_sha256: Mapping[str, str] = PINNED_FUSE_METADATA_SHA256,
 ) -> dict[str, Any]:
     """Verify vendored FUSE-1 source files, provenance SHA-256s, framed digest, and __pycache__."""
     root = Path(vendor_root) if vendor_root is not None else DEFAULT_VENDOR_ENGINE_ROOT
@@ -251,6 +263,13 @@ def verify_vendored_engine_bundle(
         raise EngineIdentityError(f"Vendored engine directory missing or symlinked: {engine_dir}")
     if metadata_dir.is_symlink() or not metadata_dir.is_dir():
         raise EngineIdentityError(f"Vendored metadata directory missing or symlinked: {metadata_dir}")
+
+    for fname, pinned_digest in sorted(expected_metadata_sha256.items()):
+        mpath = metadata_dir / fname
+        if mpath.is_symlink() or not mpath.is_file():
+            raise EngineIdentityError(f"Missing pinned vendored metadata file: {fname}")
+        if _sha256_bytes(mpath.read_bytes()) != pinned_digest:
+            raise EngineIdentityError(f"Vendored metadata does not match pinned digest: {fname}")
 
     prov_path = metadata_dir / "provenance.json"
     if prov_path.is_symlink() or not prov_path.is_file():
@@ -379,6 +398,68 @@ def verify_vendored_engine_bundle(
     }
 
 
+class _VerifiedSourceLoader(importlib.abc.Loader):
+    """Execute pre-verified source bytes; never consults bytecode caches or PYTHONPYCACHEPREFIX."""
+
+    def __init__(self, path: Path, src_bytes: bytes) -> None:
+        self._path = path
+        self._src_bytes = src_bytes
+
+    def create_module(self, spec: Any) -> None:
+        return None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        code = compile(self._src_bytes, str(self._path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+
+
+class _VerifiedPackageFinder(importlib.abc.MetaPathFinder):
+    """Resolve the isolated vendored package and its submodules to verified source bytes only."""
+
+    def __init__(self, pkg_name: str, engine_dir: Path, sources: Mapping[str, bytes]) -> None:
+        self.pkg_name = pkg_name
+        self.engine_dir = engine_dir
+        self.sources = dict(sources)
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if fullname == self.pkg_name:
+            stem, is_pkg = "__init__", True
+        elif fullname.startswith(self.pkg_name + "."):
+            stem, is_pkg = fullname[len(self.pkg_name) + 1 :], False
+            if "." in stem or stem == "__init__":
+                return None
+        else:
+            return None
+        if stem not in self.sources:
+            return None
+        file_path = self.engine_dir / f"{stem}.py"
+        spec = importlib.util.spec_from_loader(
+            fullname,
+            _VerifiedSourceLoader(file_path, self.sources[stem]),
+            origin=str(file_path),
+            is_package=is_pkg,
+        )
+        if spec is None:
+            return None
+        spec.has_location = True
+        if is_pkg:
+            spec.submodule_search_locations = [str(self.engine_dir)]
+        return spec
+
+
+def _read_verified_engine_sources(engine_dir: Path, info: Mapping[str, Any]) -> dict[str, bytes]:
+    """Re-read engine sources and bind them to the digests just verified (closes read TOCTOU)."""
+    sources: dict[str, bytes] = {}
+    file_hashes = info["file_hashes"]
+    for rel in EXPECTED_ENGINE_FILES:
+        data = (engine_dir / rel).read_bytes()
+        recorded = file_hashes.get(rel)
+        if not isinstance(recorded, Mapping) or recorded.get("sha256") != _sha256_bytes(data):
+            raise EngineIdentityError(f"Vendored engine source changed after verification: {rel}")
+        sources[Path(rel).stem] = data
+    return sources
+
+
 def _load_verified_fuse_package(
     vendor_root: str | Path | None = None,
     *,
@@ -406,11 +487,13 @@ def _load_verified_fuse_package(
     pkg_suffix = hashlib.sha256(f"{engine_dir}:{info['engine_hash']}".encode("utf-8")).hexdigest()[:16]
     pkg_name = f"_shadow_vendored_fuse_{pkg_suffix}"
     init_path = engine_dir / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        pkg_name,
-        init_path,
-        submodule_search_locations=[str(engine_dir)],
-    )
+    finder = _VerifiedPackageFinder(pkg_name, engine_dir, _read_verified_engine_sources(engine_dir, info))
+    sys.meta_path[:] = [
+        f for f in sys.meta_path
+        if not (isinstance(f, _VerifiedPackageFinder) and f.pkg_name == pkg_name)
+    ]
+    sys.meta_path.insert(0, finder)
+    spec = finder.find_spec(pkg_name)
     if spec is None or spec.loader is None:
         raise EngineIdentityError(f"Unable to build import spec for vendored engine: {init_path}")
 
@@ -703,12 +786,33 @@ def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
     return float((cur_d - prev_d) / prev_d)
 
 
+_CA_UNDATED = object()
+
+
+def _ca_in_return_interval(ca_obj: object, session_date: str | None) -> object:
+    """Return the corporate action only if its ex-date falls in this one-session return interval.
+
+    For a one-session return (prior trading close -> session close) the only ex-date inside
+    the interval is the session date itself. An action dated earlier (e.g. a Friday split
+    reconciled by V2 on Monday) is already reflected in both closes, so the raw return is
+    used. An action without a valid ex-date cannot be placed and fails closed.
+    """
+    if not isinstance(ca_obj, Mapping) or session_date is None:
+        return ca_obj
+    ex_date = _parse_valid_ymd(ca_obj.get("ex_date"))
+    if ex_date is None:
+        return _CA_UNDATED
+    return ca_obj if ex_date == session_date else None
+
+
 def _compute_ca_adjusted_fund_return(
     cur_raw: object,
     prev_raw: object,
     ca_obj: object,
 ) -> float | None:
     """Derive 1-session fund return from closes, adjusting prior close for splits/distributions."""
+    if ca_obj is _CA_UNDATED:
+        return None
     if ca_obj is None:
         return _compute_return_ratio(cur_raw, prev_raw)
     if not isinstance(ca_obj, Mapping):
@@ -784,6 +888,50 @@ def _derive_one_session_loss(session_inputs: Mapping[str, Any]) -> float | None:
         if e_d == es_d and l_d == Decimal("0") and ext_d == Decimal("0"):
             return 0.0
     return None
+
+
+_RATE_INSTRUMENTS = frozenset({"SOFR", "TBILL_3M"})
+
+
+def _is_market_record_valid_for_session(
+    rec: object,
+    cal_digest: object,
+    session_date: str | None,
+) -> bool:
+    """A market record is usable only if eligible, populated, digest-bound and for this session.
+
+    Price/index records must be effective for the decision session itself. Rate series
+    (SOFR, T-bill) publish with a lag, so they may be effective on an earlier date but never
+    on a later one; the feeder enforces their exact lag rule when it builds the record.
+    """
+    if not isinstance(rec, Mapping):
+        return False
+    elig = rec.get("eligibility") if isinstance(rec.get("eligibility"), Mapping) else {}
+    if rec.get("normalized_value") is None or not elig.get("eligible"):
+        return False
+    if cal_digest is not None and rec.get("calendar_spec_digest") != cal_digest:
+        return False
+    if session_date is not None:
+        eff = rec.get("effective_session")
+        if not isinstance(eff, str) or _parse_valid_ymd(eff) is None:
+            return False
+        if str(rec.get("instrument")) in _RATE_INSTRUMENTS:
+            if eff > session_date:
+                return False
+        elif eff != session_date:
+            return False
+    return True
+
+
+def _parse_valid_ymd(raw: object) -> str | None:
+    if not isinstance(raw, str) or len(raw) != 10:
+        return None
+    try:
+        from datetime import date as _date
+
+        return _date.fromisoformat(raw).isoformat()
+    except ValueError:
+        return None
 
 
 def _map_market_corporate_action(mca: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1154,15 +1302,14 @@ def build_fuse_validated_inputs(
                 if isinstance(r, Mapping) and r.get("instrument")
             }
             cal_digest = calendar_session.get("spec_digest") if isinstance(calendar_session, Mapping) else None
+            # Every record that can feed a return (required or optional, e.g. SPX) is validated:
+            # eligible, populated, same calendar digest, and effective for this decision session.
+            for inst, rec in by_inst.items():
+                if not _is_market_record_valid_for_session(rec, cal_digest, session_date):
+                    bad_market_insts.add(inst)
             for inst in req_series:
                 rec = by_inst.get(inst)
-                elig = rec.get("eligibility") if isinstance(rec, Mapping) and isinstance(rec.get("eligibility"), Mapping) else {}
-                bad_rec = (
-                    rec is None
-                    or rec.get("normalized_value") is None
-                    or not elig.get("eligible")
-                    or (cal_digest is not None and rec.get("calendar_spec_digest") != cal_digest)
-                )
+                bad_rec = rec is None or not _is_market_record_valid_for_session(rec, cal_digest, session_date)
                 if bad_rec:
                     bad_market_insts.add(inst)
                     if inst in ("XNDX", "SEMI", "QQQ"):
@@ -1172,7 +1319,7 @@ def build_fuse_validated_inputs(
     # Derive current closes across instruments for return computation
     cur_closes: dict[str, object] = {}
     for inst_name, mrec in by_inst.items():
-        if mrec.get("normalized_value") is not None:
+        if inst_name not in bad_market_insts and mrec.get("normalized_value") is not None:
             cur_closes[inst_name] = mrec["normalized_value"]
     cur_idx_override = session_inputs.get("current_index_closes")
     if isinstance(cur_idx_override, Mapping):
@@ -1232,7 +1379,7 @@ def build_fuse_validated_inputs(
             fund_ret_val = _compute_ca_adjusted_fund_return(
                 fdata.get("close_price"),
                 prior_closes.get(symbol),
-                ca_obj,
+                _ca_in_return_interval(ca_obj, session_date),
             )
         else:
             fund_ret_val = None
@@ -1401,13 +1548,17 @@ def build_fuse_validated_inputs(
             else _finite_number(session_inputs["o5_settled_cash"])
             if session_inputs.get("o5_settled_cash") is not None
             else None
-            if "o5_settled_cash" in session_inputs
-            else bankroll_val
         ),
-        "loaded_policy_hash": str(session_inputs.get("loaded_policy_hash", policy_hash)),
-        "registered_policy_hash": str(session_inputs.get("registered_policy_hash", policy_hash)),
-        "last_heartbeat": str(session_inputs.get("last_heartbeat", as_of)),
-        "scheduled_interval": _finite_number(session_inputs.get("scheduled_interval")) if session_inputs.get("scheduled_interval") is not None else 60.0,
+        # Supplied values pass through uncoerced (an explicit null stays null so O6/O7 fail closed);
+        # only an omitted key takes the adapter default.
+        "loaded_policy_hash": copy.deepcopy(session_inputs["loaded_policy_hash"]) if "loaded_policy_hash" in session_inputs else policy_hash,
+        "registered_policy_hash": copy.deepcopy(session_inputs["registered_policy_hash"]) if "registered_policy_hash" in session_inputs else policy_hash,
+        "last_heartbeat": copy.deepcopy(session_inputs["last_heartbeat"]) if "last_heartbeat" in session_inputs else as_of,
+        "scheduled_interval": (
+            (_finite_number(session_inputs["scheduled_interval"]) if session_inputs["scheduled_interval"] is not None else None)
+            if "scheduled_interval" in session_inputs
+            else 60.0
+        ),
         "tier_loss_budget_D": _TIER_D_MAP.get(tier, 0.30),
         "v5_tolerance": session_inputs.get("v5_tolerance", None),
         "v7_spread_width": session_inputs.get("v7_spread_width", None),
