@@ -1184,6 +1184,13 @@ class FuseAdapterTest(unittest.TestCase):
             self.assertIsNone(_vin(si)[key])
             self.assertTrue(_rows(si)["O6"]["would_have_tripped"], key)
 
+        # P1-1: heartbeat provenance is explicit; the adapter default is labelled a self-heartbeat.
+        self.assertEqual(_vin(_valid_inputs())["heartbeat_source"], "adapter_self")
+        si_hb = _valid_inputs()
+        si_hb["last_heartbeat"] = "2026-01-06T21:59:30.000Z"
+        self.assertEqual(_vin(si_hb)["heartbeat_source"], "caller")
+        self.assertEqual(_vin(si_hb)["last_heartbeat"], "2026-01-06T21:59:30.000Z")
+
         # P1-1 (explicit evidence): a supplied null heartbeat or interval is not replaced by as_of / 60s.
         for key in ("last_heartbeat", "scheduled_interval"):
             si = _valid_inputs()

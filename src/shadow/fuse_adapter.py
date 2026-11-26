@@ -1553,7 +1553,16 @@ def build_fuse_validated_inputs(
         # only an omitted key takes the adapter default.
         "loaded_policy_hash": copy.deepcopy(session_inputs["loaded_policy_hash"]) if "loaded_policy_hash" in session_inputs else policy_hash,
         "registered_policy_hash": copy.deepcopy(session_inputs["registered_policy_hash"]) if "registered_policy_hash" in session_inputs else policy_hash,
+        # O7 heartbeat provenance is explicit: "caller" when the session inputs carry
+        # last_heartbeat, else "adapter_self" (as_of is the job's own self-attested heartbeat,
+        # not independent liveness evidence). The ledger replaces the self-heartbeat with the
+        # previous committed record's decision timestamp in a follow-up (see issue #13).
         "last_heartbeat": copy.deepcopy(session_inputs["last_heartbeat"]) if "last_heartbeat" in session_inputs else as_of,
+        "heartbeat_source": (
+            str(session_inputs.get("heartbeat_source") or "caller")
+            if "last_heartbeat" in session_inputs
+            else "adapter_self"
+        ),
         "scheduled_interval": (
             (_finite_number(session_inputs["scheduled_interval"]) if session_inputs["scheduled_interval"] is not None else None)
             if "scheduled_interval" in session_inputs
