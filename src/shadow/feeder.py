@@ -296,6 +296,7 @@ _EXTENDED_SESSION_MARKERS = frozenset(
         "pre_market",
         "pre_market_extended",
         "blue_ocean_overnight",
+        "closed",
     }
 )
 
@@ -318,8 +319,10 @@ def _validate_core_rth_bar_timestamp(
     *,
     allow_midnight_date_marker: bool = False,
 ) -> None:
-    if not isinstance(raw_ts, str) or not raw_ts.strip():
+    if raw_ts is None:
         return
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        raise ValueError("tiingo_invalid_timestamp")
     txt = raw_ts.strip()
     if allow_midnight_date_marker:
         if len(txt) == 10:
@@ -370,14 +373,25 @@ def _validate_tiingo_official_close_row(
     """Validate that a Tiingo row represents core RTH Official Close, not extended/overnight/T+1."""
     for marker_key in ("session", "market_session", "session_window", "session_time"):
         marker_val = row.get(marker_key)
-        if isinstance(marker_val, str) and marker_val.strip().lower() in _EXTENDED_SESSION_MARKERS:
-            raise ValueError("extended_hours_overnight_rejected")
+        if isinstance(marker_val, str):
+            norm_marker = marker_val.strip().lower()
+            if norm_marker == "next_trade_date_window":
+                raise ValueError("next_trade_date_contamination")
+            if norm_marker in _EXTENDED_SESSION_MARKERS:
+                raise ValueError("extended_hours_overnight_rejected")
     session_time_val = row.get("session_time")
     if isinstance(session_time_val, str) and ":" in session_time_val:
         st_txt = session_time_val.strip()
-        if "T" in st_txt or " " in st_txt or "+" in st_txt or st_txt.endswith("Z"):
+        if "T" in st_txt or " " in st_txt:
             _validate_core_rth_bar_timestamp(
                 st_txt,
+                session_date,
+                calendar_session,
+                allow_midnight_date_marker=False,
+            )
+        elif st_txt.endswith("Z") or "+" in st_txt or "-" in st_txt:
+            _validate_core_rth_bar_timestamp(
+                f"{session_date}T{st_txt}",
                 session_date,
                 calendar_session,
                 allow_midnight_date_marker=False,
@@ -1422,7 +1436,9 @@ def validate_official_close_market_record(
     """Enforce US 23/5 16:00 ET Official Close isolation & non-contamination for equity/index prints."""
     inst = str(rec.get("instrument", ""))
     disclosures = rec.get("disclosures") if isinstance(rec.get("disclosures"), Mapping) else {}
-    session_marker = str(disclosures.get("session_window") or disclosures.get("market_session") or "").lower()
+    session_marker = str(disclosures.get("session_window") or disclosures.get("market_session") or "").strip().lower()
+    if session_marker == "next_trade_date_window":
+        return False, "next_trade_date_contamination"
     if session_marker in _EXTENDED_SESSION_MARKERS:
         return False, "extended_hours_overnight_rejected"
     if inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI"):

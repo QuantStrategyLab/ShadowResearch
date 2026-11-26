@@ -137,8 +137,43 @@ class SessionNotInPayloadError(LiveFeederError):
     reason_code = "session_not_in_payload"
 
 
+class _CloseOnUnboundedRedirectRead:
+    """Stream proxy preventing HTTPRedirectHandler from reading unbounded 3xx bodies."""
+
+    def __init__(self, fp) -> None:
+        self._fp = fp
+
+    def read(self, size: int | None = -1) -> bytes:
+        if size is None or size < 0:
+            close_fn = getattr(self._fp, "close", None)
+            if callable(close_fn):
+                close_fn()
+            return b""
+        return self._fp.read(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        read1_fn = getattr(self._fp, "read1", None)
+        if callable(read1_fn):
+            return read1_fn(size)
+        return self._fp.read(size)
+
+    def close(self) -> None:
+        close_fn = getattr(self._fp, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __getattr__(self, name: str):
+        return getattr(self._fp, name)
+
+
 class _NoCrossHostAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Block cross-host/protocol-downgrade redirects when Authorization is present and strip auth."""
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        guarded_fp = _CloseOnUnboundedRedirectRead(fp) if fp is not None else None
+        return super().http_error_302(req, guarded_fp, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         orig = urllib.parse.urlsplit(req.full_url)
