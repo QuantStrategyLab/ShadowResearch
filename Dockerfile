@@ -5,13 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     TZ=UTC \
-    SHADOW_DATA_DIR=/var/lib/shadow/data \
     SHADOW_CONFIG_PATH=/app/config/production-scheduler.json
 
-RUN groupadd --gid 10001 shadow \
-    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin shadow \
-    && mkdir -p /app /var/lib/shadow/data \
-    && chown -R shadow:shadow /var/lib/shadow
+# Debian base already reserves group 'shadow' (GID 42); use 'shadowapp' with UID/GID 10001 to match GCS FUSE mountOptions
+RUN groupadd --gid 10001 shadowapp \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin shadowapp \
+    && mkdir -p /app
 
 WORKDIR /app
 
@@ -24,6 +23,6 @@ COPY --chown=root:root config/ /app/config/
 RUN find /app/vendor/fuse_engine -type f -exec chmod 0444 {} + \
     && find /app/vendor/fuse_engine -type d -exec chmod 0555 {} +
 
-USER shadow
+USER shadowapp
 
 ENTRYPOINT ["python3", "-B", "-m", "shadow.cloudrun_job"]

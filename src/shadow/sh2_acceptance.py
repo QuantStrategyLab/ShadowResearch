@@ -78,17 +78,31 @@ def _active_non_comment_text(raw_text: str) -> str:
 def _check_deployment_artifacts_ok(dockerfile_text: str, cloudrun_yaml: str) -> bool:
     df_active = _active_non_comment_text(dockerfile_text)
     yaml_active = _active_non_comment_text(cloudrun_yaml)
+    has_state_mount = False
+    if "volumeMounts:" in yaml_active and "volumes:" in yaml_active:
+        mounts_sec = yaml_active.split("volumeMounts:", 1)[1].split("volumes:", 1)[0]
+        vols_sec = yaml_active.split("volumes:", 1)[1]
+        has_state_mount = (
+            "name: shadow-state" in mounts_sec
+            and "mountPath: /var/lib/shadow/data" in mounts_sec
+            and "name: shadow-state" in vols_sec
+            and "driver: gcsfuse.run.googleapis.com" in vols_sec
+            and "uid=10001" in vols_sec
+            and "gid=10001" in vols_sec
+        )
     return (
-        "chmod 0444" in df_active
+        "SHADOW_DATA_DIR=" not in df_active
+        and "chmod 0444" in df_active
         and "chmod 0555" in df_active
-        and "USER shadow" in df_active
+        and "USER shadowapp" in df_active
+        and "--gid 10001 shadowapp" in df_active
         and 'ENTRYPOINT ["python3", "-B", "-m", "shadow.cloudrun_job"]' in df_active
         and "name: TIINGO_API_KEY" in yaml_active
         and "secretKeyRef:" in yaml_active
         and "name: SHADOW_DATA_DIR" in yaml_active
+        and "value: /var/lib/shadow/data" in yaml_active
         and "us-east1" in yaml_active
-        and "uid=10001" in yaml_active
-        and "gid=10001" in yaml_active
+        and has_state_mount
     )
 
 
@@ -212,8 +226,8 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
             "id": "SH2-A02",
             "status": status_for(vendor_identity_ok and bool(gates.get("pycache_verified")) and case_ok("D1")),
             "detail": (
-                f"Digest-pinned vendor package verified at {DEFAULT_VENDOR_ENGINE_ROOT.name}; "
-                f"pycache_verified={gates['pycache_verified']}, read_only_verified={gates.get('read_only_verified')} (0444 enforced in Dockerfile)"
+                f"Digest-pinned vendor package & bytecode verified at {DEFAULT_VENDOR_ENGINE_ROOT.name}; "
+                f"pycache_verified={gates['pycache_verified']}, read_only_verified={gates.get('read_only_verified')} (container 0444 unbuilt locally)"
             ),
         },
         {
@@ -249,7 +263,7 @@ def run_sh2_acceptance(repo_root: str | Path | None = None) -> dict[str, object]
         {
             "id": "SH2-A09",
             "status": status_for(case_ok("D9")),
-            "detail": "Cloud Run Jobs us-east1 stateless retry returns already_committed_no_op with <=1 append and .chain.lease.json cross-instance fencing (Item 18)",
+            "detail": "Cloud Run Jobs us-east1 stateless retry returns already_committed_no_op with <=1 append (local lease conflict verified in unit suite, Item 18)",
         },
         {
             "id": "SH2-A10",

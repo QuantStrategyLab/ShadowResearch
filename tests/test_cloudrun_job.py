@@ -179,7 +179,8 @@ class CloudRunJobTest(unittest.TestCase):
     def test_cloudrun_container_and_manifest_are_secret_free(self) -> None:
         df = (_REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("chmod 0444", df)
-        self.assertIn("USER shadow", df)
+        self.assertIn("USER shadowapp", df)
+        self.assertNotIn("SHADOW_DATA_DIR=", df)
         self.assertIn("shadow.cloudrun_job", df)
         self.assertNotIn("TIINGO_API_KEY", df)
         self.assertNotIn("/" + "Users/", df)

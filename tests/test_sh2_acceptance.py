@@ -104,8 +104,10 @@ class Sh2AcceptanceTest(unittest.TestCase):
         df = (_REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
         yaml_txt = (_REPO_ROOT / "deploy" / "cloudrun" / "job-spec.example.yaml").read_text(encoding="utf-8")
         self.assertTrue(_check_deployment_artifacts_ok(df, yaml_txt))
-        self.assertFalse(_check_deployment_artifacts_ok(df.replace("USER shadow", "# USER shadow"), yaml_txt))
+        self.assertFalse(_check_deployment_artifacts_ok(df.replace("USER shadowapp", "# USER shadowapp"), yaml_txt))
+        self.assertFalse(_check_deployment_artifacts_ok(df + "\nENV SHADOW_DATA_DIR=/tmp/bad\n", yaml_txt))
         self.assertFalse(_check_deployment_artifacts_ok(df, yaml_txt.replace("uid=10001", "uid=0")))
+        self.assertFalse(_check_deployment_artifacts_ok(df, yaml_txt.replace("mountPath: /var/lib/shadow/data", "mountPath: /tmp/other")))
 
         self.assertTrue(_check_standing_safety_locks({"standing_safety_locks": {"kelly_applied": True}}, object()))
 

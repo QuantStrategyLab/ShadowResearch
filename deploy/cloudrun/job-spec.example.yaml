@@ -1,11 +1,13 @@
 # Secret-free Cloud Run Job specification example for SHADOW-N SH-2 (us-east1)
 # Replace <project-id>, <repo>, <tag>, <service-account>, and <bucket-name> before deploy.
 # Keep config/production-scheduler.json production_chain_locked=true until OA-SH2-2 sign-off.
-# Single-writer concurrency discipline: maxRetries: 0 with parallelism: 1 and taskCount: 1
-# prevents concurrent overlapping Cloud Run tasks within one execution, AND Cloud Scheduler must
-# serialize job triggers (no overlapping manual/scheduled launches). Note: GCS FUSE O_EXCL does not
-# guarantee cross-instance distributed creation atomicity until close/generation check; use a
-# POSIX Filestore mount or storage-native GCS ifGenerationMatch=0 lease if executions can overlap.
+# Single-writer concurrency discipline: maxRetries: 0, parallelism: 1, and taskCount: 1 only
+# limit concurrency within one Cloud Run execution. Launching multiple overlapping executions (e.g.
+# duplicate Cloud Scheduler triggers or manual runs while a prior execution is still active) is NOT
+# serialized by Cloud Run or GCS FUSE O_EXCL (which lacks pre-close creation atomicity). Production
+# deployment MUST gate execution launches behind an execution-lifecycle lock (rejecting any new
+# run while an execution is active) OR mount POSIX-locking storage (e.g. Cloud Filestore) / use
+# storage-native GCS ifGenerationMatch=0 lease objects before enabling writes on the ledger.
 # Production history authentication:
 # - One-time genesis initialization (seq=0 on empty SHADOW_DATA_DIR): set
 #   SHADOW_TRUSTED_HEAD_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
