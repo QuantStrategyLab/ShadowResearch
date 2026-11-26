@@ -100,6 +100,10 @@ class ProductionChainLockedError(RuntimeError):
     """Raised when production forward-clock writes are attempted while locked (OA-SH2-2)."""
 
 
+class CorporateActionConflictError(ValueError):
+    """Two distinct corporate actions for one fund/bar that V2 cannot both represent."""
+
+
 class V2PayloadSchemaError(ValueError):
     """Raised when V2 reconciliation payload omits or mis-types boolean hwm_adjusted."""
 
@@ -933,6 +937,29 @@ _RATE_INSTRUMENTS = frozenset({"SOFR", "TBILL_3M"})
 _EXPECTED_RATE_DAY_CACHE: dict[tuple[str, str], str | None] = {}
 
 
+def _parse_aware_instant(raw: object) -> Any:
+    """Parse an ISO-8601 timestamp into an aware UTC datetime; naive or invalid -> None."""
+    from datetime import datetime, timezone
+
+    if not isinstance(raw, str) or not raw:
+        return None
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _not_after(raw: object, as_of: str) -> bool:
+    """True only if raw is a valid aware instant at or before as_of (instants, not strings)."""
+    ts = _parse_aware_instant(raw)
+    limit = _parse_aware_instant(as_of)
+    return ts is not None and limit is not None and ts <= limit
+
+
 def _expected_prior_rate_business_day(session_date: str, calendar_session: Mapping[str, Any] | None) -> str | None:
     """Expected T-1 publication business day for rate series, from the pinned calendar spec.
 
@@ -997,10 +1024,8 @@ def _is_market_record_valid_for_session(
                 return False
         elif eff != session_date:
             return False
-    if as_of is not None:
-        retrieved = rec.get("retrieval_time_utc")
-        if not isinstance(retrieved, str) or not retrieved or retrieved > as_of:
-            return False
+    if as_of is not None and not _not_after(rec.get("retrieval_time_utc"), as_of):
+        return False
     return True
 
 
@@ -1421,8 +1446,20 @@ def build_fuse_validated_inputs(
     cur_idx_override = session_inputs.get("current_index_closes")
     if isinstance(cur_idx_override, Mapping):
         for k, v in cur_idx_override.items():
-            if v is not None:
-                cur_closes[str(k)] = v
+            k = str(k)
+            if v is None:
+                continue
+            if k not in by_inst:
+                # Override is used only when no market record exists for the instrument.
+                cur_closes[k] = v
+            elif k not in bad_market_insts and _finite_decimal(v) != _finite_decimal(
+                by_inst[k].get("normalized_value")
+            ):
+                # Disagreement with a validated record fails closed (same as the fund-close path).
+                bad_market_insts.add(k)
+                cur_closes.pop(k, None)
+                idx_ok = False
+                mkt_ok = False
 
     conv_scale = _derive_conv_scale(session_inputs, bankroll_val, hwm_val)
     fuse_funds: dict[str, dict[str, Any]] = {}
@@ -1444,12 +1481,23 @@ def build_fuse_validated_inputs(
             vol_ok = False
         if close_val is None or close_val <= 0.0 or q_pre_val is None or not signal_ok:
             mkt_ok = False
-        pos_val = (close_val * q_pre_val) if (close_val is not None and q_pre_val is not None) else 0.0
+        # A held position with an unknown close (or an unknown quantity) has an unknown value:
+        # it propagates as None into ledger/broker values and the joint aggregate, so
+        # reconciliation cannot clear on invented zeroes. A flat book (q_pre == 0) is known 0.
+        if close_val is not None and q_pre_val is not None:
+            pos_val: float | None = close_val * q_pre_val
+        elif q_pre_val == 0:
+            pos_val = 0.0
+        else:
+            pos_val = None
         if joint_exposure_dec is not None and conv_scale is not None:
-            beta_dec = _FUND_EXPOSURE_BETA.get(symbol, Decimal("1"))
-            joint_exposure_dec += (
-                _LEVERAGE_MULTIPLE * beta_dec * Decimal(str(pos_val))
-            ) / conv_scale
+            if pos_val is None:
+                joint_exposure_dec = None
+            else:
+                beta_dec = _FUND_EXPOSURE_BETA.get(symbol, Decimal("1"))
+                joint_exposure_dec += (
+                    _LEVERAGE_MULTIPLE * beta_dec * Decimal(str(pos_val))
+                ) / conv_scale
         long_run_vol = _finite_number(fdata.get("long_run_volatility"))
 
         # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
@@ -1464,10 +1512,13 @@ def build_fuse_validated_inputs(
             ca_obj = market_ca
         elif market_ca is not None and _ca_identity(ca_obj) != _ca_identity(market_ca):
             # The fund payload carries one action (e.g. a prior CA being reconciled) while the
-            # feeder reports a distinct new action for this bar; V2 can hold only one, so fail
-            # closed rather than silently dropping the new event.
-            ca_conflict = True
-            mkt_ok = False
+            # feeder reports a distinct new action for this bar. V2 can hold only one, and a
+            # successor state built from either would drop the other, so the evaluation is
+            # rejected before any successor state is produced.
+            raise CorporateActionConflictError(
+                f"{symbol}: fund payload corporate action {_ca_identity(ca_obj)!r} conflicts with "
+                f"feeder corporate action {_ca_identity(market_ca)!r} for {session_date}"
+            )
 
         # The return uses the validated market close when a market record exists for the fund;
         # a caller close that disagrees with it is rejected (fail closed).
@@ -1630,7 +1681,13 @@ def build_fuse_validated_inputs(
         if cal_ok
         else None,
     }
-    source_records = {k: v for k, v in raw_source_records.items() if v is not None}
+    # Every source record (caller-supplied or derived) must be dated at or before the decision
+    # instant; a future-dated record (look-ahead) is dropped so O1 fails closed.
+    source_records = {
+        k: v
+        for k, v in raw_source_records.items()
+        if isinstance(v, Mapping) and _not_after(v.get("as_of"), as_of)
+    }
 
     derived_joint_exposure = float(joint_exposure_dec) if joint_exposure_dec is not None else None
     out: dict[str, Any] = {
@@ -1808,6 +1865,13 @@ class VendoredFuseEvaluator:
                 f"Caller engine_hash mismatch: expected {self.expected_engine_hash!r}, got {engine_hash!r}"
             )
 
+        if isinstance(validated_inputs, Mapping) and "kill_switch_tripped" in validated_inputs:
+            # Checked on the effective payload (native, direct or nested fuse_inputs): the pinned
+            # O8 reads only authorized_events, so the flag would be a silently ineffective control.
+            raise ValueError(
+                "kill_switch_tripped is not supported by fuse-eval-spec/v1 O8; supply an owner "
+                "authorized_events entry {'type': 'kill_switch', 'scope': 'account', ...} instead"
+            )
         validate_v2_reconciliation_payload(validated_inputs)
 
         auth_events_arg: dict | list | None
