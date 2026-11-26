@@ -489,6 +489,68 @@ class FeederTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "extended_hours_overnight_rejected"):
             select_tiingo_row(late_offset, "2025-11-28", calendar_session=half_cal)
 
+    def test_post_cutoff_and_post_retrieval_publication_timestamp_marked_ineligible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            post_cutoff_row = json.dumps(
+                [
+                    {
+                        "date": "2025-11-21T00:00:00.000Z",
+                        "close": 47.48,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "publicationTimestamp": "2025-11-22T02:00:00Z",
+                    }
+                ]
+            ).encode("utf-8")
+            rec_cutoff = emit_market_records_from_payloads(
+                (SeriesSpec("TQQQ", "TQQQ", "etf_tiingo"),),
+                {"TQQQ": post_cutoff_row},
+                session_date="2025-11-21",
+                retrieval_time_utc="2025-11-21T21:30:00.000Z",
+                decision_cutoff_utc="2025-11-21T23:00:00.000Z",
+                archive_dir=Path(tmpdir) / "arch_cutoff",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"TQQQ": "tiingo"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertFalse(rec_cutoff["eligibility"]["eligible"])
+            self.assertEqual(rec_cutoff["eligibility"]["reason"], "publication_after_decision_cutoff")
+
+            post_ret_row = json.dumps(
+                [
+                    {
+                        "date": "2025-11-21T00:00:00.000Z",
+                        "close": 47.48,
+                        "divCash": 0.0,
+                        "splitFactor": 1.0,
+                        "publicationTimestamp": "2025-11-21T22:00:00Z",
+                    }
+                ]
+            ).encode("utf-8")
+            rec_ret = emit_market_records_from_payloads(
+                (SeriesSpec("TQQQ", "TQQQ", "etf_tiingo"),),
+                {"TQQQ": post_ret_row},
+                session_date="2025-11-21",
+                retrieval_time_utc="2025-11-21T21:30:00.000Z",
+                decision_cutoff_utc="2025-11-21T23:00:00.000Z",
+                archive_dir=Path(tmpdir) / "arch_ret",
+                vintage="live_retrieval",
+                observation_class="live",
+                provider_for={"TQQQ": "tiingo"},
+                missing_reason_for=lambda inst: f"missing:{inst}",
+            )[0]
+            self.assertFalse(rec_ret["eligibility"]["eligible"])
+            self.assertEqual(rec_ret["eligibility"]["reason"], "publication_after_retrieval")
+
+            cal = resolve_session("XNYS", "2025-11-21")
+            ok_stale, err_stale = validate_official_close_market_record(
+                {"instrument": "TQQQ", "effective_session": "2025-11-20", "disclosures": {}},
+                cal,
+            )
+            self.assertFalse(ok_stale)
+            self.assertEqual(err_stale, "stale_effective_session")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -140,6 +140,20 @@ def read_verified_archived_bytes(
     return data
 
 
+def _parse_aware_utc(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    txt = raw.strip()
+    iso_norm = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
+    try:
+        parsed = datetime.fromisoformat(iso_norm)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def _build_mkt_record(
     *,
     instrument: str,
@@ -167,8 +181,21 @@ def _build_mkt_record(
     cutoff = decision_cutoff_utc if decision_cutoff_utc is not None else calendar_session.get("order_cutoff_utc")
     eff_close = session_close_utc if session_close_utc is not None else calendar_session.get("close_utc")
     post_close_ok = bool(eff_close is not None and retrieval_time_utc >= eff_close)
+    pub_reason: str | None = None
+    if source_publication_time_utc is not None:
+        pub_dt = _parse_aware_utc(source_publication_time_utc)
+        if pub_dt is None:
+            pub_reason = "invalid_source_publication_time"
+        else:
+            cutoff_dt = _parse_aware_utc(cutoff) if cutoff is not None else None
+            ret_dt = _parse_aware_utc(retrieval_time_utc)
+            if cutoff_dt is not None and pub_dt > cutoff_dt:
+                pub_reason = "publication_after_decision_cutoff"
+            elif ret_dt is not None and pub_dt > ret_dt:
+                pub_reason = "publication_after_retrieval"
     eligible = (
         missing_reason is None
+        and pub_reason is None
         and normalized_value is not None
         and bool(calendar_session.get("is_trading_day"))
         and not bool(calendar_session.get("blocks_eligibility"))
@@ -180,7 +207,9 @@ def _build_mkt_record(
     if eligible:
         elig_reason = None
     elif elig_reason is None:
-        if normalized_value is None:
+        if pub_reason is not None:
+            elig_reason = pub_reason
+        elif normalized_value is None:
             elig_reason = "missing_normalized_value"
         elif cutoff is None or not calendar_session.get("is_trading_day"):
             elig_reason = "non_trading_session"
@@ -1444,8 +1473,13 @@ def validate_official_close_market_record(
     if inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI"):
         trade_date = str(calendar_session.get("trade_date") or "")
         eff = str(rec.get("effective_session") or "")
-        if trade_date and eff > trade_date:
-            return False, "next_trade_date_contamination"
+        if trade_date:
+            if not eff:
+                return False, "missing_effective_session"
+            if eff > trade_date:
+                return False, "next_trade_date_contamination"
+            if eff < trade_date:
+                return False, "stale_effective_session"
         bar_ts = disclosures.get("bar_timestamp_utc")
         if isinstance(bar_ts, str) and bar_ts.strip():
             ok_ts, err = is_official_close_bar_timestamp(bar_ts, calendar_session)
