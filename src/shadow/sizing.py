@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_EVEN, localcontext
 from pathlib import Path
 
@@ -106,6 +106,12 @@ class SizingInputError(ValueError):
         super().__init__(message)
 
 
+_MAX_CANONICAL_DECIMAL_DIGITS = 64
+_MAX_CANONICAL_ABS_ADJUSTED_EXP = 64
+_MIN_CANONICAL_EXPONENT = -128
+_MAX_CANONICAL_EXPONENT = 64
+
+
 def canonical_decimal_str(value: Decimal | int | str) -> str:
     """Format a finite Decimal as an ordinary base-ten canonical string."""
     d = value if isinstance(value, Decimal) else Decimal(str(value))
@@ -113,6 +119,16 @@ def canonical_decimal_str(value: Decimal | int | str) -> str:
         raise ValueError(f"Non-finite decimal disallowed: {value!r}")
     if d == 0:
         return "0"
+    tup = d.as_tuple()
+    exp = tup.exponent
+    if (
+        not isinstance(exp, int)
+        or len(tup.digits) > _MAX_CANONICAL_DECIMAL_DIGITS
+        or exp < _MIN_CANONICAL_EXPONENT
+        or exp > _MAX_CANONICAL_EXPONENT
+        or abs(d.adjusted()) > _MAX_CANONICAL_ABS_ADJUSTED_EXP
+    ):
+        raise ValueError(f"Decimal exponent or precision out of bounds: {value!r}")
     s = format(d, "f")
     if "." in s:
         s = s.rstrip("0").rstrip(".")
@@ -369,9 +385,82 @@ def compute_raw_vs_adjusted_separation(
     }
 
 
+_CONTROL_STATE_RANK = {
+    "NORMAL": 0,
+    "NO-NEW-RISK": 1,
+    "DE-RISK": 2,
+    "ORDER-UNKNOWN": 3,
+    "HALT": 4,
+    "J1_TRIM": 1,
+}
+
+
+def _validate_control_state(state: object, field: str) -> str:
+    if not isinstance(state, str) or state not in _CONTROL_STATE_RANK:
+        raise SizingInputError(field, f"Unknown control state for {field}: {state!r}")
+    return state
+
+
+def _most_restrictive_sizing_state(base_state: str, fund_state: str | None) -> str:
+    valid_base = _validate_control_state(base_state, "base_control_state")
+    if fund_state is None:
+        return valid_base
+    valid_fund = _validate_control_state(fund_state, "fund_control_state")
+    if valid_fund == valid_base:
+        return valid_base
+    if _CONTROL_STATE_RANK[valid_fund] > _CONTROL_STATE_RANK[valid_base]:
+        return valid_fund
+    return valid_base
+
+
+def compute_tier_max_loss_fraction(
+    tier_id: str,
+    *,
+    e_val: Decimal,
+    e_star: Decimal,
+    l_val: Decimal,
+    h_val: Decimal = Decimal("0"),
+    w_ref: Decimal | None = None,
+) -> tuple[Decimal, str, Decimal]:
+    """Compute Step 3 (cushion, binding_subbound, x_ML) using prec=28 U-01 math."""
+    if tier_id not in TIER_CONFIGS:
+        raise SizingInputError("tier_id", f"Unknown tier {tier_id!r}")
+    if e_val <= 0:
+        raise SizingInputError("E", f"Equity E must be > 0, got {e_val}")
+    if e_star <= 0 or e_val > e_star:
+        raise SizingInputError("E_star", f"Must satisfy 0 < E <= E_star ({e_val}, {e_star})")
+    if h_val < 0:
+        raise SizingInputError("H", f"External capital H must be >= 0, got {h_val}")
+    if l_val < 0:
+        raise SizingInputError("L", f"Loss L must be >= 0, got {l_val}")
+
+    with localcontext() as ctx:
+        ctx.prec = 28
+        ctx.rounding = ROUND_HALF_EVEN
+        d_budget = Decimal(TIER_CONFIGS[tier_id]["D"])
+        w_ref_eff = w_ref if w_ref is not None else (e_star + h_val)
+        if w_ref_eff - l_val <= 0:
+            raise SizingInputError("W_ref", "W_ref - L must be > 0")
+        if l_val >= d_budget * w_ref_eff:
+            cushion = Decimal("0")
+        else:
+            cushion = (d_budget * w_ref_eff - l_val) / (w_ref_eff - l_val)
+        ln_one_minus_shock = (Decimal("1") - Decimal("0.83")).ln()
+        bound_a = Decimal("3") * cushion
+        bound_b = Decimal("2") * cushion
+        bound_c = _m0_cap(cushion, ln_one_minus_shock)
+        subbound, x_ml = min(
+            [("a", bound_a), ("b", bound_b), ("c", bound_c)],
+            key=lambda item: item[1],
+        )
+        return cushion, subbound, x_ml
+
+
 def compute_session_sizing(
     inputs: dict,
     active_control_state: str = "NORMAL",
+    fund_control_states: Mapping[str, str] | None = None,
+    tier_control_states: Mapping[str, tuple[str, Mapping[str, str] | None]] | None = None,
 ) -> dict:
     """Compute the 10-step policy_v0_pre notional sizing stack across all 3 tiers."""
     with localcontext() as ctx:
@@ -433,6 +522,13 @@ def compute_session_sizing(
         ln_one_minus_shock = (Decimal("1") - Decimal("0.83")).ln()
         conv_scale = Decimal("1") + (h_val / e_star)
 
+        _validate_control_state(active_control_state, "active_control_state")
+        if fund_control_states is not None:
+            if not isinstance(fund_control_states, Mapping):
+                raise SizingInputError("fund_control_states", "fund_control_states must be a mapping")
+            for fk, fv in fund_control_states.items():
+                _validate_control_state(fv, f"fund_control_states.{fk}")
+
         tiers_out: list[dict] = []
         for tier_id in TIER_ORDER:
             tc = TIER_CONFIGS[tier_id]
@@ -443,19 +539,14 @@ def compute_session_sizing(
             w_max = Decimal(tc["w_max"])
             sigma_target = Decimal(tc["sigma_target"])
 
-            # Cushion per U-01 §3.4 & DEMO-BRIEF
-            if l_val >= d_budget * w_ref:
-                cushion = Decimal("0")
-            else:
-                cushion = (d_budget * w_ref - l_val) / (w_ref - l_val)
-
-            # Step 3: x_ML(c) = min(3c, 2c, M0(c))
-            bound_a = Decimal("3") * cushion
-            bound_b = Decimal("2") * cushion
-            bound_c = _m0_cap(cushion, ln_one_minus_shock)
-            subbound, x_ml = min(
-                [("a", bound_a), ("b", bound_b), ("c", bound_c)],
-                key=lambda item: item[1],
+            # Cushion & Step 3 x_ML(c) = min(3c, 2c, M0(c)) per U-01 §3.4 & DEMO-BRIEF
+            cushion, subbound, x_ml = compute_tier_max_loss_fraction(
+                tier_id,
+                e_val=e_val,
+                e_star=e_star,
+                l_val=l_val,
+                h_val=h_val,
+                w_ref=w_ref,
             )
             cap_23 = min(x_cap, x_ml)
 
@@ -478,42 +569,34 @@ def compute_session_sizing(
                 denom = beta_soxl if inst == "SOXL" else Decimal("1")
                 x_pre[inst] = (s_i * cap_23 * v_i) / denom
 
-            # Step 7: Joint cap with OQ-1 resolution
-            x_eff_joint = min(x_joint, x_ml)
-            soxl_subcap_limit = x_eff_joint / Decimal("3")
-            soxl_beta_pre = beta_soxl * x_pre["SOXL"]
-            soxl_subcap_bound = soxl_beta_pre > soxl_subcap_limit
-            x_soxl_mid = min(soxl_beta_pre, soxl_subcap_limit) / beta_soxl
-            x_joint_beta = x_pre["TQQQ"] + beta_soxl * x_soxl_mid
+            t_acct_state = active_control_state
+            t_fund_states = fund_control_states
+            if tier_control_states is not None and tier_id in tier_control_states:
+                t_acct_state, t_fund_states = tier_control_states[tier_id]
+            _validate_control_state(t_acct_state, f"{tier_id}.control_state")
+            if t_fund_states is not None:
+                if not isinstance(t_fund_states, Mapping):
+                    raise SizingInputError(
+                        f"{tier_id}.fund_control_states",
+                        "tier fund_control_states must be a mapping",
+                    )
+                for fk, fv in t_fund_states.items():
+                    _validate_control_state(fv, f"{tier_id}.fund_control_states.{fk}")
 
-            if x_joint_beta <= x_eff_joint:
-                alpha_joint = Decimal("1")
-                x_post = {"TQQQ": x_pre["TQQQ"], "SOXL": x_soxl_mid}
-                joint_cap_bound = False
-            else:
-                alpha_joint = x_eff_joint / x_joint_beta
-                x_post = {
-                    "TQQQ": alpha_joint * x_pre["TQQQ"],
-                    "SOXL": alpha_joint * x_soxl_mid,
-                }
-                joint_cap_bound = True
-
-            # Step 8: Account fund weights & combined hard ceiling min(w_max, 1.00)
-            w_raw = {
-                inst: (x_post[inst] / Decimal("3")) * conv_scale
+            eff_states: dict[str, str] = {
+                inst: _most_restrictive_sizing_state(
+                    t_acct_state,
+                    (t_fund_states or {}).get(inst),
+                )
                 for inst in INSTRUMENT_ORDER
             }
-            w_ceil = min(w_max, Decimal("1.00"))
-            w_raw_sum = w_raw["TQQQ"] + w_raw["SOXL"]
-            if w_raw_sum > w_ceil and w_raw_sum > 0:
-                w_scale = w_ceil / w_raw_sum
-                w_target = {inst: w_raw[inst] * w_scale for inst in INSTRUMENT_ORDER}
-                w_max_bound = True
-            else:
-                w_target = w_raw
-                w_max_bound = False
+            frozen_insts = {
+                inst
+                for inst in INSTRUMENT_ORDER
+                if eff_states[inst] in ("HALT", "ORDER-UNKNOWN")
+            }
 
-            # Current weights and exposures for Step 9 mandatory bypass evaluation
+            # Current weights and exposures for Step 9 mandatory bypass & frozen-holding reservation
             w_cur_map = {
                 inst: (Decimal(q_pre_map[inst]) * fund_parsed[inst]["close_price"]) / e_val  # type: ignore[operator]
                 for inst in INSTRUMENT_ORDER
@@ -523,7 +606,89 @@ def compute_session_sizing(
                 for inst in INSTRUMENT_ORDER
             }
             w_cur_sum = w_cur_map["TQQQ"] + w_cur_map["SOXL"]
+
+            # Step 7: Joint cap with OQ-1 resolution, reserving any frozen (HALT /
+            # ORDER-UNKNOWN) holdings and excluding DE-RISK funds from active allocation.
+            x_eff_joint = min(x_joint, x_ml)
+            soxl_subcap_limit = x_eff_joint / Decimal("3")
+            w_ceil = min(w_max, Decimal("1.00"))
             joint_cur_exceeded = (x_cur_map["TQQQ"] + beta_soxl * x_cur_map["SOXL"]) > x_eff_joint
+
+            frozen_joint_beta = sum(
+                (beta_soxl if inst == "SOXL" else Decimal("1")) * x_cur_map[inst]
+                for inst in frozen_insts
+            )
+            rem_joint = max(Decimal("0"), x_eff_joint - frozen_joint_beta)
+            active_insts = [
+                inst
+                for inst in INSTRUMENT_ORDER
+                if inst not in frozen_insts and eff_states[inst] != "DE-RISK"
+            ]
+            soxl_beta_pre = beta_soxl * x_pre["SOXL"]
+            soxl_subcap_bound = (
+                "SOXL" in active_insts and soxl_beta_pre > soxl_subcap_limit
+            )
+            x_mid = {
+                inst: (
+                    min(soxl_beta_pre, soxl_subcap_limit) / beta_soxl
+                    if inst == "SOXL"
+                    else x_pre[inst]
+                )
+                for inst in active_insts
+            }
+            active_joint_beta = sum(
+                (beta_soxl if inst == "SOXL" else Decimal("1")) * x_mid[inst]
+                for inst in active_insts
+            )
+            if active_joint_beta <= rem_joint:
+                alpha_joint = Decimal("1")
+                x_post_active = dict(x_mid)
+                joint_cap_bound = False
+            elif rem_joint == 0 or active_joint_beta <= 0:
+                alpha_joint = Decimal("0")
+                x_post_active = {inst: Decimal("0") for inst in active_insts}
+                joint_cap_bound = True
+            else:
+                alpha_joint = rem_joint / active_joint_beta
+                x_post_active = {inst: alpha_joint * x_mid[inst] for inst in active_insts}
+                joint_cap_bound = True
+            x_post = {
+                inst: (
+                    x_cur_map[inst]
+                    if inst in frozen_insts
+                    else x_post_active.get(inst, Decimal("0"))
+                )
+                for inst in INSTRUMENT_ORDER
+            }
+
+            # Step 8: Account fund weights & combined hard ceiling min(w_max, 1.00)
+            frozen_w_sum = sum(w_cur_map[inst] for inst in frozen_insts)
+            rem_w_ceil = max(Decimal("0"), w_ceil - frozen_w_sum)
+            w_raw_active = {
+                inst: (x_post[inst] / Decimal("3")) * conv_scale
+                for inst in active_insts
+            }
+            w_raw_active_sum = sum(w_raw_active.values())
+            if w_raw_active_sum > rem_w_ceil:
+                w_max_bound = True
+                if rem_w_ceil == 0 or w_raw_active_sum <= 0:
+                    w_target_active = {inst: Decimal("0") for inst in active_insts}
+                else:
+                    w_scale = rem_w_ceil / w_raw_active_sum
+                    w_target_active = {
+                        inst: w_raw_active[inst] * w_scale for inst in active_insts
+                    }
+            else:
+                w_max_bound = False
+                w_target_active = w_raw_active
+            w_target = {
+                inst: (
+                    w_cur_map[inst]
+                    if inst in frozen_insts
+                    else w_target_active.get(inst, Decimal("0"))
+                )
+                for inst in INSTRUMENT_ORDER
+            }
 
             funds_out: list[dict] = []
             for inst in INSTRUMENT_ORDER:
@@ -540,14 +705,28 @@ def compute_session_sizing(
                 kelly_cf_x = (s_i * min(x_cap, x_ml, x_k_c) * v_i) / denom
                 kelly_would_bind = kelly_cf_x < x_p
 
+                eff_state = eff_states[inst]
                 w_tgt = w_target[inst]
-                if active_control_state == "DE-RISK":
+                if eff_state == "DE-RISK":
                     w_tgt_eff = Decimal("0")
                 else:
                     w_tgt_eff = w_tgt
 
                 q_ideal = int((w_tgt_eff * e_val / p_ref).to_integral_value(rounding=ROUND_FLOOR))
                 q_pre_i = q_pre_map[inst]
+                no_new_risk_clamped = False
+                no_new_risk_active = (
+                    eff_state == "NO-NEW-RISK"
+                    or t_acct_state == "NO-NEW-RISK"
+                    or (t_fund_states or {}).get(inst) == "NO-NEW-RISK"
+                )
+                if (
+                    no_new_risk_active
+                    and eff_state not in ("HALT", "ORDER-UNKNOWN", "DE-RISK")
+                    and q_ideal > q_pre_i
+                ):
+                    q_ideal = q_pre_i
+                    no_new_risk_clamped = True
                 w_cur_i = w_cur_map[inst]
 
                 cap_exceeded = (
@@ -556,15 +735,19 @@ def compute_session_sizing(
                     or joint_cur_exceeded
                     or (w_cur_sum > w_ceil)
                 )
-                breaker_forced_reduce = active_control_state in ("DE-RISK", "J1_TRIM")
+                breaker_forced_reduce = (
+                    eff_state in ("DE-RISK", "J1_TRIM")
+                    or t_acct_state == "J1_TRIM"
+                    or (t_fund_states or {}).get(inst) == "J1_TRIM"
+                )
                 mandatory_bypass = (q_ideal < q_pre_i) and (cap_exceeded or breaker_forced_reduce)
                 in_band = abs(w_cur_i - w_tgt_eff) <= (b_band * w_tgt_eff)
 
-                if active_control_state == "HALT":
+                if eff_state in ("HALT", "ORDER-UNKNOWN"):
                     delta_q_exec = 0
                     band_suppressed = False
                     emerg_bypass = False
-                elif q_ideal == q_pre_i:
+                elif q_ideal == q_pre_i or no_new_risk_clamped:
                     delta_q_exec = 0
                     band_suppressed = False
                     emerg_bypass = False

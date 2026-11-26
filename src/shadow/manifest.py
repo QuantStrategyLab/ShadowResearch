@@ -16,6 +16,7 @@ RUNTIME_MODULE_FILES: tuple[str, ...] = (
     "src/shadow/evaluator.py",
     "src/shadow/feeder.py",
     "src/shadow/feeder_live.py",
+    "src/shadow/fuse_adapter.py",
     "src/shadow/ledger.py",
     "src/shadow/manifest.py",
     "src/shadow/ots.py",
@@ -111,7 +112,14 @@ def compute_code_manifest_hash(
     cal_ver = cal_ver or "csa22-v1"
 
     targets: list[tuple[str, Path]] = [(rel, root / rel) for rel in RUNTIME_MODULE_FILES]
-    targets.append(("config/drill-scheduler.json", cfg_file))
+    if config_path is None:
+        cfg_rel = "config/drill-scheduler.json"
+    else:
+        try:
+            cfg_rel = cfg_file.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            cfg_rel = f"external/{cfg_file.resolve().as_posix().lstrip('/')}"
+    targets.append((cfg_rel, cfg_file))
     targets.append((f"specs/{cal_ver}/manifest.json", root / "specs" / cal_ver / "manifest.json"))
 
     h = hashlib.sha256()

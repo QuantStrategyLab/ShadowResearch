@@ -176,6 +176,14 @@ class SizingStackTest(unittest.TestCase):
         self.assertEqual(canonical_decimal_str(Decimal("0.2000")), "0.2")
         with self.assertRaises(ValueError):
             canonical_decimal_str(Decimal("NaN"))
+        self.assertEqual(canonical_decimal_str(Decimal("0E-57")), "0")
+        for extreme in (
+            Decimal("1e200000000"),
+            Decimal("1e-200000000"),
+            Decimal("1." + ("1" * 64)),
+        ):
+            with self.assertRaises(ValueError):
+                canonical_decimal_str(extreme)
 
     def test_missing_input_raises_sizing_error(self) -> None:
         bad = _make_inputs()
@@ -434,6 +442,114 @@ class SizingStackTest(unittest.TestCase):
                 self.assertNotEqual(compute_code_manifest_hash(tmp_repo), base_code, mod)
                 self.assertNotEqual(policy_config_hash(repo_root=tmp_repo), base_policy, mod)
                 target.write_text(orig, encoding="utf-8")
+
+    def test_halted_fund_holdings_reserved_against_joint_cap_and_weight_ceil(self) -> None:
+        # Codex P2 regression (PRRT_kwDOV2RNAc67oejF): balanced $50k with 500 TQQQ ($25k) under
+        # V2 fund-scoped HALT and 0 SOXL must reserve frozen TQQQ exposure so SOXL cannot buy.
+        overweight_halt = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                L="0",
+                p_tqqq="50",
+                q_pre_tqqq=500,
+                p_soxl="40",
+                q_pre_soxl=0,
+            ),
+            active_control_state="NORMAL",
+            fund_control_states={"TQQQ": "HALT", "SOXL": "NORMAL"},
+        )
+        bal_over = _tier(overweight_halt, "balanced")
+        self.assertEqual(_fund(bal_over, "TQQQ")["delta_q_exec"], 0)
+        self.assertEqual(_fund(bal_over, "SOXL")["q_ideal"], 0)
+        self.assertEqual(_fund(bal_over, "SOXL")["delta_q_exec"], 0)
+
+        # Partial frozen TQQQ ($2,500 => x_cur = 0.15) leaves x_ML - 0.15 = 0.051289... headroom
+        partial_halt = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                L="0",
+                p_tqqq="50",
+                q_pre_tqqq=50,
+                p_soxl="40",
+                q_pre_soxl=0,
+            ),
+            active_control_state="NORMAL",
+            fund_control_states={"TQQQ": "HALT", "SOXL": "NORMAL"},
+        )
+        bal_part = _tier(partial_halt, "balanced")
+        soxl_part = _fund(bal_part, "SOXL")
+        tqqq_x_cur = Decimal("3") * (Decimal("2500") / Decimal("50000"))
+        total_beta_post = tqqq_x_cur + Decimal("1.5") * Decimal(soxl_part["x_post_joint"])
+        self.assertLessEqual(total_beta_post, Decimal(bal_part["x_ML"]) + Decimal("0.000002"))
+        self.assertEqual(_fund(bal_part, "TQQQ")["delta_q_exec"], 0)
+
+    def test_derisk_excluded_from_cap_without_frozen_and_tier_j1_trim_triggers_bypass(self) -> None:
+        # 1) When TQQQ is DE-RISK and frozen_insts is empty, SOXL keeps full headroom.
+        derisk_res = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                q_pre_tqqq=200,
+                q_pre_soxl=0,
+            ),
+            fund_control_states={"TQQQ": "DE-RISK", "SOXL": "NORMAL"},
+        )
+        bal_derisk = _tier(derisk_res, "balanced")
+        self.assertEqual(_fund(bal_derisk, "TQQQ")["w_target"], "0")
+        self.assertGreater(int(_fund(bal_derisk, "SOXL")["q_ideal"]), 0)
+
+        # 2) Tier-level J1_TRIM triggers mandatory_bypass for a weight-reducing trade even inside +/-20% band.
+        # Compute baseline NORMAL balanced weight/q_pre slightly above target (inside 20% band) then trigger J1_TRIM on balanced tier.
+        base_normal = compute_session_sizing(_make_inputs(E="50000", E_star="50000"))
+        bal_norm = _tier(base_normal, "balanced")
+        q_target_tqqq = _fund(bal_norm, "TQQQ")["q_ideal"]
+        trim_res = compute_session_sizing(
+            _make_inputs(
+                E="50000",
+                E_star="50000",
+                q_pre_tqqq=int(q_target_tqqq) + 1,
+            ),
+            tier_control_states={"balanced": ("J1_TRIM", None)},
+        )
+        bal_trim = _tier(trim_res, "balanced")
+        self.assertEqual(_fund(bal_trim, "TQQQ")["delta_q_exec"], -1)
+
+    def test_no_new_risk_clamp_holds_under_j1_trim_and_unknown_state_rejected(self) -> None:
+        # Rank-1 tie: J1_TRIM at tier/account level MUST NOT defeat fund NO-NEW-RISK buy clamp.
+        res = compute_session_sizing(
+            _make_inputs(E="50000", E_star="50000", q_pre_tqqq=0, q_pre_soxl=0),
+            active_control_state="NORMAL",
+            tier_control_states={"balanced": ("J1_TRIM", {"TQQQ": "NO-NEW-RISK", "SOXL": "NORMAL"})},
+        )
+        bal = _tier(res, "balanced")
+        self.assertEqual(_fund(bal, "TQQQ")["q_ideal"], 0)
+        self.assertEqual(_fund(bal, "TQQQ")["delta_q_exec"], 0)
+        self.assertGreater(_fund(bal, "SOXL")["q_ideal"], 0)
+
+        for bad_kwargs in (
+            {"active_control_state": "BOGUS"},
+            {"fund_control_states": {"TQQQ": "NO_NEW_RISK"}},
+            {"tier_control_states": {"balanced": ("NORMAL", {"SOXL": "UNKNOWN"})}},
+        ):
+            with self.assertRaises(SizingInputError):
+                compute_session_sizing(_make_inputs(E="50000", E_star="50000"), **bad_kwargs)  # type: ignore[arg-type]
+
+    def test_code_manifest_hash_distinguishes_same_filename_config_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_repo = Path(tmpdir)
+            (tmp_repo / "dir_a").mkdir()
+            (tmp_repo / "dir_b").mkdir()
+            cfg_a = tmp_repo / "dir_a" / "shared.json"
+            cfg_b = tmp_repo / "dir_b" / "shared.json"
+            payload = '{"calendar_version":"csa22-v2","mode":"drill"}\n'
+            cfg_a.write_text(payload, encoding="utf-8")
+            cfg_b.write_text(payload, encoding="utf-8")
+            self.assertNotEqual(
+                compute_code_manifest_hash(tmp_repo, config_path=cfg_a),
+                compute_code_manifest_hash(tmp_repo, config_path=cfg_b),
+            )
 
 
 if __name__ == "__main__":
