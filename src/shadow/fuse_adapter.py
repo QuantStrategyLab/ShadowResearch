@@ -221,7 +221,7 @@ def _verify_pyc_matches_source(
     if norm_fn != src_path.name and not norm_fn.endswith("/" + src_path.name):
         raise EngineIdentityError(f"Unexpected .pyc co_filename in vendored engine: {rel!r}")
 
-    expected_code = compile(src_bytes, pyc_code.co_filename, "exec", optimize=optimize)
+    expected_code = compile(src_bytes, pyc_code.co_filename, "exec", dont_inherit=True, optimize=optimize)
     if marshal.dumps(pyc_code) != marshal.dumps(expected_code):
         raise EngineIdentityError(f"Tampered .pyc bytecode mismatch in vendored engine: {rel!r}")
 
@@ -1270,7 +1270,7 @@ def build_fuse_validated_inputs(
             "quote_staleness": _finite_number(fdata.get("quote_staleness")),
             "spread_width": _finite_number(fdata.get("spread_width")),
             "trading_pause": fdata.get("trading_pause"),
-            "session_time": str(fdata.get("session_time", "regular")),
+            "session_time": str(fdata["session_time"]) if fdata.get("session_time") is not None else None,
             "share_count": _preserve_numeric_quantity(q_pre_val) if q_pre_val is not None else 0,
             "ledger_value": _finite_number(fdata.get("ledger_value")) if fdata.get("ledger_value") is not None else pos_val,
             "broker_position": _preserve_numeric_quantity(broker_pos_val),
@@ -1385,7 +1385,13 @@ def build_fuse_validated_inputs(
             if "account_whitelist" in session_inputs
             else ["stage_n_shadow"]
         ),
-        "settled_cash": _finite_number(session_inputs.get("settled_cash")) if session_inputs.get("settled_cash") is not None else bankroll_val,
+        "settled_cash": (
+            _finite_number(session_inputs["settled_cash"])
+            if session_inputs.get("settled_cash") is not None
+            else _finite_number(session_inputs["o5_settled_cash"])
+            if session_inputs.get("o5_settled_cash") is not None
+            else bankroll_val
+        ),
         "session_order_count": int(session_inputs.get("session_order_count", 0)),
         "session_turnover": _finite_number(session_inputs.get("session_turnover")) if session_inputs.get("session_turnover") is not None else 0.0,
         "loaded_policy_hash": str(session_inputs.get("loaded_policy_hash", policy_hash)),
