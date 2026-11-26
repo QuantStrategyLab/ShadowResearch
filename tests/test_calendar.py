@@ -15,6 +15,7 @@ if _SRC not in sys.path:
 
 from shadow.calendar_consumer import (
     CalendarDigestError,
+    classify_us_equity_session_window,
     load_spec,
     resolve_prior_close_session,
     resolve_session,
@@ -134,6 +135,16 @@ class CalendarConsumerTest(unittest.TestCase):
         # Half-day 2025-11-28 after 13:00 EST (18:00Z) -> resolves 2025-11-28
         half_after = resolve_prior_close_session("2025-11-28T18:05:00.000Z", spec=spec)
         self.assertEqual(half_after["trade_date"], "2025-11-28")
+
+    def test_classify_session_window_checks_closure_and_date_before_overnight_hours(self) -> None:
+        spec = load_spec(SPEC_DIR)
+        sat_sess = resolve_session("XNYS", "2025-11-22", spec=spec)
+        hol_sess = resolve_session("XNYS", "2025-12-25", spec=spec)
+        mon_sess = resolve_session("XNYS", "2025-11-24", spec=spec)
+        self.assertEqual(classify_us_equity_session_window("2025-11-23T02:00:00.000Z", sat_sess), "closed")
+        self.assertEqual(classify_us_equity_session_window("2025-12-26T02:00:00.000Z", hol_sess), "closed")
+        self.assertEqual(classify_us_equity_session_window("2025-11-25T06:00:00.000Z", mon_sess), "next_trade_date_window")
+        self.assertEqual(classify_us_equity_session_window("2025-11-25T02:15:00.000Z", mon_sess), "extended_overnight_open")
 
 
 if __name__ == "__main__":

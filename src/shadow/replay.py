@@ -245,6 +245,7 @@ def replay_window(
                             archive_dir,
                             mrec,
                             session_date=sess.get("session_date"),
+                            calendar_session=cal,
                         )
                         if not ok_raw:
                             archive_errors.append(f"seq_{seq}:{raw_err}")

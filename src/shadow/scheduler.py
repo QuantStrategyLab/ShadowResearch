@@ -2264,7 +2264,7 @@ def _run_daily_drill_cycle_locked(
     raw_integrity_failures: list[str] = []
     for rec in mkt_recs:
         ok_raw, raw_err = verify_market_record_raw_integrity(
-            archive_dir, rec, session_date=session_date
+            archive_dir, rec, session_date=session_date, calendar_session=cal
         )
         if not ok_raw:
             raw_integrity_failures.append(str(raw_err))

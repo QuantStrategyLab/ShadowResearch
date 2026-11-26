@@ -383,6 +383,56 @@ class OpenTimestampsTest(unittest.TestCase):
             )
         self.assertIn("ots_redirect_rejected", str(ctx_redir.exception))
 
+    def test_urllib_ots_transport_deadline_label_and_http_exception_wrapping(self) -> None:
+        import time
+        from shadow.http_limits import make_deadline_http_handlers, read_bounded_http_body
+
+        class _TimeoutStream:
+            chunked = False
+            length = 8
+
+            def read1(self, _n: int) -> bytes:
+                raise TimeoutError("timed out")
+
+        with self.assertRaises(OtsSubmitError) as ctx_dl:
+            read_bounded_http_body(
+                _TimeoutStream(),
+                max_bytes=1024,
+                error_cls=OtsSubmitError,
+                error_prefix="ots_response_too_large",
+                deadline_monotonic=time.monotonic() + 1.0,
+            )
+        self.assertEqual(str(ctx_dl.exception), "ots_response:deadline_exceeded")
+
+        class _BrokenStream:
+            chunked = False
+            length = 8
+            closed = False
+
+            def read1(self, _n: int) -> bytes:
+                raise http.client.HTTPException("stream reset")
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _BrokenStreamHttpsHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):  # type: ignore[override]
+                hdrs = http.client.HTTPMessage()
+                resp = urllib.response.addinfourl(_BrokenStream(), hdrs, req.full_url, code=200)
+                resp.msg = "OK"
+                return resp
+
+        opener = urllib.request.build_opener(_BrokenStreamHttpsHandler(), _NoOtsRedirectHandler())
+        with self.assertRaisesRegex(OtsSubmitError, "ots_transport_error:HTTPException"):
+            urllib_ots_transport(
+                "GET",
+                "https://a.pool.opentimestamps.org/timestamp/00",
+                None,
+                {"Accept": "application/vnd.opentimestamps.v1"},
+                5.0,
+                opener=opener,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
