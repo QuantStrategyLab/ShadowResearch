@@ -873,6 +873,10 @@ def evaluate_non_stub_tiers(
         tier_inputs["tier"] = tier_id
         if proposed_exposure_by_tier is not None and tier_id in proposed_exposure_by_tier:
             tier_inputs["proposed_exposure"] = proposed_exposure_by_tier[tier_id]
+            if isinstance(tier_inputs.get("fuse_inputs"), Mapping):
+                nested_copy = dict(tier_inputs["fuse_inputs"])
+                nested_copy["proposed_exposure"] = proposed_exposure_by_tier[tier_id]
+                tier_inputs["fuse_inputs"] = nested_copy
         if (
             tier_id != primary_tier
             and primary_tier_change is not None
@@ -3596,9 +3600,9 @@ def _assert_pending_state_preserves_committed_breakers(
 
     c_by_tier = committed_state.get("_by_tier")
     p_by_tier = pending_state.get("_by_tier")
-    if isinstance(c_by_tier, Mapping) and p_by_tier is not None:
+    if isinstance(c_by_tier, Mapping):
         if not isinstance(p_by_tier, Mapping):
-            raise EngineIdentityError("Pending state invalid _by_tier section")
+            raise EngineIdentityError("Pending state invalid or missing _by_tier section")
         for t_name, c_tier_state in c_by_tier.items():
             if not isinstance(c_tier_state, Mapping):
                 continue

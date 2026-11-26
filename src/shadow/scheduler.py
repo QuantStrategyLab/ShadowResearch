@@ -3340,6 +3340,8 @@ def _run_daily_drill_cycle_locked(
     head_env = ledger.head()
     head_hash = head_env["record_sha256"] if head_env is not None else GENESIS_PREV_HASH
     prior_records = ledger.load_records()
+    if prior_records:
+        ledger.recover_pending_evidence(prior_records)
     anchor_resolved, anchor_bytes = _authenticate_production_history(
         ledger=ledger,
         cfg=cfg,
