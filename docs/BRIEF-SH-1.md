@@ -90,7 +90,7 @@ Phase B acceptance passed **8/8** (`~/workspace/mac-mini-pilot/PHASE-B-ACCEPTANC
 
 - Fail-closed egress for the dev user: the only outbound paths are loopback and
   the SSH tunnel to qVPS over tailscale0; proxied egress is
-  **43.156.238.238, loc=SG**; direct internet, LAN, direct DNS, own-address and
+  **<egress-ip>, loc=SG**; direct internet, LAN, direct DNS, own-address and
   IPv6 paths are all dropped and were acceptance-tested as dropped.
 - Per-process environment pinned by `~/dev-env-mini/env.sh`:
   `TZ=Asia/Singapore`, `LANG/LC_ALL=en_SG.UTF-8`, HTTP proxy
