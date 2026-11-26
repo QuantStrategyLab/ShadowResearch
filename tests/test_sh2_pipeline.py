@@ -2699,6 +2699,7 @@ class Sh2PipelineTest(unittest.TestCase):
                         "instrument": inst,
                         "normalized_value": 50.0,
                         "calendar_spec_digest": str(cal5["spec_digest"]),
+                        "effective_session": ts[:10],
                         "eligibility": {"eligible": True},
                     }
                     for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
@@ -2867,6 +2868,7 @@ class Sh2PipelineTest(unittest.TestCase):
                         "instrument": inst,
                         "normalized_value": 50.0,
                         "calendar_spec_digest": str(cal5["spec_digest"]),
+                        "effective_session": ts[:10],
                         "eligibility": {"eligible": True},
                     }
                     for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
