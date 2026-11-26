@@ -1418,12 +1418,15 @@ def build_fuse_validated_inputs(
             out[o5_key] = copy.deepcopy(session_inputs[o5_key])
     # Canonical O5 session counters default to zero only when no alias carries evidence;
     # the vendored evaluate_O5() treats conflicting aliases as a limit violation.
+    # An explicitly supplied null counter is unknown evidence and is preserved as None.
     if "session_order_count" in session_inputs:
-        out["session_order_count"] = int(session_inputs["session_order_count"])
+        raw_count = session_inputs["session_order_count"]
+        out["session_order_count"] = int(raw_count) if raw_count is not None else None
     elif not any(k in session_inputs for k in ("o5_orders_today", "orders_today")):
         out["session_order_count"] = 0
-    if session_inputs.get("session_turnover") is not None:
-        out["session_turnover"] = _finite_number(session_inputs["session_turnover"])
+    if "session_turnover" in session_inputs:
+        raw_turnover = session_inputs["session_turnover"]
+        out["session_turnover"] = _finite_number(raw_turnover) if raw_turnover is not None else None
     elif not any(k in session_inputs for k in ("o5_turnover_today", "turnover_today")):
         out["session_turnover"] = 0.0
     # O9 checks H change descriptors against the live H used for exposure and loss caps.

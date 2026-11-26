@@ -1249,6 +1249,29 @@ class FuseAdapterTest(unittest.TestCase):
         )
         self.assertFalse(_rows(si_o5)["O5"]["would_have_tripped"])
 
+        # O5: explicitly unknown canonical counters are preserved, not defaulted to zero.
+        for null_counter, limit_key, limit_val in (
+            ("session_turnover", "o5_max_turnover_per_session", 10000),
+            ("session_order_count", "o5_max_orders_per_session", 10),
+        ):
+            si_null = _valid_inputs()
+            si_null.update(
+                {
+                    "o5_collar": "0.05",
+                    "o5_symbol": "TQQQ",
+                    "o5_order_size": 10,
+                    "o5_side": "buy",
+                    "o5_limit_price": "50",
+                    "o5_reference_price": "50",
+                    "o5_account": "stage_n_shadow",
+                    limit_key: limit_val,
+                    null_counter: None,
+                }
+            )
+            rows_null = _rows(si_null)
+            self.assertTrue(rows_null["O5"]["would_have_tripped"], null_counter)
+            self.assertEqual(rows_null["O5"]["reason"], "pre_trade_limit_violation", null_counter)
+
         # O9: an authorized H change is checked against the live H used for sizing.
         si_h = _valid_inputs()
         si_h["H"] = "10000"
