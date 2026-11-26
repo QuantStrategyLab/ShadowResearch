@@ -369,6 +369,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "SOXL",
@@ -376,6 +377,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "QQQ",
@@ -383,6 +385,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "XNDX",
@@ -390,6 +393,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "SEMI",
@@ -397,13 +401,15 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "SOFR",
                     "normalized_value": "0.045",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
-                    "effective_session": "2026-01-05",
+                    "effective_session": "2026-01-02",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "TBILL_3M",
@@ -411,6 +417,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
             ],
             "funds": {
@@ -454,6 +461,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                     "corporate_action": {
                         "split_ratio": split_ratio,
                         "cash_per_share_usd": cash,
@@ -466,6 +474,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                     "corporate_action": {"split_ratio": "1", "cash_per_share_usd": "0", "ex_date": "2026-01-05"},
                 },
                 {
@@ -474,6 +483,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "XNDX",
@@ -481,6 +491,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "SEMI",
@@ -488,13 +499,15 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "SOFR",
                     "normalized_value": "0.045",
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
-                    "effective_session": "2026-01-05",
+                    "effective_session": "2026-01-02",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
                 {
                     "instrument": "TBILL_3M",
@@ -502,6 +515,7 @@ class FuseAdapterTest(unittest.TestCase):
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal["spec_digest"],
                     "effective_session": "2026-01-05",
+                    "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 },
             ]
             return inp
@@ -1369,7 +1383,9 @@ class FuseAdapterTest(unittest.TestCase):
                     "normalized_value": val,
                     "eligibility": {"eligible": True},
                     "calendar_spec_digest": cal6["spec_digest"],
-                    "effective_session": eff,
+                    # SOFR publishes T-1 (2026-01-05 for a 2026-01-06 decision).
+                    "effective_session": "2026-01-05" if (inst == "SOFR" and eff == sd) else eff,
+                    "retrieval_time_utc": "2026-01-06T21:30:00.000Z",
                 }
                 rec.update(overrides.get(inst, {}))
                 recs.append(rec)
@@ -1392,11 +1408,58 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertIsNone(vin_stale["funds"]["TQQQ"]["fund_return"])
         self.assertIsNone(vin_stale["funds"]["TQQQ"]["index_return"])
         self.assertTrue(_rows(_mkt_inputs(_records("2026-01-05")))["O1"]["would_have_tripped"])
-        # Rate series may lag (earlier effective date) but never lead the decision session.
+        # Rate series follow the feeder's exact freshness rule: SOFR at the T-1 publication day,
+        # T-bill at the session day or T-1. Never a later date, and never an older archived rate.
         lagged_rates = _records(sd, SOFR={"effective_session": "2026-01-05"}, TBILL_3M={"effective_session": "2026-01-05"})
         self.assertEqual(_vin(_mkt_inputs(lagged_rates))["funds"]["TQQQ"]["fund_return"], 0.0)
-        future_rate = _records(sd, SOFR={"effective_session": "2026-01-07"})
-        self.assertTrue(_rows(_mkt_inputs(future_rate))["O1"]["would_have_tripped"])
+        self.assertFalse(_rows(_mkt_inputs(lagged_rates))["O1"]["would_have_tripped"])
+        for bad_rate in (
+            {"SOFR": {"effective_session": "2026-01-07"}},
+            {"SOFR": {"effective_session": sd}},
+            {"SOFR": {"effective_session": "2025-12-15"}},
+            {"TBILL_3M": {"effective_session": "2025-12-15"}},
+        ):
+            self.assertTrue(_rows(_mkt_inputs(_records(sd, **bad_rate)))["O1"]["would_have_tripped"], bad_rate)
+
+        # P1(r2)-2: a record retrieved after the decision instant (or without a retrieval time) is
+        # look-ahead evidence in replay and is rejected even if marked eligible.
+        for retrieval in ("2026-01-06T22:00:00.001Z", None):
+            look_ahead = _records(sd, TQQQ={"retrieval_time_utc": retrieval})
+            self.assertIsNone(_vin(_mkt_inputs(look_ahead))["funds"]["TQQQ"]["fund_return"], retrieval)
+            self.assertTrue(_rows(_mkt_inputs(look_ahead))["O1"]["would_have_tripped"], retrieval)
+
+        # P1(r2)-6: the return uses the validated market close; a disagreeing caller close fails closed.
+        mkt_close_in = _mkt_inputs(_records(sd, TQQQ={"normalized_value": "55"}))
+        mkt_close_in["funds"]["TQQQ"].pop("close_price")
+        self.assertAlmostEqual(_vin(mkt_close_in)["funds"]["TQQQ"]["fund_return"], 0.1)
+        mkt_close_in["funds"]["TQQQ"]["close_price"] = "55"
+        self.assertAlmostEqual(_vin(mkt_close_in)["funds"]["TQQQ"]["fund_return"], 0.1)
+        mismatch_in = _mkt_inputs(_records(sd, TQQQ={"normalized_value": "55"}))
+        mismatch_in["funds"]["TQQQ"]["close_price"] = "50"
+        self.assertIsNone(_vin(mismatch_in)["funds"]["TQQQ"]["fund_return"])
+        self.assertTrue(_rows(mismatch_in)["O1"]["would_have_tripped"])
+
+        # P1(r2)-4: a fund-payload CA and a distinct new feeder CA on the same bar fail closed.
+        ca_in = _mkt_inputs(
+            _records(sd, TQQQ={"corporate_action": {"split_ratio": "2", "cash_per_share_usd": "0", "ex_date": sd}})
+        )
+        ca_in["funds"]["TQQQ"]["corporate_action"] = {
+            "type": "distribution",
+            "cash_per_share_usd": 0.5,
+            "ex_date": "2026-01-02",
+            "adjustment_complete": True,
+            "exact_reconciliation": True,
+            "hwm_adjusted": True,
+        }
+        ca_in["funds"]["TQQQ"]["hwm_adjusted"] = True
+        self.assertIsNone(_vin(ca_in)["funds"]["TQQQ"]["fund_return"])
+        self.assertTrue(_rows(ca_in)["O1"]["would_have_tripped"])
+        same_ca = _mkt_inputs(
+            _records(sd, TQQQ={"corporate_action": {"split_ratio": "2", "cash_per_share_usd": "0", "ex_date": sd}})
+        )
+        same_ca["prior_closes"]["TQQQ"] = "100"
+        same_ca["funds"]["TQQQ"]["corporate_action"] = {"type": "split", "ratio": 2.0, "ex_date": sd}
+        self.assertAlmostEqual(_vin(same_ca)["funds"]["TQQQ"]["fund_return"], 0.0)
 
         # P1-4: an ineligible optional SPX bar must not derive an L6 index-crash return.
         spx_bad = _records(sd) + [
@@ -1406,6 +1469,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": False, "reason": "stale_index_bar"},
                 "calendar_spec_digest": cal6["spec_digest"],
                 "effective_session": sd,
+                "retrieval_time_utc": "2026-01-06T21:30:00.000Z",
             }
         ]
         vin_spx_bad = _vin(_mkt_inputs(spx_bad))
@@ -1418,6 +1482,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal6["spec_digest"],
                 "effective_session": sd,
+                "retrieval_time_utc": "2026-01-06T21:30:00.000Z",
             }
         ]
         self.assertAlmostEqual(_vin(_mkt_inputs(spx_ok))["index_one_session_returns"]["SPX"], -0.2)
@@ -1437,6 +1502,59 @@ class FuseAdapterTest(unittest.TestCase):
         self.assertEqual(_vin(_split_inputs({"ex_date": "2026-01-02"}))["funds"]["TQQQ"]["fund_return"], 0.0)
         self.assertAlmostEqual(_vin(_split_inputs({"ex_date": sd}))["funds"]["TQQQ"]["fund_return"], 1.0)
         self.assertIsNone(_vin(_split_inputs({}))["funds"]["TQQQ"]["fund_return"])
+
+        # P1(r2)-5: explicit null broker/cash observations are unknown evidence, not model values.
+        for fund_key in ("broker_position", "broker_value"):
+            si = _valid_inputs()
+            si["funds"]["TQQQ"][fund_key] = None
+            self.assertIsNone(_vin(si)["funds"]["TQQQ"][fund_key], fund_key)
+            self.assertTrue(_rows(si)["O3"]["would_have_tripped"], fund_key)
+        for cash_key in ("broker_cash", "positions_cash"):
+            si = _valid_inputs()
+            si[cash_key] = None
+            self.assertIsNone(_vin(si)[cash_key], cash_key)
+            self.assertTrue(_rows(si)["O3"]["would_have_tripped"], cash_key)
+        self.assertFalse(_rows(_valid_inputs())["O3"]["would_have_tripped"])
+
+        # P1(r2)-3: an unsupported kill_switch_tripped flag is rejected, never silently ignored.
+        si_kill = _valid_inputs()
+        si_kill["kill_switch_tripped"] = True
+        with self.assertRaisesRegex(ValueError, "authorized_events"):
+            _vin(si_kill)
+        rows_kill, _, _ = ev.evaluate(
+            ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", _vin(_valid_inputs()), {},
+            {"account": [{"type": "kill_switch", "scope": "account", "session": sd, "as_of": as_of}]},
+        )
+        self.assertEqual(rows_kill["O8"]["state"], "HALT")
+
+        # Default-substitution scan: explicit nulls / unknown values are never replaced by defaults.
+        for key in ("joint_exposure", "proposed_exposure", "reconciliation_tolerance"):
+            si = _valid_inputs()
+            si[key] = None
+            self.assertIsNone(_vin(si)[key], key)
+        si = _valid_inputs()
+        si["funds"]["TQQQ"]["exposure"] = None
+        si["funds"]["TQQQ"]["ledger_value"] = None
+        self.assertIsNone(_vin(si)["funds"]["TQQQ"]["exposure"])
+        self.assertIsNone(_vin(si)["funds"]["TQQQ"]["ledger_value"])
+        for bad_tier in (None, "turbo"):
+            si = _valid_inputs()
+            si["tier"] = bad_tier
+            vin_bad_tier = _vin(si)
+            self.assertIsNone(vin_bad_tier["tier_joint_cap"], bad_tier)
+            self.assertIsNone(vin_bad_tier["tier_loss_budget_D"], bad_tier)
+        retier_unknown = build_fuse_validated_inputs(
+            {"tier": "turbo", "fuse_inputs": {"tier": "aggressive", "bankroll": 45000, "high_water_mark": 50000,
+                                               "tier_joint_cap": 1.0, "max_loss_cap": 1.0, "tier_loss_budget_D": 0.4}},
+            None, policy_hash="p", session_date=sd, as_of=as_of,
+        )
+        for stale_key in ("tier_joint_cap", "max_loss_cap", "tier_loss_budget_D"):
+            self.assertNotIn(stale_key, retier_unknown)
+        retier_no_hwm = build_fuse_validated_inputs(
+            {"tier": "balanced", "fuse_inputs": {"tier": "aggressive", "bankroll": 45000, "H": "0", "max_loss_cap": 1.0}},
+            None, policy_hash="p", session_date=sd, as_of=as_of,
+        )
+        self.assertNotIn("max_loss_cap", retier_no_hwm)
 
         # P1-6: null policy hashes stay null so O6 fails closed (not the string "None").
         for key in ("loaded_policy_hash", "registered_policy_hash"):
@@ -1687,6 +1805,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "normalized_value": 50.0,
                 "calendar_spec_digest": cal_digest,
                 "effective_session": "2026-01-06",
+                "retrieval_time_utc": "2026-01-06T21:30:00.000Z",
                 "eligibility": {"eligible": True},
             }
             for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR")
@@ -2131,6 +2250,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 "corporate_action": {
                     "split_ratio": "2",
                     "cash_per_share_usd": "1",
@@ -2143,6 +2263,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 "corporate_action": {"split_ratio": "1", "cash_per_share_usd": "0", "ex_date": "2026-01-05"},
             },
             {
@@ -2151,6 +2272,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "XNDX",
@@ -2158,6 +2280,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SEMI",
@@ -2165,13 +2288,15 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
-                "effective_session": "2026-01-05",
+                "effective_session": "2026-01-02",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
         ]
 
@@ -2261,6 +2386,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOXL",
@@ -2268,6 +2394,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "QQQ",
@@ -2275,6 +2402,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
                 "corporate_action": {"split_ratio": "2", "ex_date": "2026-01-05"},
             },
             {
@@ -2283,6 +2411,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SEMI",
@@ -2290,13 +2419,15 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
-                "effective_session": "2026-01-05",
+                "effective_session": "2026-01-02",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "TBILL_3M",
@@ -2304,6 +2435,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
         ]
         vin = build_fuse_validated_inputs(
@@ -2378,6 +2510,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOXL",
@@ -2385,6 +2518,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "QQQ",
@@ -2392,6 +2526,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "XNDX",
@@ -2399,6 +2534,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": False, "reason": "stale_benchmark_bar"},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SEMI",
@@ -2406,13 +2542,15 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
-                "effective_session": "2026-01-05",
+                "effective_session": "2026-01-02",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "TBILL_3M",
@@ -2420,6 +2558,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
         ]
 
@@ -2466,6 +2605,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": False, "reason": "stale_fund_bar"},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOXL",
@@ -2473,6 +2613,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "XNDX",
@@ -2480,6 +2621,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SEMI",
@@ -2487,13 +2629,15 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "SOFR",
                 "normalized_value": "0.045",
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
-                "effective_session": "2026-01-05",
+                "effective_session": "2026-01-02",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
             {
                 "instrument": "TBILL_3M",
@@ -2501,6 +2645,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "eligibility": {"eligible": True},
                 "calendar_spec_digest": cal["spec_digest"],
                 "effective_session": "2026-01-05",
+                "retrieval_time_utc": "2026-01-05T21:30:00.000Z",
             },
         ]
 
