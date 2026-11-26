@@ -2485,6 +2485,7 @@ def _reconcile_committed_state_snapshot_if_missing(
         engine_hash=PINNED_FUSE_ENGINE_HASH,
         spec_version=PINNED_FUSE_SPEC_VERSION,
         next_row_state=rebuilt["next_row_state"],
+        update_latest=(ex_seq == len(prior_records) - 1),
     )
     _retire_superseded_pending_rejected_state(
         snapshots_dir,
@@ -3062,14 +3063,14 @@ def _authenticate_production_history(
         and (pend_file is None or not pend_file.is_file() or superseded_pending_ok)
     )
     if can_catchup_interrupted_commit:
-        if bitcoin_merkle_roots is not None:
-            ok_credit, credit_issues = ledger.assess_receipt_creditability(
-                bitcoin_merkle_roots=bitcoin_merkle_roots,
-                commitment_deadline_et=cfg.commitment_deadline_et,
-                runtime_config=cfg,
-            )
-            if not ok_credit:
-                raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
+        ok_credit, credit_issues = ledger.assess_receipt_creditability(
+            bitcoin_merkle_roots=bitcoin_merkle_roots,
+            commitment_deadline_et=cfg.commitment_deadline_et,
+            runtime_config=cfg,
+            require_bitcoin_verification=(bitcoin_merkle_roots is not None),
+        )
+        if not ok_credit:
+            raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
         if superseded_pending_ok and snapshots_dir is not None:
             _retire_superseded_pending_rejected_state(
                 snapshots_dir,
@@ -3102,7 +3103,15 @@ def _authenticate_production_history(
         or not hmac.compare_digest(head_rec_sha, str(anchor_obj["head_sha256"]))
     ):
         raise EngineIdentityError("production_trusted_head_mismatch:diverges_from_anchor")
-    if not hmac.compare_digest(head_rec_sha, expected_prior_head_sha256):
+    head_matches_expected = hmac.compare_digest(head_rec_sha, expected_prior_head_sha256)
+    retry_matches_prev = bool(
+        existing_env is not None
+        and hmac.compare_digest(
+            str(existing_env["record_body"].get("prev_record_sha256") or ""),
+            expected_prior_head_sha256,
+        )
+    )
+    if not (head_matches_expected or retry_matches_prev):
         raise EngineIdentityError("production_trusted_head_mismatch")
 
     if snapshots_dir is not None:
@@ -3141,14 +3150,14 @@ def _authenticate_production_history(
                 "production_trusted_head_rollback_rejected: unexpected pending digest on committed anchor"
             )
 
-    if bitcoin_merkle_roots is not None:
-        ok_credit, credit_issues = ledger.assess_receipt_creditability(
-            bitcoin_merkle_roots=bitcoin_merkle_roots,
-            commitment_deadline_et=cfg.commitment_deadline_et,
-            runtime_config=cfg,
-        )
-        if not ok_credit:
-            raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
+    ok_credit, credit_issues = ledger.assess_receipt_creditability(
+        bitcoin_merkle_roots=bitcoin_merkle_roots,
+        commitment_deadline_et=cfg.commitment_deadline_et,
+        runtime_config=cfg,
+        require_bitcoin_verification=(bitcoin_merkle_roots is not None),
+    )
+    if not ok_credit:
+        raise EngineIdentityError(f"production_history_uncreditable:{credit_issues}")
 
     return anchor_resolved, anchor_bytes
 

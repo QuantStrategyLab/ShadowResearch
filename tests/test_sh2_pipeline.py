@@ -27,6 +27,10 @@ from run_sh2_demo import (  # noqa: E402
     build_live_mock_transport,
     run_all_demos,
 )
+from shadow.cloudrun_job import (  # noqa: E402
+    main as cloudrun_main,
+    run_cloudrun_job,
+)
 from shadow.calendar_consumer import (  # noqa: E402
     classify_us_equity_session_window,
     is_official_close_bar_timestamp,
@@ -1692,23 +1696,24 @@ class Sh2PipelineTest(unittest.TestCase):
             self.assertEqual(r1["sequence"], 1)
             seq1_sha = r1["record_sha256"]
 
-            # 5. Same-session retry requires exact committed record_sha256 (seq1_sha);
-            # seq0_sha fails closed even when bitcoin_merkle_roots is provided
+            # 5. Same-session retry after external anchor commits seq1_sha succeeds with
+            # pre-commit expected_prior_head_sha256 (seq0_sha), preserving Cloud Run retry idempotency
             for extra_btc in (None, dict(hdrs)):
-                with self.assertRaises(EngineIdentityError) as stale_retry_ctx:
-                    run_production_cycle(
-                        session_date="2026-01-06",
-                        data_dir=root,
-                        config_path=cfg_path,
-                        transport=build_live_mock_transport("2026-01-06"),
-                        environ={"TIINGO_API_KEY": "test-dummy-token"},
-                        wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
-                        expected_prior_head_sha256=seq0_sha,
-                        expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
-                        bitcoin_merkle_roots=extra_btc,
-                        trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
-                    )
-                self.assertIn("production_trusted_head_mismatch", str(stale_retry_ctx.exception))
+                r1_same_args_retry = run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
+                    expected_prior_head_sha256=seq0_sha,
+                    expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    bitcoin_merkle_roots=extra_btc,
+                    trusted_head_anchor_path=Path(tmpdir) / "auth_anchor.json",
+                )
+                self.assertEqual(r1_same_args_retry["reason"], "already_committed_session_preserved")
+                self.assertEqual(r1_same_args_retry["sequence"], 1)
+                self.assertEqual(r1_same_args_retry["record_sha256"], seq1_sha)
 
             # Reproduce forged same-session record/receipt + deleted report using unchanged seq0_sha
             forged_root = Path(tmpdir) / "forged_retry_root"
@@ -1852,16 +1857,22 @@ class Sh2PipelineTest(unittest.TestCase):
         class _SimSigkill(BaseException):
             pass
 
+        class _LocalOts(OpenTimestampsClient):
+            def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                ots_b, _ = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                return ots_b, "https://a.pool.opentimestamps.org"
+
         drill_cfg = _sh2_drill_cfg()
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "crash_snap_recovery"
+            local_ots = _LocalOts()
             r0 = run_daily_drill_cycle(
                 session_date="2026-01-05",
                 data_dir=root,
                 config=drill_cfg,
                 transport=build_live_mock_transport("2026-01-05"),
                 environ={"TIINGO_API_KEY": "test-dummy-token"},
-                ots_client=None,
+                ots_client=local_ots,
                 allow_unanchored_on_ots_failure=True,
                 wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
@@ -1878,7 +1889,7 @@ class Sh2PipelineTest(unittest.TestCase):
                     config=drill_cfg,
                     transport=build_live_mock_transport("2026-01-06"),
                     environ={"TIINGO_API_KEY": "test-dummy-token"},
-                    ots_client=None,
+                    ots_client=local_ots,
                     allow_unanchored_on_ots_failure=True,
                     wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
                     clock=_fast_clock(),
@@ -1902,7 +1913,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 transport=build_live_mock_transport("2026-01-06"),
                 environ={"TIINGO_API_KEY": "test-dummy-token"},
-                ots_client=None,
+                ots_client=local_ots,
                 allow_unanchored_on_ots_failure=True,
                 wall_clock=lambda: datetime(2026, 1, 6, 22, 35, tzinfo=timezone.utc),
                 clock=_fast_clock(),
@@ -1918,7 +1929,7 @@ class Sh2PipelineTest(unittest.TestCase):
                 config=drill_cfg,
                 transport=build_live_mock_transport("2026-01-07"),
                 environ={"TIINGO_API_KEY": "test-dummy-token"},
-                ots_client=None,
+                ots_client=local_ots,
                 allow_unanchored_on_ots_failure=True,
                 wall_clock=lambda: datetime(2026, 1, 7, 22, 30, tzinfo=timezone.utc),
                 clock=_fast_clock(),
@@ -3736,9 +3747,169 @@ class Sh2PipelineTest(unittest.TestCase):
             calendar_spec=spec_v2,
         )
         self.assertTrue(built["appended"])
+        self.assertIn("o4_resolved_symbols", built)
         l0 = {b["id"]: b for b in built["record_body"]["evaluator"]["breakers"]}["L0"]
         self.assertTrue(l0["outputs"]["cap_breached"])
         self.assertFalse(l0["outputs"]["increases_blocked"])
+
+        # Case 2: max_loss_cap=2000 with post-trade 13 shares * 100 * 3x = 3900 > 2000 -> increases_blocked=True
+        inp_tight = json.loads(json.dumps(inp_reduce))
+        inp_tight["max_loss_cap"] = "2000"
+        built_tight = build_record_body(
+            chain_id="drill-l0-twopass-tight",
+            sequence=0,
+            prev_record_sha256=GENESIS_PREV_HASH,
+            mode="drill",
+            session_date="2026-01-05",
+            decision_timestamp_utc="2026-01-05T22:30:00.000Z",
+            session_inputs=inp_tight,
+            calendar_session=cal,
+            code_version_sha=code_sha,
+            evaluator=ev,
+            calendar_spec=spec_v2,
+        )
+        self.assertTrue(built_tight["appended"])
+        l0_tight = {b["id"]: b for b in built_tight["record_body"]["evaluator"]["breakers"]}["L0"]
+        self.assertTrue(l0_tight["outputs"]["cap_breached"])
+        self.assertTrue(l0_tight["outputs"]["increases_blocked"])
+
+    def test_astra_round1_p1_regressions(self) -> None:
+        raw_cfg = json.loads(
+            (_REPO_ROOT / "config" / "production-scheduler.json").read_text(encoding="utf-8")
+        )
+        raw_cfg["production_chain_locked"] = False
+        raw_cfg["clk01_active"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "prod_retry"
+            cfg_path = Path(tmpdir) / "unlocked-prod.json"
+            cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+            anchor_path = Path(tmpdir) / "trusted_anchor.json"
+            hdrs: dict[int, dict[str, str]] = {}
+
+            class _FakeOts(OpenTimestampsClient):
+                def stamp_digest(self, sha256_hex: str) -> tuple[bytes, str]:
+                    ots_b, root_hex = build_synthetic_ots_fixture(sha256_hex, bitcoin_height=880100)
+                    assert root_hex is not None
+                    hdrs[880100] = {"merkle_root": root_hex, "timestamp": "2026-01-06T03:00:00.000Z"}
+                    return ots_b, "https://a.pool.opentimestamps.org"
+
+            # P1 #4: Cloud Run / production mode rejects missing data_dir / SHADOW_DATA_DIR
+            with self.assertRaises(EngineIdentityError) as miss_cr:
+                run_cloudrun_job(
+                    config_path=_REPO_ROOT / "config" / "drill-scheduler.json",
+                    mode="drill",
+                    environ={"CLOUD_RUN_EXECUTION": "exec-123"},
+                )
+            self.assertIn("missing_persistent_data_dir", str(miss_cr.exception))
+            with self.assertRaises(EngineIdentityError) as miss_prod:
+                run_cloudrun_job(
+                    config_path=cfg_path,
+                    mode="production",
+                    environ={},
+                )
+            self.assertIn("missing_persistent_data_dir", str(miss_prod.exception))
+            self.assertEqual(cloudrun_main(["--mode", "production"]), 3)
+
+            # P1 #1: Identical Cloud Run retry parameters yield committed -> already_committed_no_op
+            r0 = run_cloudrun_job(
+                data_dir=root,
+                config_path=cfg_path,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 30, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                environ={"TIINGO_API_KEY": "test-dummy-token", "CLOUD_RUN_EXECUTION": "exec-1"},
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(r0["status"], "committed")
+            r0_retry = run_cloudrun_job(
+                data_dir=root,
+                config_path=cfg_path,
+                mode="production",
+                session_date="2026-01-05",
+                transport=build_live_mock_transport("2026-01-05"),
+                ots_client=_FakeOts(),
+                wall_clock=lambda: datetime(2026, 1, 5, 22, 35, tzinfo=timezone.utc),
+                clock=_fast_clock(),
+                sleeper=lambda _s: None,
+                environ={"TIINGO_API_KEY": "test-dummy-token", "CLOUD_RUN_EXECUTION": "exec-1"},
+                expected_prior_head_sha256=GENESIS_PREV_HASH,
+                expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                trusted_head_anchor_path=anchor_path,
+            )
+            self.assertEqual(r0_retry["status"], "already_committed_no_op")
+            self.assertTrue(r0_retry["idempotent_noop"])
+
+            # P1 #5: Caller production_chain_locked=False cannot override locked production config
+            prod_ledger = ShadowLedger(root / "ledger")
+            recs = prod_ledger.load_records()
+            rcps = [
+                json.loads(prod_ledger._receipt_path(i).read_text(encoding="utf-8"))
+                for i in range(len(recs))
+            ]
+            ok_override, reasons_override = check_forward_clock_credit(
+                recs,
+                rcps,
+                ledger_dir=prod_ledger.root_dir,
+                bitcoin_merkle_roots=dict(hdrs),
+                config_path=_REPO_ROOT / "config" / "production-scheduler.json",
+                production_chain_locked=False,
+            )
+            self.assertFalse(ok_override)
+            self.assertIn("production_chain_locked", reasons_override)
+
+            # P2: Historical snapshot recovery with update_latest=False preserves newer latest.state.json
+            save_row_state_snapshot(
+                root / "state_snapshots",
+                chain_id="prod-sh2-v1",
+                sequence=0,
+                session_date="2026-01-05",
+                record_sha256=str(r0["record_sha256"]),
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state={"marker": "newer_keep"},
+                update_latest=True,
+            )
+            save_row_state_snapshot(
+                root / "state_snapshots",
+                chain_id="prod-sh2-v1",
+                sequence=0,
+                session_date="2026-01-05",
+                record_sha256=str(r0["record_sha256"]),
+                engine_hash=PINNED_FUSE_ENGINE_HASH,
+                spec_version=PINNED_FUSE_SPEC_VERSION,
+                next_row_state={"marker": "older_backfill"},
+                update_latest=False,
+            )
+            latest_after = json.loads(
+                (root / "state_snapshots" / "latest.state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(latest_after["next_row_state"], {"marker": "newer_keep"})
+
+            # P1 #2: Deleting day-0 receipt fails next-day run_production_cycle even when bitcoin_merkle_roots is None
+            prod_ledger._receipt_path(0).unlink()
+            with self.assertRaises(EngineIdentityError) as rcp_ctx:
+                run_production_cycle(
+                    session_date="2026-01-06",
+                    data_dir=root,
+                    config_path=cfg_path,
+                    transport=build_live_mock_transport("2026-01-06"),
+                    environ={"TIINGO_API_KEY": "test-dummy-token"},
+                    ots_client=_FakeOts(),
+                    wall_clock=lambda: datetime(2026, 1, 6, 22, 30, tzinfo=timezone.utc),
+                    clock=_fast_clock(),
+                    sleeper=lambda _s: None,
+                    expected_prior_head_sha256=str(r0["record_sha256"]),
+                    expected_pending_state_sha256=NO_PENDING_REJECTED_STATE_SHA256,
+                    bitcoin_merkle_roots=None,
+                    trusted_head_anchor_path=anchor_path,
+                )
+            self.assertIn("production_history_uncreditable", str(rcp_ctx.exception))
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ from shadow.fuse_adapter import (
     PINNED_FUSE_ENGINE_HASH,
     PINNED_FUSE_SPEC_VERSION,
     build_fuse_validated_inputs,
+    compute_joint_exposure_for_quantities,
     is_stub_evaluator,
     resolve_account_and_fund_control_states,
     resolve_aggregate_control_state,
@@ -833,7 +834,7 @@ def evaluate_non_stub_tiers(
     decision_timestamp_utc: str,
     prior_row_state: Mapping[str, Any] | None,
     authorized_events: object | None = None,
-    proposed_exposure_by_tier: Mapping[str, float] | None = None,
+    proposed_exposure_by_tier: Mapping[str, float | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate all 3 sizing tiers with vendored FUSE-1 while preserving the primary tier's outputs."""
     primary_tier = str(session_inputs.get("tier") or "balanced")
@@ -1035,17 +1036,18 @@ def build_record_body(
     )
 
     if not is_stub_evaluator(ev) and "proposed_exposure" not in eval_session_inputs:
-        funds_in = eval_session_inputs.get("funds", {})
-        proposed_by_tier: dict[str, float] = {}
+        proposed_by_tier: dict[str, float | None] = {}
         for t_dec in sizing_res["tiers"]:
             tier_id = str(t_dec["tier_id"])
-            total_prop = Decimal("0")
-            for f_dec in t_dec["funds"]:
-                inst = str(f_dec["instrument"])
-                q_after = int(f_dec["q_pre"]) + int(f_dec["delta_q_exec"])
-                px_dec = Decimal(str(funds_in[inst]["close_price"]))
-                total_prop += Decimal(q_after) * px_dec
-            proposed_by_tier[tier_id] = float(total_prop)
+            q_after_by_inst = {
+                str(f_dec["instrument"]): int(f_dec["q_pre"]) + int(f_dec["delta_q_exec"])
+                for f_dec in t_dec["funds"]
+            }
+            proposed_by_tier[tier_id] = compute_joint_exposure_for_quantities(
+                eval_session_inputs,
+                q_after_by_inst,
+                tier=tier_id,
+            )
         tiered_eval_p2 = evaluate_non_stub_tiers(
             evaluator=ev,
             session_inputs=eval_session_inputs,
@@ -1166,6 +1168,7 @@ def build_record_body(
         "fail_closed": False,
         "record_body": body,
         "next_row_state": next_state,
+        "o4_resolved_symbols": o4_resolved_symbols,
     }
 
 
@@ -1250,11 +1253,12 @@ def check_forward_clock_credit(
                 if eff_expected_spec_version is None:
                     eff_expected_spec_version = PINNED_FUSE_SPEC_VERSION
             else:
-                if eff_locked is None:
-                    eff_locked = not (
-                        raw_cfg.get("production_chain_locked") is False
-                        and raw_cfg.get("clk01_active") is True
-                    )
+                cfg_locked = not (
+                    raw_cfg.get("production_chain_locked") is False
+                    and raw_cfg.get("clk01_active") is True
+                )
+                # Explicit or default locked production configuration cannot be overridden by caller args.
+                eff_locked = bool(cfg_locked or (production_chain_locked is True))
                 if eff_expected_engine_hash is None:
                     eh = raw_cfg.get("fuse_engine_hash")
                     eff_expected_engine_hash = eh if isinstance(eh, str) and eh else "__MISSING__"
@@ -2676,6 +2680,7 @@ class ShadowLedger:
         repo_root: str | Path | None = None,
         config_path: str | Path | None = None,
         runtime_config: object | None = None,
+        require_bitcoin_verification: bool = True,
     ) -> tuple[bool, list[object]]:
         """Require valid chain + non-empty ledger with timely OTS receipts verified against trusted Bitcoin headers & block timestamps."""
         eff_commitment_deadline_et = commitment_deadline_et
@@ -2743,17 +2748,18 @@ class ShadowLedger:
             if not timely:
                 issues.append({"sequence": seq, "reason": str(t_err)})
                 continue
-            ok_btc, btc_err = verify_receipt(
-                envelope,
-                receipt,
-                ots_bytes=ots_bytes,
-                bitcoin_merkle_roots=bitcoin_merkle_roots,
-                require_bitcoin_verification=True,
-                require_bitcoin_timestamp=True,
-                expected_commitment_deadline_utc=expected_deadline,
-            )
-            if not ok_btc:
-                issues.append({"sequence": seq, "reason": str(btc_err)})
+            if require_bitcoin_verification:
+                ok_btc, btc_err = verify_receipt(
+                    envelope,
+                    receipt,
+                    ots_bytes=ots_bytes,
+                    bitcoin_merkle_roots=bitcoin_merkle_roots,
+                    require_bitcoin_verification=True,
+                    require_bitcoin_timestamp=True,
+                    expected_commitment_deadline_utc=expected_deadline,
+                )
+                if not ok_btc:
+                    issues.append({"sequence": seq, "reason": str(btc_err)})
         return len(issues) == 0, issues
 
 
@@ -2767,6 +2773,7 @@ def save_row_state_snapshot(
     engine_hash: str,
     spec_version: str,
     next_row_state: dict,
+    update_latest: bool = True,
 ) -> Path:
     """Persist next_row_state atomically for restart continuity with identity pins."""
     if not isinstance(next_row_state, dict):
@@ -2795,9 +2802,10 @@ def save_row_state_snapshot(
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
     ).encode("utf-8")
     seq_path = s_dir / f"seq_{sequence:06d}.state.json"
-    latest_path = s_dir / "latest.state.json"
     _atomic_write_bytes(seq_path, raw_bytes)
-    _atomic_write_bytes(latest_path, raw_bytes)
+    if update_latest:
+        latest_path = s_dir / "latest.state.json"
+        _atomic_write_bytes(latest_path, raw_bytes)
     return seq_path
 
 

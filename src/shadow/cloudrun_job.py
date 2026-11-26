@@ -91,11 +91,6 @@ def run_cloudrun_job(
 ) -> dict[str, object]:
     """Execute one idempotent Cloud Run Job task against vendored FUSE-1 + csa22-v2."""
     env = dict(os.environ) if environ is None else dict(environ)
-    eff_data_dir = Path(
-        data_dir
-        if data_dir is not None
-        else env.get("SHADOW_DATA_DIR") or str(DEFAULT_CLOUDRUN_DATA_DIR)
-    )
     eff_config_path = (
         Path(config_path)
         if config_path is not None
@@ -110,13 +105,27 @@ def run_cloudrun_job(
         )
     )
 
-    gate_report = verify_f1_entry_gates(require_read_only=False)
-    ev = VendoredFuseEvaluator(require_read_only=False)
-
     raw_cfg = parse_json_no_duplicates(eff_config_path.read_text(encoding="utf-8"))
     if not isinstance(raw_cfg, dict):
         raise ValueError(f"invalid_runtime_config_type:{type(raw_cfg).__name__}")
     target_mode = mode or env.get("SHADOW_CHAIN_MODE") or str(raw_cfg.get("mode", "drill"))
+
+    explicit_data_dir = str(data_dir).strip() if data_dir is not None else env.get("SHADOW_DATA_DIR", "").strip()
+    is_cloudrun_env = any(
+        bool(env.get(k, "").strip())
+        for k in ("CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION", "K_SERVICE", "K_REVISION")
+    )
+    if not explicit_data_dir:
+        if is_cloudrun_env or target_mode == "production":
+            raise EngineIdentityError(
+                "missing_persistent_data_dir: Cloud Run and production runs require explicit --data-dir or SHADOW_DATA_DIR"
+            )
+        eff_data_dir = Path(DEFAULT_CLOUDRUN_DATA_DIR)
+    else:
+        eff_data_dir = Path(explicit_data_dir)
+
+    gate_report = verify_f1_entry_gates(require_read_only=False)
+    ev = VendoredFuseEvaluator(require_read_only=False)
 
     if target_mode == "production":
         cfg = load_production_scheduler_config(eff_config_path)
