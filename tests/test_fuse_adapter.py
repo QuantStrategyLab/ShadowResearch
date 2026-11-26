@@ -1608,6 +1608,63 @@ class FuseAdapterTest(unittest.TestCase):
         naive = _records(sd, TQQQ={"retrieval_time_utc": "2026-01-06T21:30:00"})
         self.assertIsNone(_vin(_mkt_inputs(naive))["funds"]["TQQQ"]["fund_return"])
 
+        # Safety pass (r4)-1: future-dated source records are dropped at the evaluator boundary on
+        # every path, including nested fuse_inputs and the direct payload.
+        future_src = {"as_of": "2026-01-07T22:00:00.000Z", "age_sessions": 0}
+        base_vin = _vin(_valid_inputs())
+        self.assertFalse(
+            ev.evaluate(ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", base_vin, {}, None)[0]["O1"][
+                "would_have_tripped"
+            ]
+        )
+        nested_src = _valid_inputs()
+        nested_src["fuse_inputs"] = dict(
+            base_vin, source_records=dict(base_vin["source_records"], positions=future_src)
+        )
+        rows_nested = ev.evaluate(ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", _vin(nested_src), {}, None)[0]
+        self.assertTrue(rows_nested["O1"]["would_have_tripped"])
+        direct_src = dict(base_vin, source_records=dict(base_vin["source_records"], positions=future_src))
+        direct_src["session_calendar_status"] = base_vin["session_calendar_status"]
+        rows_direct = ev.evaluate(ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", _vin(direct_src), {}, None)[0]
+        self.assertTrue(rows_direct["O1"]["would_have_tripped"])
+        self.assertEqual(direct_src["source_records"]["positions"], future_src)
+
+        # Safety pass (r4)-2: an unknown q_pre gives share_count None, so V2 cannot clear a pending
+        # action by matching an invented 0 against a caller-supplied broker position of 0.
+        cal5 = resolve_session("XNYS", "2026-01-05", spec=spec)
+        s1 = _valid_inputs()
+        s1["funds"]["TQQQ"]["corporate_action"] = {
+            "type": "split", "ratio": 2, "ex_date": "2026-01-05",
+            "adjustment_complete": False, "exact_reconciliation": False,
+        }
+        v1 = build_fuse_validated_inputs(s1, cal5, policy_hash="p", session_date="2026-01-05", as_of="2026-01-05T22:00:00.000Z")
+        _, _, pending_state = ev.evaluate(
+            ev.spec_version, ev.engine_hash, "p", "2026-01-05", "2026-01-05T22:00:00.000Z", "shadow", v1, {}, None
+        )
+        self.assertIn("TQQQ", pending_state["V2"]["pending_adjustments"])
+        s2 = _valid_inputs()
+        s2["funds"]["TQQQ"].pop("q_pre")
+        s2["funds"]["TQQQ"].update(
+            {
+                "broker_position": 0,
+                "ledger_value": 5000,
+                "broker_value": 5000,
+                "hwm_adjusted": True,
+                "corporate_action": {
+                    "type": "split", "ratio": 2, "ex_date": "2026-01-05", "adjustment_complete": True,
+                    "exact_reconciliation": True, "hwm_adjusted": True,
+                },
+            }
+        )
+        v2 = _vin(s2)
+        self.assertIsNone(v2["funds"]["TQQQ"]["share_count"])
+        rows2, _, next2 = ev.evaluate(ev.spec_version, ev.engine_hash, "p", sd, as_of, "shadow", v2, pending_state, None)
+        self.assertNotEqual(rows2["V2"].get("reason"), "exact_reconciliation_auto_clear")
+        self.assertTrue(next2.get("V2"))
+        si_flat_q = _valid_inputs()
+        si_flat_q["funds"]["TQQQ"]["q_pre"] = 0
+        self.assertEqual(_vin(si_flat_q)["funds"]["TQQQ"]["share_count"], 0)
+
         # P1-6: null policy hashes stay null so O6 fails closed (not the string "None").
         for key in ("loaded_policy_hash", "registered_policy_hash"):
             si = _valid_inputs()
