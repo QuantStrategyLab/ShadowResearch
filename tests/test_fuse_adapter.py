@@ -1205,6 +1205,84 @@ class FuseAdapterTest(unittest.TestCase):
             fund.update(v7_obs)
         self.assertTrue(_rows(si_v7_missing)["V7"]["would_have_tripped"])
 
+    def test_o5_counter_aliases_h_for_o9_and_retier_loss_are_not_manufactured(self) -> None:
+        spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
+        cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
+        ev = VendoredFuseEvaluator()
+
+        def _rows(si: dict, authorized_events: object = None) -> dict:
+            rows, _, _ = ev.evaluate(
+                ev.spec_version,
+                ev.engine_hash,
+                "p",
+                "2026-01-06",
+                "2026-01-06T22:00:00.000Z",
+                "shadow",
+                build_fuse_validated_inputs(
+                    si,
+                    cal6,
+                    policy_hash="p",
+                    session_date="2026-01-06",
+                    as_of="2026-01-06T22:00:00.000Z",
+                ),
+                {},
+                authorized_events,
+            )
+            return rows
+
+        # O5: alias-only session counters must not collide with manufactured zero canonical counters.
+        si_o5 = _valid_inputs()
+        si_o5.update(
+            {
+                "o5_collar": "0.05",
+                "o5_symbol": "TQQQ",
+                "o5_order_size": 10,
+                "o5_side": "buy",
+                "o5_limit_price": "50",
+                "o5_reference_price": "50",
+                "o5_account": "stage_n_shadow",
+                "o5_orders_today": 1,
+                "o5_max_orders_per_session": 10,
+                "o5_turnover_today": 500,
+                "o5_max_turnover_per_session": 10000,
+            }
+        )
+        self.assertFalse(_rows(si_o5)["O5"]["would_have_tripped"])
+
+        # O9: an authorized H change is checked against the live H used for sizing.
+        si_h = _valid_inputs()
+        si_h["H"] = "10000"
+        si_h["o9_change_descriptors"] = [{"param": "H", "to": "10000"}]
+        card = {
+            "type": "parameter_change_card",
+            "session": "2026-01-06",
+            "as_of": "2026-01-06T21:00:00.000Z",
+            "change_descriptors": [{"param": "H", "to": "10000"}],
+        }
+        rows_h = _rows(si_h, {"account": [card]})
+        self.assertEqual(rows_h["O9"]["state"], "NORMAL")
+        self.assertFalse(rows_h["O9"]["would_have_tripped"])
+
+        # Re-tiered explicit payload: a one-session return fraction is not cumulative dollar loss L.
+        vin_retier = build_fuse_validated_inputs(
+            {
+                "tier": "balanced",
+                "fuse_inputs": {
+                    "tier": "aggressive",
+                    "bankroll": 45000,
+                    "high_water_mark": 50000,
+                    "H": "0",
+                    "one_session_loss": 0.01,
+                },
+            },
+            None,
+            policy_hash="p",
+            session_date="2026-01-06",
+            as_of="2026-01-06T22:00:00.000Z",
+        )
+        self.assertEqual(vin_retier["tier"], "balanced")
+        self.assertAlmostEqual(vin_retier["max_loss_cap"], 6382.293860109469, places=6)
+
     def test_o5_order_evidence_and_v1_five_session_history_forwarded(self) -> None:
         spec = load_spec(_REPO_ROOT / "specs" / "csa22-v2")
         cal6 = resolve_session("XNYS", "2026-01-06", spec=spec)
