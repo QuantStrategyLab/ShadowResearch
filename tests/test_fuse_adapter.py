@@ -1730,6 +1730,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "instrument": inst,
                 "normalized_value": 50.0,
                 "calendar_spec_digest": str(cal6["spec_digest"]),
+                "effective_session": "2026-01-06",
                 "eligibility": {"eligible": True},
             }
             for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
@@ -1791,6 +1792,7 @@ class FuseAdapterTest(unittest.TestCase):
                 "instrument": inst,
                 "normalized_value": 50.0,
                 "calendar_spec_digest": str(cal6["spec_digest"]),
+                "effective_session": "2026-01-06",
                 "eligibility": {"eligible": True},
             }
             for inst in ("TQQQ", "SOXL", "QQQ", "XNDX", "SEMI", "SOFR", "TBILL_3M")
