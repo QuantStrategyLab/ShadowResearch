@@ -1,0 +1,11 @@
+{
+  "freeze_version": "fuse-eval-spec/v2",
+  "description": "Owner-approved v2 refreeze of golden artifacts per BRIEF-FUSE-1 \u00a76.2 for R1 (missing.V1 fail-closed), R4 (base O5 rejection_count_this_session), and R5 (tier_repetitions 40k/60k/80k caps & balanced tier_change)",
+  "frozen_at": "2026-11-24",
+  "file_hashes": {
+    "scenarios.json": "37d4f48210368cbe981a780aed4c10434bbdfb1a328c4bb1c3f196371ac26a3b",
+    "golden-table.json": "a9750d390fe194e947e9593dee53f3a0dbbba9e465a6dad374f449d24c265e8d",
+    "successor-cases.json": "19fbb0d1ecc023740ab81d3bb5035a2fae96c8889b7b11e7099e270a20d8d12d"
+  },
+  "combined_freeze_hash": "1da74ca508161ba6d9a424101321381a9f5156d8cb2c84c03be2fd2fe3f22a74"
+}

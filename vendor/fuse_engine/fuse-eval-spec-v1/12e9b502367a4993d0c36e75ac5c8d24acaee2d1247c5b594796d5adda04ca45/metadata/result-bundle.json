@@ -1,0 +1,38 @@
+{
+  "base_cells": {
+    "failed": 0,
+    "failures": [],
+    "passed": 264,
+    "total": 264
+  },
+  "bundle_hash": "78fed9dfc9b0b0a618fce6bb5a956063135f34845545e6a5154a32e119354cc9",
+  "description": "FUSE-1 trip matrix execution results",
+  "enforcement_mode": "shadow_would_have_tripped",
+  "engine_hash": "12e9b502367a4993d0c36e75ac5c8d24acaee2d1247c5b594796d5adda04ca45",
+  "freeze_hash": "1da74ca508161ba6d9a424101321381a9f5156d8cb2c84c03be2fd2fe3f22a74",
+  "loss_breakers_armed": false,
+  "spec_version": "fuse-eval-spec/v1",
+  "successor_cases": {
+    "failed": 0,
+    "failures": [],
+    "passed": 13,
+    "total": 13
+  },
+  "summary": {
+    "failed_base": 0,
+    "failed_successor": 0,
+    "failed_tier": 0,
+    "passed_base": 264,
+    "passed_successor": 13,
+    "passed_tier": 132,
+    "total_base": 264,
+    "total_successor": 13,
+    "total_tier": 132
+  },
+  "tier_repetitions": {
+    "failed": 0,
+    "failures": [],
+    "passed": 132,
+    "total": 132
+  }
+}
