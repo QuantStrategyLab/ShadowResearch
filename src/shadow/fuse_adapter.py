@@ -798,6 +798,23 @@ def _compute_return_ratio(cur_raw: object, prev_raw: object) -> float | None:
 _CA_UNDATED = object()
 
 
+def _ca_identity(ca: object) -> tuple[object, ...] | None:
+    """Identity of a corporate action for comparing two reported events."""
+    if not isinstance(ca, Mapping):
+        return None
+
+    def _num(v: object) -> object:
+        d = _sizing_decimal(v)
+        return d.normalize() if d is not None else v
+
+    return (
+        ca.get("type"),
+        _num(ca.get("ratio")),
+        _num(ca.get("cash_per_share_usd")),
+        _parse_valid_ymd(ca.get("ex_date")),
+    )
+
+
 def _ca_in_return_interval(ca_obj: object, session_date: str | None) -> object:
     """Return the corporate action only if its ex-date falls in this one-session return interval.
 
@@ -902,16 +919,53 @@ def _derive_one_session_loss(session_inputs: Mapping[str, Any]) -> float | None:
 _RATE_INSTRUMENTS = frozenset({"SOFR", "TBILL_3M"})
 
 
+_EXPECTED_RATE_DAY_CACHE: dict[tuple[str, str], str | None] = {}
+
+
+def _expected_prior_rate_business_day(session_date: str, calendar_session: Mapping[str, Any] | None) -> str | None:
+    """Expected T-1 publication business day for rate series, from the pinned calendar spec.
+
+    Mirrors the feeder's freshness rule (feeder.expected_prior_sofr_business_day). Returns
+    None (fail closed) when the calendar spec cannot be loaded and digest-verified.
+    """
+    if not isinstance(calendar_session, Mapping):
+        return None
+    version = calendar_session.get("calendar_version")
+    digest = calendar_session.get("spec_digest")
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        return None
+    key = (session_date, f"{version}:{digest}")
+    if key in _EXPECTED_RATE_DAY_CACHE:
+        return _EXPECTED_RATE_DAY_CACHE[key]
+    result: str | None = None
+    try:
+        from shadow.calendar_consumer import load_spec
+        from shadow.feeder import expected_prior_sofr_business_day
+
+        spec = load_spec(Path(__file__).resolve().parents[2] / "specs" / version)
+        if spec.get("spec_digest") == digest:
+            result = expected_prior_sofr_business_day(session_date, calendar_spec=spec)
+    except Exception:
+        result = None
+    _EXPECTED_RATE_DAY_CACHE[key] = result
+    return result
+
+
 def _is_market_record_valid_for_session(
     rec: object,
     cal_digest: object,
     session_date: str | None,
+    *,
+    as_of: str | None = None,
+    calendar_session: Mapping[str, Any] | None = None,
 ) -> bool:
     """A market record is usable only if eligible, populated, digest-bound and for this session.
 
-    Price/index records must be effective for the decision session itself. Rate series
-    (SOFR, T-bill) publish with a lag, so they may be effective on an earlier date but never
-    on a later one; the feeder enforces their exact lag rule when it builds the record.
+    Price/index records must be effective for the decision session itself. Rate series follow
+    the feeder's exact freshness rule: SOFR must be effective on the expected T-1 publication
+    business day; the 3M T-bill on the session day or that T-1 day. An archived rate from an
+    older date is never reused. A record retrieved after the decision instant (as_of), or
+    without a retrieval time, is look-ahead evidence and is rejected.
     """
     if not isinstance(rec, Mapping):
         return False
@@ -924,10 +978,17 @@ def _is_market_record_valid_for_session(
         eff = rec.get("effective_session")
         if not isinstance(eff, str) or _parse_valid_ymd(eff) is None:
             return False
-        if str(rec.get("instrument")) in _RATE_INSTRUMENTS:
-            if eff > session_date:
+        inst = str(rec.get("instrument"))
+        if inst in _RATE_INSTRUMENTS:
+            expected_prior = _expected_prior_rate_business_day(session_date, calendar_session)
+            allowed = {expected_prior} if inst == "SOFR" else {session_date, expected_prior}
+            if expected_prior is None or eff not in allowed:
                 return False
         elif eff != session_date:
+            return False
+    if as_of is not None:
+        retrieved = rec.get("retrieval_time_utc")
+        if not isinstance(retrieved, str) or not retrieved or retrieved > as_of:
             return False
     return True
 
@@ -1086,8 +1147,6 @@ def _derive_default_max_loss_cap(
             e_star_dec = Decimal(str(raw_e_star))
         elif not require_sizing_bankroll and hwm_val is not None:
             e_star_dec = Decimal(str(hwm_val))
-        elif not require_sizing_bankroll:
-            e_star_dec = e_dec
         else:
             return None
 
@@ -1170,10 +1229,11 @@ def _apply_explicit_payload_tier(
         if requested_tier in TIER_CONFIGS:
             payload["tier_loss_budget_D"] = _TIER_D_MAP[requested_tier]
             bankroll_val = _finite_number(payload.get("bankroll", session_inputs.get("E")))
+            # No fallback to bankroll: a missing high-water mark leaves the loss cap underivable.
             hwm_val = _finite_number(
                 payload.get(
                     "high_water_mark",
-                    session_inputs.get("high_water_mark", session_inputs.get("E_star", bankroll_val)),
+                    session_inputs.get("high_water_mark", session_inputs.get("E_star")),
                 )
             )
             if bankroll_val is not None:
@@ -1202,6 +1262,10 @@ def _apply_explicit_payload_tier(
                 payload["max_loss_cap"] = derived_cap
             else:
                 payload.pop("max_loss_cap", None)
+        else:
+            # Unknown tier: caps computed for the payload's previous tier must not survive.
+            for stale_key in ("tier_joint_cap", "max_loss_cap", "tier_loss_budget_D"):
+                payload.pop(stale_key, None)
     else:
         payload.setdefault("tier", "balanced")
     payload.setdefault("loaded_policy_hash", policy_hash)
@@ -1242,6 +1306,13 @@ def build_fuse_validated_inputs(
     """Translate ShadowResearch session inputs into FUSE-1 validated_inputs without shims."""
     if not isinstance(session_inputs, Mapping):
         raise ValueError("session_inputs must be a mapping")
+    if "kill_switch_tripped" in session_inputs:
+        # The pinned engine's evaluate_O8 reads only authorized_events and the prior latch, so a
+        # boolean flag would be a silently ineffective control. Reject it instead.
+        raise ValueError(
+            "kill_switch_tripped is not supported by fuse-eval-spec/v1 O8; supply an owner "
+            "authorized_events entry {'type': 'kill_switch', 'scope': 'account', ...} instead"
+        )
 
     explicit_fuse = session_inputs.get("fuse_inputs")
     if explicit_fuse is not None:
@@ -1258,8 +1329,10 @@ def build_fuse_validated_inputs(
         direct = copy.deepcopy(dict(session_inputs))
         return _apply_explicit_payload_tier(direct, session_inputs, policy_hash=policy_hash)
 
-    tier = str(session_inputs.get("tier", "balanced"))
-    tier_cfg = TIER_CONFIGS.get(tier, TIER_CONFIGS["balanced"])
+    # An omitted tier takes the policy default (balanced); an explicit null or unknown tier is
+    # not silently mapped to balanced: tier-dependent caps stay missing so L0/L1 fail closed.
+    tier = str(session_inputs["tier"]) if "tier" in session_inputs else "balanced"
+    tier_cfg = TIER_CONFIGS.get(tier)
     bankroll_val = _finite_number(session_inputs.get("E"))
     if "high_water_mark" in session_inputs:
         hwm_val = _finite_number(session_inputs.get("high_water_mark"))
@@ -1271,7 +1344,7 @@ def build_fuse_validated_inputs(
     cal_status, exch_status = _map_calendar_statuses(calendar_session, session_date=session_date)
     if "tier_joint_cap" in session_inputs:
         tier_joint_cap = _finite_number(session_inputs.get("tier_joint_cap"))
-    elif bankroll_val is not None:
+    elif bankroll_val is not None and tier_cfg is not None:
         tier_joint_cap = float(Decimal(str(tier_cfg["x_joint"])) * Decimal(str(bankroll_val)))
     else:
         tier_joint_cap = None
@@ -1314,11 +1387,15 @@ def build_fuse_validated_inputs(
             # Every record that can feed a return (required or optional, e.g. SPX) is validated:
             # eligible, populated, same calendar digest, and effective for this decision session.
             for inst, rec in by_inst.items():
-                if not _is_market_record_valid_for_session(rec, cal_digest, session_date):
+                if not _is_market_record_valid_for_session(
+                    rec, cal_digest, session_date, as_of=as_of, calendar_session=calendar_session
+                ):
                     bad_market_insts.add(inst)
             for inst in req_series:
                 rec = by_inst.get(inst)
-                bad_rec = rec is None or not _is_market_record_valid_for_session(rec, cal_digest, session_date)
+                bad_rec = rec is None or not _is_market_record_valid_for_session(
+                    rec, cal_digest, session_date, as_of=as_of, calendar_session=calendar_session
+                )
                 if bad_rec:
                     bad_market_insts.add(inst)
                     if inst in ("XNDX", "SEMI", "QQQ"):
@@ -1366,15 +1443,35 @@ def build_fuse_validated_inputs(
 
         # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it
         ca_obj = copy.deepcopy(fdata.get("corporate_action"))
-        if (
-            ca_obj is None
-            and not bad_market_payload
-            and symbol not in bad_market_insts
-            and symbol in by_inst
-        ):
-            ca_obj = _map_market_corporate_action(
-                by_inst[symbol].get("corporate_action")  # type: ignore[arg-type]
-            )
+        market_ca = (
+            _map_market_corporate_action(by_inst[symbol].get("corporate_action"))  # type: ignore[arg-type]
+            if not bad_market_payload and symbol not in bad_market_insts and symbol in by_inst
+            else None
+        )
+        ca_conflict = False
+        if ca_obj is None:
+            ca_obj = market_ca
+        elif market_ca is not None and _ca_identity(ca_obj) != _ca_identity(market_ca):
+            # The fund payload carries one action (e.g. a prior CA being reconciled) while the
+            # feeder reports a distinct new action for this bar; V2 can hold only one, so fail
+            # closed rather than silently dropping the new event.
+            ca_conflict = True
+            mkt_ok = False
+
+        # The return uses the validated market close when a market record exists for the fund;
+        # a caller close that disagrees with it is rejected (fail closed).
+        close_for_return: object = fdata.get("close_price")
+        close_mismatch = False
+        if symbol in by_inst and symbol not in bad_market_insts and not bad_market_payload:
+            mkt_close = by_inst[symbol].get("normalized_value")
+            close_for_return = mkt_close
+            if fdata.get("close_price") is not None and (
+                _sizing_decimal(fdata.get("close_price")) is None
+                or _sizing_decimal(mkt_close) is None
+                or _sizing_decimal(fdata.get("close_price")) != _sizing_decimal(mkt_close)
+            ):
+                close_mismatch = True
+                mkt_ok = False
 
         # Derive 1-session fund and benchmark index returns from real closes when not explicitly given
         if fdata.get("fund_return") is not None:
@@ -1383,10 +1480,12 @@ def build_fuse_validated_inputs(
             not bad_market_payload
             and symbol not in bad_market_insts
             and symbol in prior_closes
-            and fdata.get("close_price") is not None
+            and close_for_return is not None
+            and not ca_conflict
+            and not close_mismatch
         ):
             fund_ret_val = _compute_ca_adjusted_fund_return(
-                fdata.get("close_price"),
+                close_for_return,
                 prior_closes.get(symbol),
                 _ca_in_return_interval(ca_obj, session_date),
             )
@@ -1411,14 +1510,15 @@ def build_fuse_validated_inputs(
         # q_pre / position value / bankroll, so O3 here is a documented model
         # self-reconciliation, NOT independent reconciliation evidence. Once SUPPLY-B supplies
         # broker evidence, missing broker_* observations must fail closed (tracked follow-up).
+        # Omitted key = Stage N model-only substitution; explicit null = unknown evidence (missing).
         broker_pos_val = (
-            _resolve_tier_quantity(fdata.get("broker_position"), tier)
-            if "broker_position" in fdata and fdata.get("broker_position") is not None
+            (_resolve_tier_quantity(fdata["broker_position"], tier) if fdata["broker_position"] is not None else None)
+            if "broker_position" in fdata
             else q_pre_val
         )
         fund_entry: dict[str, Any] = {
             "symbol": symbol,
-            "exposure": _finite_number(fdata.get("exposure")) if fdata.get("exposure") is not None else pos_val,
+            "exposure": ((_finite_number(fdata["exposure"]) if fdata["exposure"] is not None else None) if "exposure" in fdata else pos_val),
             "fund_return": fund_ret_val,
             "index_return": idx_ret_val,
             "modelled_fee": _finite_number(fdata.get("modelled_fee")),
@@ -1434,9 +1534,13 @@ def build_fuse_validated_inputs(
             "trading_pause": fdata.get("trading_pause"),
             "session_time": str(fdata["session_time"]) if fdata.get("session_time") is not None else None,
             "share_count": _preserve_numeric_quantity(q_pre_val) if q_pre_val is not None else 0,
-            "ledger_value": _finite_number(fdata.get("ledger_value")) if fdata.get("ledger_value") is not None else pos_val,
+            "ledger_value": ((_finite_number(fdata["ledger_value"]) if fdata["ledger_value"] is not None else None) if "ledger_value" in fdata else pos_val),
             "broker_position": _preserve_numeric_quantity(broker_pos_val),
-            "broker_value": _finite_number(fdata.get("broker_value")) if fdata.get("broker_value") is not None else pos_val,
+            "broker_value": (
+                (_finite_number(fdata["broker_value"]) if fdata["broker_value"] is not None else None)
+                if "broker_value" in fdata
+                else pos_val
+            ),
             "corporate_action": ca_obj,
             "fund_event": copy.deepcopy(fdata.get("fund_event")),
         }
@@ -1522,10 +1626,14 @@ def build_fuse_validated_inputs(
         "tier": tier,
         "bankroll": bankroll_val,
         "high_water_mark": hwm_val,
-        "joint_exposure": _finite_number(session_inputs.get("joint_exposure")) if session_inputs.get("joint_exposure") is not None else derived_joint_exposure,
+        "joint_exposure": ((_finite_number(session_inputs["joint_exposure"]) if session_inputs["joint_exposure"] is not None else None) if "joint_exposure" in session_inputs else derived_joint_exposure),
         "tier_joint_cap": tier_joint_cap,
         "max_loss_cap": max_loss_cap,
-        "proposed_exposure": _finite_number(session_inputs.get("proposed_exposure")) if session_inputs.get("proposed_exposure") is not None else derived_joint_exposure,
+        # FUSE runs BEFORE sizing (ledger evaluates rows, then sizes), so no proposal exists yet:
+        # an omitted proposed_exposure is the current (pre-sizing) exposure, and sizing enforces
+        # the tier max-loss cap (Step 3 x_ML) on the actual targets. An explicit value, including
+        # an explicit null, passes through.
+        "proposed_exposure": ((_finite_number(session_inputs["proposed_exposure"]) if session_inputs["proposed_exposure"] is not None else None) if "proposed_exposure" in session_inputs else derived_joint_exposure),
         "one_session_loss": _derive_one_session_loss(session_inputs),
         "market_halt_level": session_inputs.get("market_halt_level", None),
         "index_one_session_returns": idx_returns,
@@ -1535,10 +1643,20 @@ def build_fuse_validated_inputs(
         "exchange_status": exch_status,
         # Stage N model self-reconciliation (see broker_position above): absent cash
         # observations default to the bankroll; O3 is not independently evaluated in SH-2.
-        "positions_cash": _finite_number(session_inputs.get("positions_cash")) if session_inputs.get("positions_cash") is not None else bankroll_val,
-        "broker_cash": _finite_number(session_inputs.get("broker_cash")) if session_inputs.get("broker_cash") is not None else bankroll_val,
-        "reconciliation_tolerance": _finite_number(session_inputs.get("reconciliation_tolerance")) if session_inputs.get("reconciliation_tolerance") is not None else 1.0,
-        "pending_orders": copy.deepcopy(session_inputs.get("pending_orders", {})),
+        # Omitted key = model-only substitution; an explicit null stays missing (O3 fails closed).
+        "positions_cash": (
+            (_finite_number(session_inputs["positions_cash"]) if session_inputs["positions_cash"] is not None else None)
+            if "positions_cash" in session_inputs
+            else bankroll_val
+        ),
+        "broker_cash": (
+            (_finite_number(session_inputs["broker_cash"]) if session_inputs["broker_cash"] is not None else None)
+            if "broker_cash" in session_inputs
+            else bankroll_val
+        ),
+        "reconciliation_tolerance": ((_finite_number(session_inputs["reconciliation_tolerance"]) if session_inputs["reconciliation_tolerance"] is not None else None) if "reconciliation_tolerance" in session_inputs else 1.0),
+        # Omitted = no pending orders (Stage N never places orders); an explicit value passes through.
+        "pending_orders": copy.deepcopy(session_inputs["pending_orders"]) if "pending_orders" in session_inputs else {},
         "symbol_whitelist": (
             copy.deepcopy(session_inputs["symbol_whitelist"])
             if "symbol_whitelist" in session_inputs
@@ -1577,15 +1695,13 @@ def build_fuse_validated_inputs(
             if "scheduled_interval" in session_inputs
             else 60.0
         ),
-        "tier_loss_budget_D": _TIER_D_MAP.get(tier, 0.30),
+        "tier_loss_budget_D": _TIER_D_MAP.get(tier),
         "v5_tolerance": session_inputs.get("v5_tolerance", None),
         "v7_spread_width": session_inputs.get("v7_spread_width", None),
         "o5_collar": session_inputs.get("o5_collar", None),
     }
     if "hwm_adjusted" in session_inputs:
         out["hwm_adjusted"] = session_inputs["hwm_adjusted"]
-    if session_inputs.get("kill_switch_tripped") is True:
-        out["kill_switch_tripped"] = True
     for o7_key in ("o7_runtime_silent", "o7_monitor_silent"):
         if o7_key in session_inputs:
             out[o7_key] = bool(session_inputs[o7_key])
