@@ -1251,6 +1251,71 @@ def _derive_conv_scale(
         return None
 
 
+def _accumulate_fund_joint_exposure(
+    joint_exposure_dec: Decimal | None,
+    *,
+    symbol: str,
+    pos_val: Decimal | float | None,
+    conv_scale: Decimal | None,
+) -> Decimal | None:
+    """Apply U-01 Step 6 (leverage * beta * pos_val / conv_scale) or propagate None."""
+    if joint_exposure_dec is None or conv_scale is None or conv_scale <= 0:
+        return None
+    if pos_val is None:
+        return None
+    pos_dec = pos_val if isinstance(pos_val, Decimal) else Decimal(str(pos_val))
+    beta_dec = _FUND_EXPOSURE_BETA.get(symbol, Decimal("1"))
+    return joint_exposure_dec + (_LEVERAGE_MULTIPLE * beta_dec * pos_dec) / conv_scale
+
+
+def compute_joint_exposure_for_quantities(
+    session_inputs: Mapping[str, Any],
+    quantities_by_inst: Mapping[str, Any],
+    *,
+    tier: str | None = None,
+) -> float | None:
+    """Compute U-01 Step 6 effective joint exposure for explicit fund share quantities."""
+    raw_funds = session_inputs.get("funds")
+    if not isinstance(raw_funds, Mapping):
+        return None
+    bankroll_val = _finite_number(session_inputs.get("E"))
+    if "high_water_mark" in session_inputs:
+        hwm_val = _finite_number(session_inputs.get("high_water_mark"))
+    elif "E_star" in session_inputs:
+        hwm_val = _finite_number(session_inputs.get("E_star"))
+    else:
+        hwm_val = None
+    conv_scale = _derive_conv_scale(session_inputs, bankroll_val, hwm_val)
+    if conv_scale is None or conv_scale <= 0:
+        return None
+    eff_tier = (
+        tier
+        if tier is not None
+        else (str(session_inputs["tier"]) if "tier" in session_inputs else "balanced")
+    )
+    joint_exposure_dec: Decimal | None = Decimal("0")
+    for symbol in sorted(raw_funds.keys()):
+        fdata = raw_funds[symbol]
+        if not isinstance(fdata, Mapping):
+            continue
+        close_dec = _sizing_decimal(fdata.get("close_price"))
+        raw_q = quantities_by_inst.get(symbol, fdata.get("q_pre"))
+        q_val = _resolve_sizing_q_pre(raw_q, eff_tier)
+        if close_dec is not None and q_val is not None:
+            pos_val: Decimal | None = Decimal(str(float(close_dec))) * Decimal(q_val)
+        elif q_val == 0:
+            pos_val = Decimal("0")
+        else:
+            pos_val = None
+        joint_exposure_dec = _accumulate_fund_joint_exposure(
+            joint_exposure_dec,
+            symbol=symbol,
+            pos_val=pos_val,
+            conv_scale=conv_scale,
+        )
+    return float(joint_exposure_dec) if joint_exposure_dec is not None else None
+
+
 def _apply_explicit_payload_tier(
     payload: dict[str, Any],
     session_inputs: Mapping[str, Any],
@@ -1304,6 +1369,19 @@ def _apply_explicit_payload_tier(
                 payload.pop(stale_key, None)
     else:
         payload.setdefault("tier", "balanced")
+    explicit_inner = session_inputs.get("fuse_inputs")
+    for override_key in ("last_heartbeat", "heartbeat_source", "scheduled_interval", "proposed_exposure"):
+        if override_key in session_inputs:
+            if (
+                override_key != "proposed_exposure"
+                and isinstance(explicit_inner, Mapping)
+                and override_key in explicit_inner
+                and explicit_inner[override_key] != session_inputs[override_key]
+            ):
+                raise ValueError(
+                    f"conflicting_{override_key}_between_session_inputs_and_fuse_inputs"
+                )
+            payload[override_key] = copy.deepcopy(session_inputs[override_key])
     payload.setdefault("loaded_policy_hash", policy_hash)
     payload.setdefault("registered_policy_hash", policy_hash)
     return payload
@@ -1490,14 +1568,12 @@ def build_fuse_validated_inputs(
             pos_val = 0.0
         else:
             pos_val = None
-        if joint_exposure_dec is not None and conv_scale is not None:
-            if pos_val is None:
-                joint_exposure_dec = None
-            else:
-                beta_dec = _FUND_EXPOSURE_BETA.get(symbol, Decimal("1"))
-                joint_exposure_dec += (
-                    _LEVERAGE_MULTIPLE * beta_dec * Decimal(str(pos_val))
-                ) / conv_scale
+        joint_exposure_dec = _accumulate_fund_joint_exposure(
+            joint_exposure_dec,
+            symbol=symbol,
+            pos_val=pos_val,
+            conv_scale=conv_scale,
+        )
         long_run_vol = _finite_number(fdata.get("long_run_volatility"))
 
         # Wire feeder market_records[].corporate_action into V2 when fund payload does not override it

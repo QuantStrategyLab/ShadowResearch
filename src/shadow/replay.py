@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Mapping
 from datetime import date, datetime, time as dt_time, timezone
@@ -11,11 +12,31 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from shadow.calendar_consumer import DEFAULT_SPEC_DIR, load_spec, resolve_session
-from shadow.evaluator import REQUIRED_MARKET_SERIES, StubEvaluator, Y2_REQUIRED_MARKET_SERIES
-from shadow.feeder import VINTAGE_Y2, default_eod_decision_cutoff_utc, verify_market_record_raw_integrity
+from shadow.evaluator import (
+    REQUIRED_MARKET_SERIES,
+    StubEvaluator,
+    StubProductionForbiddenError,
+    Y2_REQUIRED_MARKET_SERIES,
+)
+from shadow.feeder import (
+    VINTAGE_Y2,
+    default_eod_decision_cutoff_utc,
+    validate_official_close_market_record,
+    verify_market_record_raw_integrity,
+)
+from shadow.fuse_adapter import (
+    EngineIdentityError,
+    PINNED_FUSE_ENGINE_HASH,
+    PINNED_FUSE_SPEC_VERSION,
+    VendoredFuseEvaluator,
+    apply_fund_long_run_volatility,
+    is_stub_evaluator,
+)
 from shadow.ledger import (
     GENESIS_PREV_HASH,
     ShadowLedger,
+    _assert_pending_state_preserves_committed_breakers,
+    _sha256_canonical_state_dict,
     build_record_body,
     canonical_json_bytes,
     is_utc_ms_timestamp,
@@ -26,6 +47,60 @@ from shadow.ots import load_trusted_bitcoin_headers
 from shadow.sizing import canonical_decimal_str, policy_config_hash
 
 _NY_TZ = ZoneInfo("America/New_York")
+_DATE_YYYY_MM_DD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_prior_row_state_continuation(
+    fctx: Mapping[str, object],
+    prior_state: dict,
+    *,
+    session_date: str,
+    prev_session_date: str | None,
+    engine_hash: str,
+    spec_version: str,
+) -> dict | None:
+    """Validate optional pending-rejected prior_row_state_used continuity against prior_state."""
+    cand_prior = fctx.get("prior_row_state_used")
+    if not isinstance(cand_prior, Mapping):
+        return None
+    if cand_prior == prior_state:
+        return dict(cand_prior)
+    if fctx.get("prior_row_state_base_sha256") != _sha256_canonical_state_dict(prior_state):
+        return None
+    rej_ds = fctx.get("prior_rejected_session_date")
+    if not isinstance(rej_ds, str) or not _DATE_YYYY_MM_DD_RE.fullmatch(rej_ds):
+        return None
+    try:
+        date.fromisoformat(rej_ds)
+    except ValueError:
+        return None
+    if rej_ds > session_date or (prev_session_date is not None and rej_ds < prev_session_date):
+        return None
+    raw_o4 = fctx.get("prior_o4_resolved_symbols")
+    if raw_o4 is not None and not isinstance(raw_o4, list):
+        return None
+    allowed_o4 = (
+        {str(s) for s in raw_o4 if isinstance(s, str) and s} if isinstance(raw_o4, list) else set()
+    )
+    raw_auth = fctx.get("prior_authorized_events")
+    if raw_auth is not None and (
+        not isinstance(raw_auth, list) or not all(isinstance(x, Mapping) for x in raw_auth)
+    ):
+        return None
+    try:
+        _assert_pending_state_preserves_committed_breakers(
+            prior_state,
+            cand_prior,
+            rej_ds=rej_ds,
+            expected_engine_hash=engine_hash,
+            expected_spec_version=spec_version,
+            expected_base_session_date=prev_session_date,
+            allowed_o4_resolved_symbols=allowed_o4,
+            authorized_events=raw_auth,
+        )
+    except EngineIdentityError:
+        return None
+    return dict(cand_prior)
 
 
 def _resolve_spec_dir(bundle: dict) -> Path:
@@ -47,6 +122,7 @@ def replay_window(
     ledger_dir: str | Path,
     *,
     bitcoin_merkle_roots: Mapping[int, str] | None = None,
+    evaluator: object | None = None,
 ) -> dict:
     """Re-derive every record bit-for-bit from retained inputs and verify chain + receipts separately."""
     b_dir = Path(bundle_dir)
@@ -153,8 +229,91 @@ def replay_window(
             "replayed_count": 0,
         }
 
-    ev = StubEvaluator()
+    bundle_engine_hash = bundle.get("engine_hash")
+    rec0_body = (
+        stored_records[0]["record_body"]
+        if stored_records
+        and isinstance(stored_records[0], dict)
+        and isinstance(stored_records[0].get("record_body"), dict)
+        else {}
+    )
+    rec0_engine_hash = rec0_body.get("engine_hash")
+    is_prod_bundle = bundle.get("mode") == "production"
+
+    if is_prod_bundle and evaluator is not None and is_stub_evaluator(evaluator):
+        raise StubProductionForbiddenError(
+            "StubEvaluator is structurally forbidden when replaying production mode"
+        )
+    if is_prod_bundle and (
+        str(bundle_engine_hash or "").startswith("stub-")
+        or str(rec0_engine_hash or "").startswith("stub-")
+    ):
+        return {
+            "bit_for_bit_match": False,
+            "chain_ok": chain_ok,
+            "first_bad_sequence": first_bad_seq,
+            "chain_error": chain_err,
+            "receipts_ok": receipts_ok,
+            "bad_receipt_sequence": bad_rec_seq,
+            "receipt_error": rec_err,
+            "receipts_creditable": receipts_creditable,
+            "receipt_credit_issues": receipt_credit_issues,
+            "archived_inputs_ok": False,
+            "mismatches": ["stub_forbidden_in_production"],
+            "error": "stub_forbidden_in_production",
+            "replayed_count": 0,
+        }
+
+    if evaluator is not None:
+        ev = evaluator
+    elif is_prod_bundle or bundle_engine_hash == PINNED_FUSE_ENGINE_HASH or rec0_engine_hash == PINNED_FUSE_ENGINE_HASH:
+        ev = VendoredFuseEvaluator()
+    else:
+        ev = StubEvaluator()
+
+    if is_prod_bundle and (
+        is_stub_evaluator(ev)
+        or getattr(ev, "engine_hash", None) != PINNED_FUSE_ENGINE_HASH
+        or getattr(ev, "spec_version", None) != PINNED_FUSE_SPEC_VERSION
+    ):
+        return {
+            "bit_for_bit_match": False,
+            "chain_ok": chain_ok,
+            "first_bad_sequence": first_bad_seq,
+            "chain_error": chain_err,
+            "receipts_ok": receipts_ok,
+            "bad_receipt_sequence": bad_rec_seq,
+            "receipt_error": rec_err,
+            "receipts_creditable": receipts_creditable,
+            "receipt_credit_issues": receipt_credit_issues,
+            "archived_inputs_ok": False,
+            "mismatches": ["invalid_production_evaluator_identity"],
+            "error": "invalid_production_evaluator_identity",
+            "replayed_count": 0,
+        }
+
+    if bundle_engine_hash is not None and bundle_engine_hash != getattr(ev, "engine_hash", None):
+        return {
+            "bit_for_bit_match": False,
+            "chain_ok": chain_ok,
+            "first_bad_sequence": first_bad_seq,
+            "chain_error": chain_err,
+            "receipts_ok": receipts_ok,
+            "bad_receipt_sequence": bad_rec_seq,
+            "receipt_error": rec_err,
+            "receipts_creditable": receipts_creditable,
+            "receipt_credit_issues": receipt_credit_issues,
+            "archived_inputs_ok": False,
+            "mismatches": [
+                f"bundle_engine_hash_mismatch:bundle={bundle_engine_hash},ev={getattr(ev, 'engine_hash', None)}"
+            ],
+            "error": "bundle_engine_hash_mismatch",
+            "replayed_count": 0,
+        }
+
     prior_state: dict = {}
+    prev_session_date: str | None = None
+    prev_decision_utc: str | None = None
     prev_hash = GENESIS_PREV_HASH
     mismatches: list[str] = []
     archive_errors: list[str] = []
@@ -187,6 +346,9 @@ def replay_window(
             and sess_labels.get("forward_clock_credit_eligible") is False
             and stored_labels.get("forward_clock_credit_eligible") is False
             and stored_assertions.get("forward_clock_credit_eligible") is False
+        )
+        expected_required_series = (
+            Y2_REQUIRED_MARKET_SERIES if is_noncreditable_y2_session else REQUIRED_MARKET_SERIES
         )
         has_mkt_key = "market_records" in sess
         declared_digest = sess.get("market_records_digest")
@@ -221,9 +383,6 @@ def replay_window(
                         else None
                     )
 
-                expected_required_series = (
-                    Y2_REQUIRED_MARKET_SERIES if is_noncreditable_y2_session else REQUIRED_MARKET_SERIES
-                )
                 by_inst: dict[str, dict] = {}
                 seen_instruments: set[str] = set()
                 for idx, mrec in enumerate(mkt_records):
@@ -249,6 +408,10 @@ def replay_window(
                         )
                         if not ok_raw:
                             archive_errors.append(f"seq_{seq}:{raw_err}")
+                    if not is_noncreditable_y2_session:
+                        ok_close, close_err = validate_official_close_market_record(mrec, cal)
+                        if not ok_close:
+                            archive_errors.append(f"seq_{seq}:{close_err}:{m_inst}")
 
                     if m_inst in expected_required_series:
                         elig = mrec.get("eligibility")
@@ -322,6 +485,51 @@ def replay_window(
                                     f"seq_{seq}:invalid_close_price_{inst}:{exc}"
                                 )
 
+        replay_inputs = dict(sess["inputs"])
+        eff_prior_state = prior_state
+        if not is_stub_evaluator(ev):
+            if "market_records" in sess:
+                if (
+                    "market_records" in replay_inputs
+                    and replay_inputs["market_records"] != sess["market_records"]
+                ):
+                    archive_errors.append(f"seq_{seq}:shadowed_inputs_market_records")
+                if (
+                    "required_series" in replay_inputs
+                    and (
+                        not isinstance(replay_inputs["required_series"], (list, tuple))
+                        or list(replay_inputs["required_series"]) != list(expected_required_series)
+                    )
+                ):
+                    archive_errors.append(f"seq_{seq}:shadowed_inputs_required_series")
+                replay_inputs["market_records"] = sess["market_records"]
+                replay_inputs["required_series"] = expected_required_series
+            fctx = sess.get("fuse_context")
+            if isinstance(fctx, Mapping):
+                for ctx_key in (
+                    "prior_closes",
+                    "positions_source_record",
+                    "broker_reconciliation_source_record",
+                    "index_one_session_returns",
+                    "authorized_events",
+                ):
+                    if ctx_key in fctx and fctx[ctx_key] is not None:
+                        replay_inputs[ctx_key] = fctx[ctx_key]
+                apply_fund_long_run_volatility(replay_inputs, fctx.get("long_run_vol_by_inst"))
+                if fctx.get("prior_row_state_used") is not None:
+                    validated_prior = _validate_prior_row_state_continuation(
+                        fctx,
+                        prior_state,
+                        session_date=sess["session_date"],
+                        prev_session_date=prev_session_date,
+                        engine_hash=ev.engine_hash,
+                        spec_version=ev.spec_version,
+                    )
+                    if validated_prior is None:
+                        mismatches.append(f"seq_{seq}:prior_row_state_used_mismatch")
+                    else:
+                        eff_prior_state = validated_prior
+
         res = build_record_body(
             chain_id=bundle["chain_id"],
             sequence=seq,
@@ -329,15 +537,16 @@ def replay_window(
             mode=bundle["mode"],
             session_date=sess["session_date"],
             decision_timestamp_utc=sess["decision_timestamp_utc"],
-            session_inputs=sess["inputs"],
+            session_inputs=replay_inputs,
             calendar_session=cal,
             code_version_sha=bundle["code_version_sha"],
             evaluator=ev,
-            prior_row_state=prior_state,
+            prior_row_state=eff_prior_state,
             discipline_labels=sess.get("discipline_labels"),
             market_records_digest=computed_mkt_digest,
             runtime_config=bundle.get("runtime_config"),
             calendar_spec=spec,
+            prev_decision_timestamp_utc=prev_decision_utc,
         )
         if not res["appended"]:
             mismatches.append(f"seq_{seq}:unexpected_fail_closed")
@@ -362,6 +571,8 @@ def replay_window(
             )
 
         prior_state = res["next_row_state"]
+        prev_session_date = sess["session_date"]
+        prev_decision_utc = str(replayed_body["decision_timestamp_utc"])
         prev_hash = replayed_hash
 
     archived_inputs_ok = (len(archive_errors) == 0) if any_requires_market_records else False
